@@ -654,14 +654,16 @@ static int auto_delay(void) {
     int rtt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
     if (rtt <= 0) return 2;
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
-    /* (net4) delay = the one-way trip less one frame, rounded up: the other player's pad of a frame comes at most about 2
-     * frames late, so a rollback runs 1 or 2 frames again. A re-run frame costs about 5 ms here (testers 2026-10-25: load
-     * 5.5 ms + 4.9 ms per frame), so a 2-frame rollback still fits in one 16.7 ms frame and a 3-frame one does not; the old
-     * rule (one-way less 2, rounded) left 3-frame rollbacks on most changes of the other player's pad: a hitch each time.
-     * 78 ms round trip: 2 frames (was 1); 150 ms: 4 (was 3); 200 ms and more: 5 (was 4). graphics.ini rollback_delay = <n>
-     * (or SSBU_RB_NET_DELAY) fixes it instead. */
-    int d = (int)ceil(one_way - 1.0);
-    return d < 1 ? 1 : d > 5 ? 5 : d;
+    /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
+     * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
+     * 2 frames) made rollbacks of 2-3 frames on most changes of the other player's pad. */
+    /* (net4, overnight 2026-10-25) one-way + half a frame, rounded up: the other player's pad of a frame then normally comes
+     * during the pass before it, so that frame never runs on a guess, no rollback is needed, and the state before it is not
+     * captured either (rbg_capture_needed): rollback is left for the jitter. Measured, two games at 50 ms round trip: with
+     * the delay covering the trip, ticks over budget p90 31.9 -> 16.9 ms, rollbacks 22 -> 2, frames identical. 2 ms: 1 frame;
+     * 20-35 ms: 2; 78 ms: 3; 150 ms: 5; 6 at most. graphics.ini rollback_delay = <n> fixes it (lower = less delay, more rollbacks). */
+    int d = (int)ceil(one_way + 0.5);
+    return d < 1 ? 1 : d > 6 ? 6 : d;
 }
 void rbn_start(long long f0) {
     g_f0 = f0; g_started = 1; g_match_n++;

@@ -157,9 +157,11 @@ still play together in a room.
 Rollback is **on by default**; `rollback = off` in `config\graphics.ini` (or F1 > Experimental) turns it off. F1's
 "Restart the game now" applies the switch too.
 
-Input delay is chosen from the best measured round trip so that rollbacks stay at 1 or 2 frames: 1 frame below about
-67 ms, 2 frames up to about 100 ms, 3 up to about 133 ms, 4 up to about 167 ms, 5 above (the rest of the trip is covered
-by rollback). `rollback_delay = <frames>` in `config\graphics.ini` fixes it instead (`auto` = the rule above).
+Input delay is chosen from the best measured round trip so that the other player's input normally arrives just before
+it is needed: the one-way time plus half a frame, rounded up. Round trip up to about 17 ms: 1 frame; up to 50 ms: 2;
+up to 83 ms: 3; up to 117 ms: 4; up to 150 ms: 5; above: 6. Rollback then only covers lag spikes, and the frames whose
+input is already there cost less (no state is saved for them). A lower `rollback_delay` gives less input delay and more
+rollbacks (each one shows as a slightly late frame). `rollback_delay = <frames>` in `config\graphics.ini` fixes it instead (`auto` = the rule above).
 
 The game uses a direct connection between the two players whenever the routers allow it, rollback messages included;
 F2 shows "direct to the other player" or "through the lobby server". A room still relayed 10 s after the other player
