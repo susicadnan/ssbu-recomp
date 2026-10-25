@@ -3,7 +3,23 @@
  * are stubs; simulation timestamps below are synthetic, not measured game performance.
  * clang -O1 -D_CRT_SECURE_NO_WARNINGS tests/rbn_receive_test.c -o rbn_receive_test.exe
  * SPDX-License-Identifier: GPL-3.0-or-later */
+#include <windows.h>
+static void receive_test_lock(PSRWLOCK lock);
+#define AcquireSRWLockExclusive receive_test_lock
 #include "../runtime/rb_net.c"
+#undef AcquireSRWLockExclusive
+
+/* Deterministically pause the receiver immediately before it acquires the queue lock. The callback completes a
+ * match transition on the main side; no sleeps or production test hook are needed to exercise that interleaving. */
+static void (*before_receive_lock)(void);
+static void receive_test_lock(PSRWLOCK lock) {
+    if (lock == &g_rq_lock && before_receive_lock) {
+        void (*transition)(void) = before_receive_lock;
+        before_receive_lock = NULL;
+        transition();
+    }
+    AcquireSRWLockExclusive(lock);
+}
 
 int g_game_build;
 static int sent_pads, last_sent_newest, last_sent_count;
@@ -56,6 +72,38 @@ static void receive_one(int frame, uint64_t buttons) {
     RbMsg m = {0}; m.type = RB_MSG_PADS; m.player = 1; m.newest = frame; m.count = 1;
     m.pads[0].buttons = buttons;
     receive(&m, 0);
+}
+
+static void transition_to_next_match(void) { reset_session(1); }
+static void transition_to_menus(void) { rbn_match_reset(); }
+
+static void session_boundary_tests(void) {
+    reset_session(1);
+    long long old = g_rx_oldmatch;
+    long long received = g_rx_pkts;
+    before_receive_lock = transition_to_next_match;
+    receive_one(1, 99);             /* passes the old tag check, then resumes after reset/start of the next match */
+    rbn_drain(0);
+    CHECK(!before_receive_lock, "receiver crossed the intended match-transition boundary");
+    CHECK(g_rx_oldmatch == old + 1, "packet admitted before reset is rechecked before enqueueing");
+    CHECK(!g_peer_started && rbn_confirmed() == 0, "old packet cannot start or supply input to the new match");
+    CHECK(g_peer_mode == -1, "old packet cannot set the new match's delay/rollback mode");
+    CHECK(g_rx_pkts == received && g_rq_head == g_rq_tail, "old packet is not counted or published to the new queue");
+    receive_one(1, 7); rbn_drain(0);
+    CHECK(g_peer_started && rbn_confirmed() == 1 && rbn_pad(1, 1).buttons == 7,
+          "new match accepts its own input after rejecting the stale in-flight packet");
+    CHECK(g_peer_mode == 4, "current packet publishes its mode before the start barrier consumes it");
+
+    reset_session(1); old = g_rx_oldmatch;
+    before_receive_lock = transition_to_menus;
+    receive_one(1, 99);
+    CHECK(!g_started && g_peer_mode == -1 && g_rx_oldmatch == old + 1 && g_rq_head == g_rq_tail,
+          "receive resumed between matches cannot repopulate the cleared queue or mode");
+    rbn_start(0); rbn_drain(0);
+    CHECK(!g_peer_started && rbn_confirmed() == 0, "starting later does not resurrect a packet received during reset");
+    receive_one(1, 8); rbn_drain(0);
+    CHECK(rbn_pad(1, 1).buttons == 8, "current input remains usable after an idle transition");
+    printf("SESSION_BOUNDARY reset/start and reset/idle inserted before enqueue lock\n");
 }
 
 static void boundary_tests(void) {
@@ -217,12 +265,13 @@ int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
     _putenv("SSBU_RB_NET_RESEND_MS=");
-    CHECK(rbn_on() && !g_predrain, "feature defaults off");
+    CHECK(rbn_on() && g_predrain, "pre-frame receive defaults on after in-game validation");
     CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
+    session_boundary_tests();
     resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);
