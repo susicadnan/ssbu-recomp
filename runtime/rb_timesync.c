@@ -33,7 +33,10 @@ RbSyncAction rb_ts_decide(int frame) {
         if (frame <= 120 && g_est >= g_frame_us) a.skip = 1;
     } else if (g_est <= -8000) {
         a.speed = 1.01;
-        if (g_est <= -g_frame_us) { a.advance = (int)(-g_est / g_frame_us); if (a.advance > 3) a.advance = 3; }
+        if (g_est <= -g_frame_us) {
+            int64_t behind = -(int64_t)g_est / g_frame_us;    /* INT32_MIN is valid; cap before narrowing to int */
+            a.advance = behind > 3 ? 3 : (int)behind;
+        }
     }
     return a;
 }
