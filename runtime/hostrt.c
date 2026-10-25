@@ -207,17 +207,13 @@ static void fn_hash_build(void) {
     }
     g_fn_mask = size - 1;
 }
-/* (net4, 2026-10-25) a small direct-mapped cache per thread in front of the hash: the hash table is 4 MB (every probe a
- * cache miss) and a frame's indirect calls go to the same few hundred targets (virtual calls); measured 0.6 ms of a 10 ms
- * frame in the probe loop (SSBU_RB_SIM_PROF=3, main thread). 4096 entries x 16 B = 64 KB, stays in L2. */
-#define FNC_N 4096
-static __declspec(thread) struct { uint64_t addr; void (*fn)(Ctx *); } t_fnc[FNC_N];
+/* (net4, 2026-10-25: a 64 KB per-thread direct-mapped cache in front of this hash was tried for the 0.6 ms a frame spends in
+ * the probe loop (SSBU_RB_SIM_PROF=3); main-thread cycles per pass did not change (22.4 -> 22.3 million): the time is the
+ * calls themselves, not the misses. Not kept.) */
 static void (*lookup_guest(uint64_t addr))(Ctx *) {
     if (g_fn_mask) {
-        unsigned ci = (unsigned)((addr >> 2) * 0x9E3779B1u >> 20) & (FNC_N - 1);
-        if (t_fnc[ci].addr == addr) return t_fnc[ci].fn;
         for (unsigned h = fn_hash(addr) & g_fn_mask;; h = (h + 1) & g_fn_mask) {
-            if (g_fn_hash[h].addr == addr) { t_fnc[ci].addr = addr; t_fnc[ci].fn = g_fn_hash[h].fn; return g_fn_hash[h].fn; }
+            if (g_fn_hash[h].addr == addr) return g_fn_hash[h].fn;
             if (!g_fn_hash[h].addr) return NULL;
         }
     }
