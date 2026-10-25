@@ -25,7 +25,7 @@ int rb_pad_equal(const RbPad *a, const RbPad *b);
 RbPad rb_input_local(int frame, RbPad now);
 int rb_input_local_latest(void);                   /* newest frame with a local pad (frame + delay of the last call) */
 int rb_input_local_get(int frame, RbPad *out);     /* 1 when that frame's local pad is known (to send it again) */
-/* a pad of player `p` for `frame` from the network; a frame already known is ignored (redundant copies) */
+/* a pad of player `p` for `frame` from the network; known frames and frames beyond the next RB_RING slots are ignored */
 void rb_input_remote_put(int p, int frame, RbPad pad);
 int rb_input_remote_latest(int p);                 /* newest consecutive frame received from player p (0 = none) */
 /* the pad player p uses at `frame`: the real one, or the last real one repeated (*predicted = 1, recorded for the check) */
