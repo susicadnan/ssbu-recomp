@@ -862,6 +862,7 @@ static DWORD WINAPI rgss_thread(void *p) {
                 DWORD64 base = 0; PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(x.Rip, &base, NULL);
                 uint64_t g = guest_function_of(x.Rip);
                 if (g && (!nf || fr[nf - 1] != g)) fr[nf++] = g; else if (!g && d == 0) fr[nf++] = ((uint64_t)x.Rip >> 4 << 4) | (1ull << 63);      /* 1 = host code (imports, hooks); capture / load: the host address */
+                else if (!g && d == 1 && nf == 1 && (fr[0] >> 63)) fr[nf++] = ((uint64_t)x.Rip >> 4 << 4) | (1ull << 62);      /* (net4) the host CALLER of a host leaf (strcmp, memcpy: who) */
                 if (!f) break;
                 void *hd; DWORD64 est; RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, x.Rip, f, &x, &hd, &est, NULL);
                 if (!x.Rip) break;
@@ -908,11 +909,11 @@ static void rgs_samp_report(void) {
         for (int i = 0; i < (sg == 2 ? 80 : 40); i++) {
             RgsS *e = &g_rgss_c[i]; long long v = inc ? e->incl[kd][sg] : e->self[kd][sg]; if (!v) break;
             char hn[96] = "";                                /* (net4) a host address named by its module and offset (the linker map gives the function) */
-            if (e->fn >> 63) {
-                HMODULE hm = NULL; uint64_t a = e->fn & ~(1ull << 63); char mp[MAX_PATH] = "?";
+            if (e->fn >> 62) {
+                HMODULE hm = NULL; uint64_t a = e->fn & ~(3ull << 62); char mp[MAX_PATH] = "?";
                 if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)a, &hm) && hm) GetModuleFileNameA(hm, mp, MAX_PATH);
                 const char *b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
-                snprintf(hn, sizeof hn, " = host %s+%llx", b, (unsigned long long)(a - (uint64_t)(uintptr_t)hm));
+                snprintf(hn, sizeof hn, " = host %s%s+%llx", (e->fn >> 63) ? "" : "caller ", b, (unsigned long long)(a - (uint64_t)(uintptr_t)hm));
             }
             LOG("r1: RB PROF 3 %s %s %s %llx%s: %.4f ms per %s (%lld of %lld samples); self %.4f\n", kd ? "re-run" : "real", sgn[sg], inc ? "incl" : "self", (unsigned long long)e->fn, hn,
                 v * 0.1 / div, sg == 4 ? "capture" : sg == 5 ? "load" : "pass", v, tot, e->self[kd][sg] * 0.1 / div);
