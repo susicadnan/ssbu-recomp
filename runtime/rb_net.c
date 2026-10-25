@@ -15,6 +15,7 @@
  *   SSBU_RB_NET_LOG=<file> one line per finalized frame: "f <frame> h <checksum>" (compare two games' files)
  *   SSBU_RB_NET_AHEAD=<n>  most frames this game runs ahead of the newest remote pad (default 7 = the ring depth)
  *   SSBU_RB_NET_FIND=0     (R3 net3) no opponent search through the lobby (lobby / LAN mode without a room: the old way)
+ *   SSBU_RB_NET_PREDRAIN=1 experimental: apply inputs received during pacing before the next simulation pass (default off)
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <stdio.h>
@@ -39,6 +40,7 @@ int net_mode(void);
 int net_online(void);
 
 static int g_on = -1, g_loop, g_loop_lat = 4, g_local, g_delay_cfg = -1, g_ahead = 7, g_started, g_peer_started;
+static int g_predrain;
 static unsigned g_bot_seed; static int g_bot;
 static FILE *g_hlog;
 static volatile LONG64 g_cur;                          /* the frame this game is on (read by the receive thread for PONGs) */
@@ -61,6 +63,7 @@ int rbn_on(void) {
     }
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
+    { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = v && atoi(v) > 0; }
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
     g_local = 0;
     if (!g_loop && net_online() && net_mode() == 3) g_local = 1;      /* NET_MODE_JOIN */
@@ -625,6 +628,7 @@ static long long g_f0;                                  /* the base frame (the r
 static int g_delay, g_remote = 1;
 static long long g_peer_ack, g_sent_newest;
 static long long g_stat_pred, g_stat_padget, g_stat_mis;
+static long long g_preframe_pads;
 static long long g_ts_n; static double g_ts_extra;     /* time sync: extra ms per frame for the next frames */
 static int g_ts_left;
 static uint64_t g_hacc = 0xcbf29ce484222325ull; static int g_hlines;
@@ -778,6 +782,16 @@ void rbn_drain(long long cur) {
         if (m.check_frame > 0) on_check(m.check_frame, m.check);
     }
 }
+/* Main thread, after pacing and before any input reads of the next real pass. Inputs can arrive while the timer waits;
+ * leaving them queued would make that pass predict inputs we already have. Drain only at the pass boundary, never
+ * between its pad reads. Mismatches in earlier passes stay pending for the normal safe-point rollback; they must not
+ * be consumed or finalized here. The loop test's artificial delivery schedule stays unchanged. */
+void rbn_before_frame(long long cur) {
+    if (!g_predrain || !g_started || g_loop) return;
+    int before = rb_input_remote_latest(g_remote);
+    rbn_drain(cur);
+    g_preframe_pads += rb_input_remote_latest(g_remote) - before;
+}
 int rbn_take_mismatch(void) { int m = rb_input_take_mismatch(); if (m) g_stat_mis++; return m; }
 void rbn_put_mismatch(int m) { rb_input_put_mismatch(m); if (m) g_stat_mis--; }      /* (R3 pub1) r1_ring_load refused: the wrong guess stays pending */
 long long rbn_confirmed(void) { return rb_input_remote_latest(g_remote); }
@@ -902,6 +916,7 @@ double rbn_offset_ms(void) { return rb_ts_offset() / 1000.0; }
 void rbn_match_reset(void) {
     g_started = 0; g_peer_started = 0; g_f0 = 0; InterlockedExchange(&g_peer_mode, -1); g_peer_ack = 0; g_sent_newest = 0;
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
+    g_preframe_pads = 0;
     g_hacc = 0xcbf29ce484222325ull; g_hlines = 0; g_lacc_n = 0;
     memset(g_hash, 0, sizeof g_hash); memset(g_hframe, 0, sizeof g_hframe); g_hfinal_upto = 0;
     g_desync = 0; g_check_ok = 0; g_desync_first = -1; g_peer_check_f = 0; g_peer_check = 0;
@@ -924,6 +939,7 @@ void rbn_report(FILE *o, long long frames) {
     fprintf(o, "[rbnet] report: pads given %lld, predicted %lld (%.1f%%), mispredictions %lld; finalized frames %lld; checksums compared %lld, DESYNCS %lld (first %lld)\n",
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
+    fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);
