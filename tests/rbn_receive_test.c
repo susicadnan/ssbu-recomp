@@ -151,6 +151,49 @@ static void resend_tests(void) {
     g_resend_ms = 50;
 }
 
+static void record_rtts(int count, int us) {
+    AcquireSRWLockExclusive(&g_rq_lock);
+    for (int k = 0; k < count; k++) rtt_sample_locked(us);
+    ReleaseSRWLockExclusive(&g_rq_lock);
+}
+static void rtt_window_tests(void) {
+    rbn_match_reset(); g_loop = 0; g_delay_cfg = -1; g_lockstep = 0; g_peer_mode = -1;
+    rtt_reset(); g_recent_rtt = 1;
+    CHECK(auto_delay() == 2 && lock_delay() == 4, "unknown RTT keeps existing delay fallbacks");
+    record_rtts(8, 78000);
+    CHECK(rtt_for_delay(1) == 78000 && auto_delay() == 3, "partial recent window uses available samples");
+    record_rtts(2992, 78000);    /* five minutes on the direct path, then 3.2 seconds on a slower relay */
+    record_rtts(32, 293000);
+    g_recent_rtt = 0; int legacy_slow = auto_delay(), legacy_lock = lock_delay();
+    g_recent_rtt = 1; int recent_slow = auto_delay(), recent_lock = lock_delay();
+    CHECK(legacy_slow == 3 && recent_slow == 6, "recent RTT adapts the next match to a slower route");
+    CHECK(legacy_lock == 4 && recent_lock == 10, "lockstep fallback also covers the current route");
+    RbnRttStats s = rtt_stats(1);
+    CHECK(s.n == 32 && s.best_us == 293000 && s.mean_us == 293000, "recent window forgets the previous path");
+    CHECK(g_rtt_n == 3032 && g_rtt_min_us == 78000, "all-session reporting retains its full history");
+    rbn_match_reset(); CHECK(g_rtt_recent_n == 32, "RTT history survives rematches with the same opponent");
+
+    rtt_reset(); record_rtts(3000, 293000); record_rtts(32, 78000);
+    g_recent_rtt = 0; int legacy_fast = auto_delay();
+    g_recent_rtt = 1; int recent_fast = auto_delay();
+    CHECK(legacy_fast == 6 && recent_fast == 3, "recovered direct path can lower the next match's delay again");
+    g_delay_cfg = 2; CHECK(auto_delay() == 2, "fixed user delay overrides the RTT estimator"); g_delay_cfg = -1;
+
+    rtt_reset();
+    record_rtts(16, 78000); record_rtts(16, 98000);
+    CHECK(rtt_for_delay(0) == 78000 && rtt_for_delay(1) == 93000 && auto_delay() == 4,
+          "recent estimator preserves the existing jitter formula");
+    g_loop = 1; CHECK(auto_delay() == 2, "loop bot keeps its deterministic delay"); g_loop = 0;
+    rtt_reset(); CHECK(g_rtt_n == 0 && g_rtt_recent_n == 0 && g_rtt_us == -1, "new opponent resets both RTT histories");
+    /* Exercise the real PONG decoder once as well. No exact elapsed-time assertion depends on machine scheduling. */
+    RbMsg pong = {0}; uint8_t b[32]; pong.type = RB_MSG_PONG; pong.echo_us = now_us() - 78000;
+    size_t n = rb_msg_build(b, sizeof b, &pong); rbn_rx(b, (int)n);
+    CHECK(g_rtt_n == 1 && g_rtt_recent_n == 1, "valid PONG feeds both estimators");
+    printf("RTT_TRACE direct->relay: delay %d -> %d, lockstep %d -> %d; relay->direct: delay %d -> %d after 32 new samples\n",
+           legacy_slow, recent_slow, legacy_lock, recent_lock, legacy_fast, recent_fast);
+    rtt_reset(); g_recent_rtt = 0; g_delay_cfg = 2;
+}
+
 /* Identical precomputed delivery schedules are replayed with the feature off and on. Every packet has 16 redundant
  * inputs (within the existing protocol); loss and jitter do not depend on the receiving policy. No wall-clock sleeps.
  * The toy simulation hashes every input, so correctness is checked against a perfect-input reference. */
@@ -235,15 +278,19 @@ int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
     _putenv("SSBU_RB_NET_RESEND_MS=");
+    _putenv("SSBU_RB_NET_RECENT_RTT="); _putenv("SSBU_RB_NET_JITTER=1");
     CHECK(rbn_on() && g_predrain, "pre-frame receive defaults on after in-game validation");
     CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
+    CHECK(!g_recent_rtt, "recent RTT experiment defaults off");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=0"); CHECK(rbn_on() && !g_predrain, "environment can disable pre-frame receive");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
+    g_on = -1; _putenv("SSBU_RB_NET_RECENT_RTT=1"); CHECK(rbn_on() && g_recent_rtt, "recent RTT experiment can be enabled");
     boundary_tests();
     queue_telemetry_tests();
     resend_tests();
+    rtt_window_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);
     compare("jitter-loss", 27000, 9000, 15, 6500, 1);
