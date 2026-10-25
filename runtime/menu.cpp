@@ -1075,6 +1075,14 @@ static void sec_experimental(void) {
 #else
     if (!pname[0]) ImGui::TextDisabled("Empty: your login name is used.");
 #endif
+    /* (2b, net4) the lobby code: only players with the same code see each other's rooms (net_relay.c online_code; "public" = everyone) */
+    static char lcode[33], lcode0[33]; static int lcode_read;
+    if (!lcode_read) { lcode_read = 1; ini_read("online_code", lcode, sizeof lcode); memcpy(lcode0, lcode, sizeof lcode); }
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("Lobby code", "empty = public: everyone's rooms", lcode, sizeof lcode);
+    if (ImGui::IsItemDeactivatedAfterEdit()) ini("online_code", lcode);
+    tag(1, strcmp(lcode, lcode0) != 0);
+    ImGui::SameLine(); ImGui::TextDisabled("a private word you and your friends all enter: only your rooms are listed");
     ImGui::Separator();
     /* (3) online play (net_relay.c / nnldn.c) */
     bool on = O.mode != 0;
@@ -1107,7 +1115,7 @@ static void sec_experimental(void) {
         if (getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
         sec_online();
     }
-    if (online_differs() || S.runahead != S0.runahead || ua_on != ua_on0 || strcmp(pname, pname0)) {
+    if (online_differs() || S.runahead != S0.runahead || ua_on != ua_on0 || strcmp(pname, pname0) || strcmp(lcode, lcode0)) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Saved. These changes are used when the game starts again.");
         if (ImGui::Button("Restart the game now")) restart_game();
