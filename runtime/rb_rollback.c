@@ -85,7 +85,7 @@ void rbn_put_mismatch(int m);
  * capture (3-5 ms of every frame: threads held, the learned pages compared and copied) is left out; the next capture then
  * takes the changes of both frames. A pending wrong guess (a refused load) keeps every capture. SSBU_RB_NET_CAPNEED=0: every
  * frame is captured (the old way). */
-static long long g_rbg_cap_unneeded;
+static long long g_rbg_cap_unneeded, g_rbg_recap_unneeded;
 static int rbg_capture_needed(long long i) {
     static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_NET_CAPNEED"); on = !(e && e[0] == '0'); }
     if (!on || g_rbg_pend > 0 || rbn_loop()) return 1;
@@ -217,6 +217,7 @@ static void rbg_step_body(Ctx *c) {
         else if (g_rbg_recap == 3) want = 0;                                  /* (3: the last one only; a later rollback may load the state this one loaded) */
         else if (r4) want = i == g_rbg_recap_first;
         else want = i == g_rbg_recap_first;
+        if (want && !rbg_capture_needed(i)) { want = 0; g_rbg_recap_unneeded++; }      /* (net4) frame i + 1's pad is here: state i is never loaded */
         if (want) { double tc = now_ms(); if (!rbg_capture(i, c)) g_rbg_capfail++; g_rbg_t_recap += now_ms() - tc; g_rbg_n_recap++; } else g_rbg_capskip++;
         g_rgs_next = i + 1;
         /* (net4) the other player's pads that came while this rollback runs are taken now, so the frames still to be run again
@@ -408,7 +409,7 @@ static void rbg_fight_off(void) {
     g_rbg_in_match = 0; g_rbg_ff_first = -1;
     g_rbg_rb = 0; memset(g_rbg_k, 0, sizeof g_rbg_k); g_rbg_rerun = g_rbg_miss = g_rbg_stalls = g_rbg_capfail = g_rbg_capskip = g_rbg_lastlocal = g_rbg_real = g_rbg_gone = 0;
     g_rbg_stall_ms = g_rbg_load_ms = g_rbg_tick0 = g_rbg_next = g_rbg_last_go = 0;
-    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rbg_mid_dropped = 0; g_rbg_cap_unneeded = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
+    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rbg_mid_dropped = 0; g_rbg_cap_unneeded = 0; g_rbg_recap_unneeded = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
     g_rbg_t_pre = g_rbg_t_load = g_rbg_t_rerun = g_rbg_t_recap = g_rbg_t_pass0 = 0; g_rbg_n_rerun = g_rbg_n_recap = 0;
     g_rbg_wd_before = g_ra_wd_fired;
     g_rbg_pend = 0;
@@ -429,7 +430,7 @@ static void rbg_report(void) {
         g_rbg_real, g_rbg_rb, g_rbg_rerun, g_rbg_k[1], g_rbg_k[2], g_rbg_k[3], g_rbg_k[4], g_rbg_k[5], g_rbg_k[6], g_rbg_k[7], g_rbg_k[RG_MAXSLOT + 1] + g_rbg_k[8], g_rbg_miss);
     LOG("r1: RB NET report: stalls for the other player %lld (%.1f ms in all; %lld of them because the ring was short of memory); captures failed %lld, re-run captures not needed %lld; load mean %.3f ms; peer silent %lld\n",
         g_rbg_stalls, g_rbg_stall_ms, g_rbg_short_waits, g_rbg_capfail, g_rbg_capskip, g_rbg_rb ? g_rbg_load_ms / g_rbg_rb : 0.0, g_rbg_gone);
-    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld\n", g_rbg_mid_dropped, g_rbg_cap_unneeded);
+    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded);
     LOG("r1: RB NET report: ring memory (hs14, fix %s): captures given up %lld, old states freed early %lld, captures skipped to keep the oldest needed state %lld\n",
         g_rg_poolfix ? "on" : "OFF", g_rg_short_n, g_rg_freed_slots, g_rg_skip_full);
     LOG("r1: RB NET report: task-worker watchdog releases %lld (since the process start), rollbacks with the workers not held %lld (watchdog paused at H2: %s)\n", g_ra_wd_fired, g_rbg_rb_unheld, g_rbg_wdfix ? "yes" : "NO");
