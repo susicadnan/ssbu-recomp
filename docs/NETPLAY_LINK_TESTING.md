@@ -62,3 +62,19 @@ Eleven tests cover bidirectional byte preservation, delay and jitter bounds, see
 packet ordering, live profile changes, peer ownership, socket errors and JSON updates. A real loopback subprocess test
 starts with 100% loss, changes the control file to 0%, and verifies an intact datagram round trip before bounded exit.
 This verifies the test helper; paired-game results using it are still pending.
+
+## Live paired-game use (2026-10-25)
+
+The CLI proxy forwarded real host/join game sessions in two same-PC pairs using isolated integration build `b3702f5`
+(PR3/4/5/6/7), direct paths disabled, runtime latency simulation off and fighter files unset. It applied 39 ms each
+direction, then an atomic JSON update to 90 ms when the host started handshake 2, without restarting either game.
+Both pairs completed a natural rematch. Recent-RTT mode passed strict comparison for all 486 first-match and 1,096
+second-match finalized checksums. The baseline's 1,089 common rematch checksums matched, but unequal tail coverage
+(1,094/1,089) failed strict comparison. Detailed estimator/timing tradeoffs are in `NETPLAY_RTT_WINDOW.md` on PR3.
+
+Neither run had queue overflow, send errors or unexpected peers. Configured loss/jitter were zero, although local
+scheduling added jitter. Final periodic counters were collected after both games stopped and the pending queue drained:
+baseline 8,069 received/sent, recent 7,823 received/sent. Windows receive errors (6/12) appeared only after game-process
+shutdown, when their UDP ports closed. The coordinator then terminated only its owned proxy process; these were not
+clean proxy-exit tests. This validates live forwarding/profile changes, not NAT behavior, bandwidth modeling or
+internet performance. More seeds, loss/outages and recovery transitions remain to be tested.
