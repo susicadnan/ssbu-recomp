@@ -476,6 +476,7 @@ static const char *ip_text(uint32_t ip, char *b);
 static volatile uint32_t g_rb_match_peer;              /* (R3 net3) the opponent of the last rollback-match search (lobby 1.4), 0 = none */
 static volatile LONG64 g_rb_rx_other;                  /* (R3 net3) rollback messages from another player than that opponent: dropped */
 static volatile LONG g_rb_nodst; static volatile uint32_t g_rb_dst_said;
+static volatile uint32_t g_rb_direct_from;            /* (net4) the player whose rollback messages came straight from it (T_RB_DIRECT) */
 int net_rb_no_destination(void) { return g_rb_nodst; }
 int net_rb_send(const void *p, int n) {
     if (!net_rb_ready() || n <= 0 || n > 1400) return 0;
@@ -505,7 +506,9 @@ int net_rb_send(const void *p, int n) {
             memcpy(b + 16, p, (size_t)n);
             tx(b, 16 + n, &at);
             InterlockedIncrement64(&g_rb_out_direct);
-            return 1;
+            if (g_rb_direct_from == dst) return 1;
+            /* the other game has not sent us one of these yet: it may be an older version that drops type 22, so the lobby
+             * gets a copy too until it has (a pad message arriving twice changes nothing) */
         }
     }
     hdr(b, T_RB); s64(b + 4, g_cookie); s32(b + 12, dst);
@@ -659,7 +662,7 @@ static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from)
         ReleaseSRWLockExclusive(&g_peers_lock);
         if (!ok || !src || src == g_ip) return;
         if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); return; }    /* (as T_RB: not our opponent) */
-        g_rb_peer = src;
+        g_rb_peer = src; g_rb_direct_from = src;
         InterlockedIncrement64(&g_rb_in_direct);
         rbn_rx(p + 16, n - 16);
         return;
