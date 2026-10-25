@@ -657,12 +657,12 @@ static int auto_delay(void) {
     /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
      * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
      * 2 frames) made rollbacks of 2-3 frames on most changes of the other player's pad. */
-    /* (net4, overnight 2026-10-25) one-way + half a frame, rounded up: the other player's pad of a frame then normally comes
+    /* (net4, overnight 2026-10-25) one-way + a third of a frame, rounded up: the other player's pad of a frame then normally comes
      * during the pass before it, so that frame never runs on a guess, no rollback is needed, and the state before it is not
      * captured either (rbg_capture_needed): rollback is left for the jitter. Measured, two games at 50 ms round trip: with
-     * the delay covering the trip, ticks over budget p90 31.9 -> 16.9 ms, rollbacks 22 -> 2, frames identical. 2 ms: 1 frame;
-     * 20-35 ms: 2; 78 ms: 3; 150 ms: 5; 6 at most. graphics.ini rollback_delay = <n> fixes it (lower = less delay, more rollbacks). */
-    int d = (int)ceil(one_way + 0.5);
+     * the delay covering the trip, ticks over budget p90 31.9 -> 16.9 ms, rollbacks 22 -> 2, frames identical; at 150 ms
+     * (delay 6) 0 rollbacks in 1,485 frames. A third of a frame of margin: 2 ms: 1 frame; 20-40 ms: 2; 78 ms: 3; 100 ms: 4; 150 ms: 5; 6 at most. graphics.ini rollback_delay = <n> fixes it (lower = less delay, more rollbacks). */
+    int d = (int)ceil(one_way + 0.35);
     return d < 1 ? 1 : d > 6 ? 6 : d;
 }
 void rbn_start(long long f0) {

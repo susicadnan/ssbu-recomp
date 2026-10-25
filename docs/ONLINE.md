@@ -158,8 +158,8 @@ Rollback is **on by default**; `rollback = off` in `config\graphics.ini` (or F1 
 "Restart the game now" applies the switch too.
 
 Input delay is chosen from the best measured round trip so that the other player's input normally arrives just before
-it is needed: the one-way time plus half a frame, rounded up. Round trip up to about 17 ms: 1 frame; up to 50 ms: 2;
-up to 83 ms: 3; up to 117 ms: 4; up to 150 ms: 5; above: 6. Rollback then only covers lag spikes, and the frames whose
+it is needed: the one-way time plus a third of a frame, rounded up. Round trip up to about 22 ms: 1 frame; up to 55 ms: 2;
+up to 88 ms: 3; up to 122 ms: 4; up to 155 ms: 5; above: 6. Rollback then only covers lag spikes, and the frames whose
 input is already there cost less (no state is saved for them). A lower `rollback_delay` gives less input delay and more
 rollbacks (each one shows as a slightly late frame). `rollback_delay = <frames>` in `config\graphics.ini` fixes it instead (`auto` = the rule above).
 
