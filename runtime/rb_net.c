@@ -646,6 +646,26 @@ static long long g_stat_pred, g_stat_padget, g_stat_mis;
 static long long g_preframe_pads;
 static double g_resend_last_ms = -1;
 static long long g_stall_resends;
+/* Time from network-thread enqueue to main-thread consumption, excluding network transit. A bounded histogram
+ * avoids allocation/sorting on the simulation thread. Bins 0..31 are [n,n+1) ms; bin 32 is the overflow bucket. */
+static struct { uint64_t samples, sum_us, max_us, bins[33]; } g_rx_wait;
+static void rx_wait_sample(uint64_t us) {
+    unsigned bin = us >= 32000 ? 32 : (unsigned)(us / 1000);
+    g_rx_wait.samples++; g_rx_wait.sum_us += us; g_rx_wait.bins[bin]++;
+    if (us > g_rx_wait.max_us) g_rx_wait.max_us = us;
+}
+static double rx_wait_bound(int percent) {
+    if (!g_rx_wait.samples) return 0;
+    uint64_t rank = (g_rx_wait.samples * (unsigned)percent + 99) / 100, seen = 0;
+    for (unsigned bin = 0; bin < 33; bin++) {
+        seen += g_rx_wait.bins[bin];
+        if (seen >= rank) {
+            uint64_t bound = bin == 32 ? g_rx_wait.max_us : (bin + 1) * 1000;
+            return (bound < g_rx_wait.max_us ? bound : g_rx_wait.max_us) / 1000.0;
+        }
+    }
+    return g_rx_wait.max_us / 1000.0;
+}
 static long long g_ts_n; static double g_ts_extra;     /* time sync: extra ms per frame for the next frames */
 static int g_ts_left;
 static uint64_t g_hacc = 0xcbf29ce484222325ull; static int g_hlines;
@@ -802,6 +822,7 @@ void rbn_drain(long long cur) {
         RbMsg m;
         if (!rb_msg_parse(b, (size_t)n, &m)) { g_rx_bad++; continue; }
         if (m.type != RB_MSG_PADS || !g_started || m.player != g_remote) continue;
+        if (m.count) { uint64_t consumed = now_us(); rx_wait_sample(consumed >= at ? consumed - at : 0); }
         g_peer_started = 1;
         for (int k = 0; k < m.count; k++) rb_input_remote_put(g_remote, m.newest - k, m.pads[k]);
         if (m.ack > g_peer_ack && m.ack <= rb_input_local_latest()) g_peer_ack = m.ack;      /* (hs12: never an acknowledgement of pads not sent yet) */
@@ -951,6 +972,7 @@ void rbn_match_reset(void) {
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
     g_preframe_pads = 0;
     g_resend_last_ms = -1; g_stall_resends = 0;
+    memset(&g_rx_wait, 0, sizeof g_rx_wait);
     g_hacc = 0xcbf29ce484222325ull; g_hlines = 0; g_lacc_n = 0;
     memset(g_hash, 0, sizeof g_hash); memset(g_hframe, 0, sizeof g_hframe); g_hfinal_upto = 0;
     g_desync = 0; g_check_ok = 0; g_desync_first = -1; g_peer_check_f = 0; g_peer_check = 0;
@@ -975,6 +997,9 @@ void rbn_report(FILE *o, long long frames) {
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
     fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
+    fprintf(o, "[rbnet] report: input receive-queue wait (not network transit): %llu packets, mean %.3f ms, p50/p95/p99 upper bounds %.3f/%.3f/%.3f ms, max %.3f ms\n",
+            (unsigned long long)g_rx_wait.samples, g_rx_wait.samples ? g_rx_wait.sum_us / (double)g_rx_wait.samples / 1000.0 : 0.0,
+            rx_wait_bound(50), rx_wait_bound(95), rx_wait_bound(99), g_rx_wait.max_us / 1000.0);
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);

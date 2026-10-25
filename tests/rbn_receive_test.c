@@ -71,6 +71,7 @@ static void boundary_tests(void) {
     rbn_before_frame(0);
     CHECK(rbn_pad(1, 1).buttons == 1 && g_stat_pred == 0, "available input is used without prediction");
     CHECK(g_preframe_pads == 1 && g_cur == 0, "account for received frames without advancing the clock");
+    CHECK(g_rx_wait.samples == 1, "queue residence is measured for applied input packets");
     CHECK(rbn_take_mismatch() == 0, "input received before simulation needs no rollback");
     receive_one(2, 2);              /* arrives between pad reads: it must stay queued */
     CHECK(rbn_pad(1, 2).buttons == 1 && rbn_pad(1, 2).buttons == 1, "pad reads cannot drain halfway through a pass");
@@ -84,6 +85,7 @@ static void boundary_tests(void) {
     receive(&m, 1);
     rbn_before_frame(0);
     CHECK(rbn_confirmed() == 0, "previous-match packets remain rejected");
+    CHECK(g_rx_wait.samples == 0, "rejected match packets cannot pollute queue telemetry");
     receive_one(2, 2); receive_one(1, 1); receive_one(2, 2);
     rbn_before_frame(0);
     CHECK(rbn_confirmed() == 2 && g_preframe_pads == 2, "reordered and duplicated packets confirm once");
@@ -93,6 +95,22 @@ static void boundary_tests(void) {
     g_loop = 0;
     rbn_match_reset(); rbn_before_frame(0);
     CHECK(!g_preframe_pads && !g_started, "no drain between matches; per-match telemetry resets");
+    CHECK(!g_rx_wait.samples, "queue telemetry resets between matches");
+}
+
+static void queue_telemetry_tests(void) {
+    reset_session(1);
+    RbMsg hello = {0}; hello.type = RB_MSG_PADS; hello.player = 1;
+    receive(&hello, 0); rbn_before_frame(0);
+    CHECK(g_rx_wait.samples == 0, "empty startup hello is excluded from input timing samples");
+    CHECK(rx_wait_bound(95) == 0, "no samples have no percentile");
+    for (int i = 0; i < 98; i++) rx_wait_sample(500);
+    rx_wait_sample(31999); rx_wait_sample(100000);
+    CHECK(g_rx_wait.samples == 100 && g_rx_wait.sum_us == 180999, "queue sample counts and sums include outliers");
+    CHECK(rx_wait_bound(50) == 1 && rx_wait_bound(95) == 1, "typical waits use the 1 ms upper bound");
+    CHECK(rx_wait_bound(99) == 32 && rx_wait_bound(100) == 100, "long waits use the right bucket or the observed maximum");
+    rbn_match_reset();
+    rx_wait_sample(400); CHECK(rx_wait_bound(99) == 0.4, "percentile bound never exceeds the observed maximum");
 }
 
 static void resend_tests(void) {
@@ -223,6 +241,7 @@ int main(void) {
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
+    queue_telemetry_tests();
     resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);

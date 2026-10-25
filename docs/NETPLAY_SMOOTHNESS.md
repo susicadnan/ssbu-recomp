@@ -35,6 +35,13 @@ frame, as it does at the ordinary safe point.
 The end-of-match report records whether the option is enabled and how many additional remote frames were confirmed by
 the new drain. This count includes frames that arrived together and is not a count of avoided rollbacks.
 
+The report also measures input receive-queue residence: time between the network thread enqueuing a nonempty input
+packet and the simulation thread consuming it. Network transit is excluded. It reports the sample count, mean,
+maximum, and p50/p95/p99 upper bounds from fixed one-millisecond histogram buckets. Values above 32 ms share an
+overflow bucket whose bound is the observed maximum, so these are bounds, not exact percentiles. Empty startup
+messages and rejected packets are excluded, and counters reset between matches. This helps distinguish network
+conditions from inputs waiting on local simulation work without allocating or sorting during a frame.
+
 ## Reproduce the game-free tests (Windows)
 
 Use the project's clang and Windows SDK/MSVC headers and libraries:
