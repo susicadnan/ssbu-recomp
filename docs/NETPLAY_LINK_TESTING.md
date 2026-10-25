@@ -61,7 +61,7 @@ python tools/net/test_netplay_proxy.py
 Eleven tests cover bidirectional byte preservation, delay and jitter bounds, seeded loss, full outages, bounded queues,
 packet ordering, live profile changes, peer ownership, socket errors and JSON updates. A real loopback subprocess test
 starts with 100% loss, changes the control file to 0%, and verifies an intact datagram round trip before bounded exit.
-This verifies the test helper; paired-game results using it are still pending.
+This verifies the test helper; live paired-game use is recorded below.
 
 ## Live paired-game use (2026-10-25)
 
