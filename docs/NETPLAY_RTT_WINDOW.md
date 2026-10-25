@@ -3,7 +3,7 @@
 `SSBU_RB_NET_RECENT_RTT=1` is an optional experiment. It chooses the next match's automatic input delay using the most
 recent 32 valid round-trip measurements, rather than the best and mean of the entire session. The existing jitter
 formula is preserved: best RTT plus 1.5 times the difference between mean and best, after ten samples. The default
-remains the full-session estimator until paired game tests compare the experiment.
+remains the full-session estimator while broader paired-game comparisons continue.
 
 Pings are sent every 100 ms, so a full window represents about 3.2 seconds with no loss. Thirty-two **received samples**
 are needed to completely replace older conditions; packet loss can make this take longer. A partial window uses the
@@ -56,7 +56,7 @@ build. Both test installations lacked that header and used the same record ident
 Two sequential same-PC pairs used one natural rematch, bots 7/11, one stock, a fixed handshake seed, no fighter debug
 file, direct paths disabled and runtime latency simulation off. The loopback proxy changed from 39 to 90 ms delay in
 each direction when the host began its second handshake. Configured jitter/loss were zero; actual RTTs included local
-scheduling jitter (roughly 80–100 ms initially and 185–197 ms after the change). These are two observed runs, not an
+scheduling jitter (roughly 80â€“100 ms initially and 185â€“197 ms after the change). These are two observed runs, not an
 identical packet trace: the same proxy seed cannot reproduce concurrent arrival order.
 
 | Second-match result | Full-session estimator | Recent 32-sample window |
