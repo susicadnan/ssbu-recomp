@@ -135,10 +135,9 @@ sees rooms of its own build.
 
 ## Rollback netcode (experimental)
 
-For controlled smoothness testing, `SSBU_RB_NET_PREDRAIN=1` applies inputs that arrived during the frame-pacing wait
-before the next simulation pass reads its controllers. It does not change the configured input delay or the wire
-protocol. It defaults off pending in-game determinism and frame-time comparisons. See
-[the experiment and reproducible tests](NETPLAY_SMOOTHNESS.md). Separately, `SSBU_RB_NET_RESEND_MS=17` retries outstanding
+Pre-frame receiving is on by default: inputs that arrived during the frame-pacing wait are applied before the next
+simulation pass reads its controllers. `SSBU_RB_NET_PREDRAIN=0` disables it for comparisons. See
+[the measurements and reproducible tests](NETPLAY_SMOOTHNESS.md). Separately, `SSBU_RB_NET_RESEND_MS=17` retries outstanding
 inputs more frequently while stalled (default 50 ms; valid 8..50). This also remains an optional experiment.
 
 Smooth fights at high ping: each game runs the match locally and only the players' inputs travel; a late input rolls the

@@ -1,4 +1,4 @@
-# Pre-frame input receive experiment
+# Input receiving and stalled-connection recovery
 
 ## Input retries while stalled
 
@@ -24,7 +24,8 @@ The main thread drains incoming inputs at the safe point, then waits for the nex
 that wait used to remain queued until after the next simulation pass. That pass could predict an input already received
 by the network thread, and then replay it when the safe point finally applied the packet.
 
-`SSBU_RB_NET_PREDRAIN=1` adds a drain after pacing, before any controller reads of the next real pass. Default: off.
+Pre-frame receiving adds a drain after pacing, before any controller reads of the next real pass. It is on by default
+following in-game validation; `SSBU_RB_NET_PREDRAIN=0` disables it for comparisons.
 The delay setting, wire protocol, packet rate, and rollback depth are unchanged. The loop bot's synthetic delivery
 schedule is unchanged. The receive thread still only queues input; the main thread applies it.
 
@@ -54,8 +55,8 @@ rbn_receive_test.exe
 ```
 
 `rbn_receive_test` includes the actual session code, wire parser, tagged packet receive queue, input prediction and
-mismatch handling. Only game, rendering and transport services are stubbed. It verifies default-off behavior,
-environment opt-in, no mid-pass drain, preservation of earlier mismatches, no premature finalization, duplicate and
+mismatch handling. Only game, rendering and transport services are stubbed. It verifies default-on behavior,
+the environment override, no mid-pass drain, preservation of earlier mismatches, no premature finalization, duplicate and
 reordered packets, previous-match rejection, match reset, and the unchanged loop delivery schedule.
 
 The timing model runs 1,800 frames per policy, with a fixed seed, a two-frame input delay, 16 redundant inputs per
@@ -78,7 +79,7 @@ All five scenarios ended at the same reference state for both policies. The exis
 rollbacks, 512 replayed frames, deepest rollback six frames). Both `rb_net.c` and its caller in `r1_state.c` compiled
 with the Windows toolchain. This does not validate game snapshot restore or render/audio behavior.
 
-## In-game acceptance before enabling by default
+## In-game validation and remaining comparisons
 
 Claude ran build `c828bea` (pre-frame receive plus receive-window fixes) on 2026-10-25 with two game instances on one PC,
 host/join through the in-game lobby, bots 7/11, Final Destination, 75 ms simulated one-way delay on each sender (150 ms
@@ -103,5 +104,6 @@ Compare the per-frame finalized state logs with `tests/rbn_cmp.py`; require no d
 Include rematches and mixed peers (the option only affects local receive scheduling).
 
 Measure tick-to-tick p50/p90/p99, frames over 16.67 and 33.4 ms, replayed frames, stalls, and input delay at normal speed.
-Confirm with a two-PC internet match. Until those checks pass, keep the option off in the installed game. No Slippi
-comparison has been run, and no claim of superior performance is supported by these tests.
+Confirm with a two-PC internet match. The tests above support pre-frame receiving; the shorter retry interval still
+needs independent in-game comparisons before its default changes. No Slippi comparison has been run, and no claim of
+superior performance is supported by these tests.

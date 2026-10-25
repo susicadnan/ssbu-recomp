@@ -235,8 +235,9 @@ int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
     _putenv("SSBU_RB_NET_RESEND_MS=");
-    CHECK(rbn_on() && !g_predrain, "feature defaults off");
+    CHECK(rbn_on() && g_predrain, "pre-frame receive defaults on after in-game validation");
     CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
+    g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=0"); CHECK(rbn_on() && !g_predrain, "environment can disable pre-frame receive");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
