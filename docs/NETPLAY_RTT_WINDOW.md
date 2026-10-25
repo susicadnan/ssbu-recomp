@@ -36,6 +36,11 @@ Tests also check unknown-RTT fallbacks, partial windows, preservation of full-se
 new-opponent reset, loop-mode behavior and fixed-delay overrides. These are estimator tests. They do not prove a
 two-PC latency or frame-time improvement.
 
+The core time-sync test also covers `INT32_MIN` offsets. Negating that value in 32-bit arithmetic was undefined; the
+calculation now widens before negation and caps the number of extra frames before narrowing. The previous implementation
+traps under undefined-behavior instrumentation for this case; the corrected core and session suites pass. This is an
+edge-case arithmetic fix, not a measured frame-time optimization.
+
 For in-game validation, compare steady links at 2/78/150 ms first, then change simulated delay between matches in a
 multi-match session. Require enough finalized hashes, zero reported desyncs and final-pad differences, and report the
 chosen delay and queue-residence statistics alongside frame-time percentiles. Do not enable this experiment by

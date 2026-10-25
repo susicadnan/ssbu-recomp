@@ -117,6 +117,10 @@ static void ts_tests(void) {
     CHECK(a.speed > 1.0 && a.advance == 2, "behind: speed %.3f advance %d", a.speed, a.advance);
     a = rb_ts_decide(301);
     CHECK(a.speed == 1.0 && !a.advance, "decides only every 30 frames");
+    rb_ts_reset(1);
+    for (int i = 0; i < 30; i++) rb_ts_sample(INT32_MIN);
+    a = rb_ts_decide(300);
+    CHECK(a.advance == 3 && a.speed > 1.0, "extreme behind offset remains capped without signed overflow: %d", a.advance);
 }
 
 #define SIDE_FRAMES 3000
