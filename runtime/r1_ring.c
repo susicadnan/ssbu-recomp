@@ -907,7 +907,14 @@ static void rgs_samp_report(void) {
         long long tot = sg >= 4 ? g_rgss_tot[0][sg] + g_rgss_tot[1][sg] : g_rgss_tot[kd][sg]; long long div = sg >= 4 ? (g_rg_caps + g_rg_loads ? (sg == 4 ? g_rg_caps : g_rg_loads) : 1) : (kd ? nr : np);
         for (int i = 0; i < (sg == 2 ? 80 : 40); i++) {
             RgsS *e = &g_rgss_c[i]; long long v = inc ? e->incl[kd][sg] : e->self[kd][sg]; if (!v) break;
-            LOG("r1: RB PROF 3 %s %s %s %llx: %.4f ms per %s (%lld of %lld samples); self %.4f\n", kd ? "re-run" : "real", sgn[sg], inc ? "incl" : "self", (unsigned long long)e->fn,
+            char hn[96] = "";                                /* (net4) a host address named by its module and offset (the linker map gives the function) */
+            if (e->fn >> 63) {
+                HMODULE hm = NULL; uint64_t a = e->fn & ~(1ull << 63); char mp[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)a, &hm) && hm) GetModuleFileNameA(hm, mp, MAX_PATH);
+                const char *b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                snprintf(hn, sizeof hn, " = host %s+%llx", b, (unsigned long long)(a - (uint64_t)(uintptr_t)hm));
+            }
+            LOG("r1: RB PROF 3 %s %s %s %llx%s: %.4f ms per %s (%lld of %lld samples); self %.4f\n", kd ? "re-run" : "real", sgn[sg], inc ? "incl" : "self", (unsigned long long)e->fn, hn,
                 v * 0.1 / div, sg == 4 ? "capture" : sg == 5 ? "load" : "pass", v, tot, e->self[kd][sg] * 0.1 / div);
         }
         memcpy(g_rgss_c, g_rgss, sizeof g_rgss);

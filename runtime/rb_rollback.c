@@ -86,7 +86,7 @@ void rbn_put_mismatch(int m);
  * takes the changes of both frames. A pending wrong guess (a refused load) keeps every capture. SSBU_RB_NET_CAPNEED=0: every
  * frame is captured (the old way). */
 static long long g_rbg_cap_unneeded, g_rbg_recap_unneeded;
-static long long g_rbg_wait_rb;                        /* (net4) rollbacks started inside the wait for the tick */
+static long long g_rbg_wait_rb, g_rbg_wait_busy;                        /* (net4) rollbacks started inside the wait for the tick */
 static int rbg_capture_needed(long long i) {
     static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_NET_CAPNEED"); on = !(e && e[0] == '0'); }
     if (!on || g_rbg_pend > 0 || rbn_loop()) return 1;
@@ -317,10 +317,18 @@ static void rbg_step_body(Ctx *c) {
          * the same tick. SSBU_RB_NET_WAITRB=0: the old way (test). */
         {   static int wrb = -1; if (wrb < 0) { const char *e = getenv("SSBU_RB_NET_WAITRB"); wrb = !(e && e[0] == '0'); }
             if (wrb && !g_rbg_noring && !rbn_loop()) {
+                int tries = 0;
                 while (now_ms() < g_rbg_next) {
                     rbn_drain(i);
                     int m = rbn_take_mismatch();
-                    if (m > 0 && m <= i) { g_rbg_wait_rb++; if (rbg_rollback(c, i, m)) return; }
+                    if (m > 0 && m <= i) {
+                        /* the other threads are running here (not held as at a safe point): the load needs them at their waits.
+                         * A short try (2 ms) to hold them; busy (a job in flight, the sound thread) -> the wrong guess stays
+                         * pending for the next safe point, as before (a load with a long hold or refused is worse than that) */
+                        double keep = g_rg_park_ms; g_rg_park_ms = 2.0; int held = r1_ring_hold(); g_rg_park_ms = keep;
+                        if (held) { g_rbg_wait_rb++; if (rbg_rollback(c, i, m)) return; r1_ring_let_go(); }
+                        else { rbn_put_mismatch(m); g_rbg_wait_busy++; if (++tries >= 2) { rbg_wait_until(g_rbg_next); break; } }
+                    }
                     double left = g_rbg_next - now_ms();
                     if (left > 0.6) rbg_wait_until(now_ms() + 0.5); else if (left > 0) rbg_wait_until(g_rbg_next);
                 }
@@ -424,7 +432,7 @@ static void rbg_fight_off(void) {
     g_rbg_in_match = 0; g_rbg_ff_first = -1;
     g_rbg_rb = 0; memset(g_rbg_k, 0, sizeof g_rbg_k); g_rbg_rerun = g_rbg_miss = g_rbg_stalls = g_rbg_capfail = g_rbg_capskip = g_rbg_lastlocal = g_rbg_real = g_rbg_gone = 0;
     g_rbg_stall_ms = g_rbg_load_ms = g_rbg_tick0 = g_rbg_next = g_rbg_last_go = 0;
-    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rbg_mid_dropped = 0; g_rbg_cap_unneeded = 0; g_rbg_recap_unneeded = 0; g_rbg_wait_rb = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
+    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rbg_mid_dropped = 0; g_rbg_cap_unneeded = 0; g_rbg_recap_unneeded = 0; g_rbg_wait_rb = 0; g_rbg_wait_busy = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
     g_rbg_t_pre = g_rbg_t_load = g_rbg_t_rerun = g_rbg_t_recap = g_rbg_t_pass0 = 0; g_rbg_n_rerun = g_rbg_n_recap = 0;
     g_rbg_wd_before = g_ra_wd_fired;
     g_rbg_pend = 0;
@@ -445,7 +453,7 @@ static void rbg_report(void) {
         g_rbg_real, g_rbg_rb, g_rbg_rerun, g_rbg_k[1], g_rbg_k[2], g_rbg_k[3], g_rbg_k[4], g_rbg_k[5], g_rbg_k[6], g_rbg_k[7], g_rbg_k[RG_MAXSLOT + 1] + g_rbg_k[8], g_rbg_miss);
     LOG("r1: RB NET report: stalls for the other player %lld (%.1f ms in all; %lld of them because the ring was short of memory); captures failed %lld, re-run captures not needed %lld; load mean %.3f ms; peer silent %lld\n",
         g_rbg_stalls, g_rbg_stall_ms, g_rbg_short_waits, g_rbg_capfail, g_rbg_capskip, g_rbg_rb ? g_rbg_load_ms / g_rbg_rb : 0.0, g_rbg_gone);
-    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld; rollbacks started inside the wait for the tick %lld\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded, g_rbg_wait_rb);
+    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld; rollbacks started inside the wait for the tick %lld (left for the safe point, threads busy: %lld)\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded, g_rbg_wait_rb, g_rbg_wait_busy);
     LOG("r1: RB NET report: ring memory (hs14, fix %s): captures given up %lld, old states freed early %lld, captures skipped to keep the oldest needed state %lld\n",
         g_rg_poolfix ? "on" : "OFF", g_rg_short_n, g_rg_freed_slots, g_rg_skip_full);
     LOG("r1: RB NET report: task-worker watchdog releases %lld (since the process start), rollbacks with the workers not held %lld (watchdog paused at H2: %s)\n", g_ra_wd_fired, g_rbg_rb_unheld, g_rbg_wdfix ? "yes" : "NO");
