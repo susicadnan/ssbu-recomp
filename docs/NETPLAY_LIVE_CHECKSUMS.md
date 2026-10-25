@@ -13,6 +13,11 @@ installation of the checksum hook. No wire-format or handshake change is require
 and desync-reporting path consumes the checksums; this change does not add state resynchronization or hash every byte
 of game memory. It uses the same logged fighter/RNG/input subset as the existing explicit-file tests.
 
+Network collection is also independent of the eight-entry lifetime table used for debug frame counts. If a new fighter
+object is no longer represented in that table, its entry is resolved directly and its state still contributes to the
+network checksum. File diagnostics continue to use tracked entries. This does not reset game RNG state or change
+first-fight initialization; natural long-rematch coverage is still required.
+
 ## Verified and pending
 
 The session test supplies representative state records with `SSBU_FIGHT_HASH` unset, finalizes them, verifies that an
