@@ -32,6 +32,7 @@ def main():
                 N5_STOP_ON='fight.off', SSBU_DEBUG_MATCH='p1=mario,p2=donkey,p2=human,stage=end')
     base.update(both)
     port = base.pop('RBN_PORT', '39520')
+    min_frames = base.pop('RBN_MIN_FRAMES', '120')  # no empty / metadata-only comparison can count as a successful pair
     stagger = float(base.pop('RBN_STAGGER', '3'))      # hs12: seconds between the two starts (two boots at once sometimes miss the title screen)
     procs = []
     for side in ('h', 'j'):
@@ -44,23 +45,33 @@ def main():
         procs.append((t, subprocess.Popen([sys.executable, os.path.join(HERE, 'n11_run.py'), t] + ['%s=%s' % kv for kv in env.items()],
                                           cwd=STUDY, stdout=out, stderr=subprocess.STDOUT), out))
         time.sleep(stagger)
+    failed = 0
     for t, p, out in procs:
         p.wait()
         out.close()
-        print(open(os.path.join(LOGS, 'rbn_pair_%s.out' % t)).readline().strip())
-    subprocess.run([sys.executable, os.path.join(HERE, 'rbn_cmp.py'), os.path.join(LOGS, 'rbn_%sh.txt' % tag), os.path.join(LOGS, 'rbn_%sj.txt' % tag)])
+        with open(os.path.join(LOGS, 'rbn_pair_%s.out' % t)) as result:
+            summary = result.readline().strip()
+        print(summary)
+        # n11_run reports the game's result in its first line; older copies do not propagate that exit status.
+        if p.returncode or not (summary.startswith(t + ': EXIT 0 after ') or summary.startswith(t + ': STOPPED at N5_STOP_ON after ')):
+            failed = 1
+    comparison = subprocess.run([sys.executable, os.path.join(HERE, 'rbn_cmp.py'), os.path.join(LOGS, 'rbn_%sh.txt' % tag), os.path.join(LOGS, 'rbn_%sj.txt' % tag), '--min-frames', min_frames])
+    failed = max(failed, comparison.returncode if comparison.returncode >= 0 else 1)
     for t, _, _ in procs:
         print('==', t)
-        lines = open(os.path.join(LOGS, 'r1_%s.txt' % t), errors='replace').read().splitlines()
+        with open(os.path.join(LOGS, 'r1_%s.txt' % t), errors='replace') as report:
+            lines = report.read().splitlines()
         keep = [l for l in lines if 'start barrier' in l or 'RB NET report' in l or ('RB NET TIMING' in l and 'with rollback' in l) or '[rbnet] report' in l or 'DESYNC' in l
                 or 'RING rebase' in l or 'match start, base' in l or 'not agreed' in l or 'RB NET: match' in l or 'ring memory' in l
                 or ('RB NET TIMING' in l and 'tick to tick' in l)]
         for l in keep:                                # (hs12: one report per match now)
             print('  ' + l[:330])
-        for l in open(os.path.join(LOGS, 'n11_%s.log' % t), errors='replace'):      # rbn9: the match handshake and the match block check
-            if 'handshake' in l and ('agreed' in l or 'FAILED' in l or 'the match:' in l or 'no panel' in l) or 'match block check' in l or 'notice drawn' in l or 'handshake: stage' in l or 'after the start barrier' in l                     or '[rbnet] match' in l or 'debug panels' in l:
-                print('  ' + l.rstrip()[:330])
+        with open(os.path.join(LOGS, 'n11_%s.log' % t), errors='replace') as game_log:  # rbn9: the match handshake and the match block check
+            for l in game_log:
+                if 'handshake' in l and ('agreed' in l or 'FAILED' in l or 'the match:' in l or 'no panel' in l) or 'match block check' in l or 'notice drawn' in l or 'handshake: stage' in l or 'after the start barrier' in l                     or '[rbnet] match' in l or 'debug panels' in l:
+                    print('  ' + l.rstrip()[:330])
+    return failed
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

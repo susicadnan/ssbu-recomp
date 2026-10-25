@@ -73,6 +73,23 @@ with the Windows toolchain. This does not validate game snapshot restore or rend
 
 ## In-game acceptance before enabling by default
 
+Claude ran build `c828bea` (pre-frame receive plus receive-window fixes) on 2026-10-25 with two game instances on one PC,
+host/join through the in-game lobby, bots 7/11, Final Destination, 75 ms simulated one-way delay on each sender (150 ms
+RTT), PREDRAIN enabled, and explicit SSBU_FIGHT_HASH logs on both. Codex independently compared the resulting `cdx1`
+session logs using a minimum of 1,700 frames and strict coverage: **1,792 matching finalized frame checksums**, frames
+1..1792 on both peers. The host's report shows 1,221 checksum comparisons, zero reported desyncs and zero final-pad
+discrepancies. These hashes cover the runtime's logged fighter/RNG/input fields, not every byte of game memory.
+
+The host report also shows five additional remote frames confirmed by pre-frame receiving. This run verifies the option
+can operate in a game without a detected mismatch; it is not an off/on performance comparison. Both instances share
+CPU/GPU resources, and tick-to-tick p99 was 128.72 ms in the quoted host report. No real-internet or Slippi performance
+claim follows. The configurable retry interval added in `73aa208` was not part of this run.
+
+The comparison tool now rejects empty or metadata-only logs. Use `--min-frames 1700 --strict` for equal-length 1,800-frame
+test runs, or a justified minimum common-frame count for unequal endpoints. `tests/rbn_pair.py` requires 120 common frames
+per match by default (`RBN_MIN_FRAMES` overrides this) and returns failure when the comparison or either game run fails.
+Do not treat zero reported desyncs as evidence when no checksums were actually compared.
+
 Run paired scripted matches on the same build, with the setting off and on, over multiple seeds and latency/loss
 conditions. Keep input delay, renderer settings, fighters, stage, and snapshot options fixed between comparisons.
 Compare the per-frame finalized state logs with `tests/rbn_cmp.py`; require no desyncs or final-pad discrepancies.
