@@ -95,6 +95,37 @@ static void boundary_tests(void) {
     CHECK(!g_preframe_pads && !g_started, "no drain between matches; per-match telemetry resets");
 }
 
+static uint64_t retention_step(uint64_t state, RbPad p) { return state * 131 + p.buttons; }
+static void retention_tests(void) {
+    reset_session(1);
+    receive_one(1, 0); receive_one(2, 0); rbn_drain(0);
+    uint64_t history[7] = {0}, reference = 0;
+    for (int f = 1; f <= 6; f++) {
+        rbn_local_pad(f, (RbPad){0});
+        history[f] = retention_step(history[f - 1], rbn_pad(1, f));
+        reference = retention_step(reference, (RbPad){f < 3 ? 0 : 1});
+    }
+    /* A rollback has replayed frame 3 using its old guess and captured states 2 and 3. The middle drain now
+     * confirms 3..6, discovers that frame 3 was wrong, and puts the correction back for the next rollback. */
+    for (int f = 3; f <= 6; f++) receive_one(f, 1);
+    rbn_drain(6);
+    int mismatch = rbn_take_mismatch(); rbn_put_mismatch(mismatch);
+    CHECK(mismatch == 3 && rbn_confirmed() == 6, "inputs can be fully received while an earlier correction remains pending");
+    long long floor = rbn_snapshot_floor(0);
+    CHECK(floor == 2 && rb_input_pending_mismatch() == 3, "retention pins the state before the pending mismatch without consuming it");
+    /* Model the pool's retention rule: release an older state when a newer one exists at/before its supplied floor.
+     * Old floor=6 discards correct state 2 in favor of wrong state 3; floor=2 retains the state needed for replay. */
+    int retained = 3 <= floor ? 3 : 2;
+    uint64_t restored = history[retained];
+    for (int f = retained + 1; f <= 6; f++) restored = retention_step(restored, rb_input_get(1, f, NULL));
+    CHECK(retained <= mismatch - 1 && restored == reference, "memory-pressure retention preserves a state that can reproduce the reference");
+    mismatch = rbn_take_mismatch();
+    CHECK(rbn_snapshot_floor(mismatch) == 2, "capture immediately before a load also pins the already-taken correction");
+    CHECK(rbn_snapshot_floor(0) == 6, "completed correction can release old history again");
+    CHECK(rbn_snapshot_floor(1) == 0, "a correction at the first frame retains the base state");
+    printf("RETENTION_MODEL confirmed 6, pending correction 3: retained state %d; reference %s\n", retained, restored == reference ? "identical" : "DIFFERS");
+}
+
 static void resend_tests(void) {
     reset_session(0);
     g_resend_ms = 17;
@@ -217,12 +248,13 @@ int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
     _putenv("SSBU_RB_NET_RESEND_MS=");
-    CHECK(rbn_on() && !g_predrain, "feature defaults off");
+    CHECK(rbn_on() && g_predrain, "pre-frame receive defaults on after in-game validation");
     CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
+    retention_tests();
     resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);
