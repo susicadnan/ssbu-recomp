@@ -1014,6 +1014,19 @@ void display_present_done(int fight) {
         memcpy(g_ps_last, g_ps, sizeof g_ps);
     }
 }
+/* (net4) see display_wait_refresh: the pending-rollback question, the wait put off, and the wait made up */
+static int (*g_rb_pending)(void);
+static volatile LONG g_vsync_deferred; static LONG64 g_vsync_deferred_latch, g_vsync_deferred_n;
+void display_set_rb_pending(int (*fn)(void)) { g_rb_pending = fn; }
+long long display_vsync_deferred_count(void) { return g_vsync_deferred_n; }
+void display_wait_refresh_deferred(void) {
+    if (!InterlockedExchange(&g_vsync_deferred, 0)) return;
+    AcquireSRWLockExclusive(&g_vsync_lock);
+    while (g_vsync_n < g_vsync_deferred_latch) SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0);
+    ReleaseSRWLockExclusive(&g_vsync_lock);
+    lat_release();
+    hitch_pacing(0);
+}
 /* New pacing, part 2: holds the caller until the refresh that shows the last queued frame. Returns 1 if it waited. */
 int display_wait_refresh(void) {
     if (old_pacing() || !InterlockedExchange(&g_latch_pending, 0)) return 0;
@@ -1066,11 +1079,23 @@ int display_wait_refresh(void) {
     static int cw = -1;
     if (cw < 0) cw = getenv("SSBU_PACE_COUNTWAIT") && atoi(getenv("SSBU_PACE_COUNTWAIT"));
     uint64_t ca = cw ? g_wnd_count_addr : 0, c0 = ca ? rd64(ca) : 0;
-    LONG64 n0;
+    LONG64 n0, nstart;
     AcquireSRWLockExclusive(&g_vsync_lock);
-    n0 = g_vsync_n;
-    while (g_vsync_n < g_latch) SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0);
-    n0 = g_vsync_n - n0;
+    nstart = g_vsync_n;
+    /* (net4) online rollback: this wait is the frame's idle time (~6 ms of 16.7 at a steady 60 fps). While a rollback is
+     * pending (the other player's input differed from the guess), the game is let go NOW instead: the rollback runs at the
+     * safe point that follows, in this idle time, and the wait for the refresh is made up right before the next real pass
+     * (display_wait_refresh_deferred, from rb_rollback.c). The game's count of refreshes is unchanged: it is read at the
+     * next acquire, after the deferred wait. Checked every millisecond through g_rb_pending (rb_rollback.c). */
+    while (g_vsync_n < g_latch) {
+        SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, g_rb_pending ? 1 : 100, 0);
+        if (g_vsync_n < g_latch && g_rb_pending) {
+            ReleaseSRWLockExclusive(&g_vsync_lock);
+            if (g_rb_pending()) { g_vsync_deferred_latch = g_latch; InterlockedExchange(&g_vsync_deferred, 1); g_vsync_deferred_n++; return 1; }
+            AcquireSRWLockExclusive(&g_vsync_lock);
+        }
+    }
+    n0 = g_vsync_n - nstart;
     ReleaseSRWLockExclusive(&g_vsync_lock);
     if (ca && n0 > 0) {
         LARGE_INTEGER t0, t1;

@@ -86,7 +86,21 @@ void rbn_put_mismatch(int m);
  * takes the changes of both frames. A pending wrong guess (a refused load) keeps every capture. SSBU_RB_NET_CAPNEED=0: every
  * frame is captured (the old way). */
 static long long g_rbg_cap_unneeded, g_rbg_recap_unneeded;
-static long long g_rbg_wait_rb, g_rbg_wait_busy;                        /* (net4) rollbacks started inside the wait for the tick */
+static long long g_rbg_wait_rb, g_rbg_wait_busy;
+/* (net4) display.c's wait for the refresh asks, every millisecond, whether a rollback is pending: the other player's pads
+ * received so far are taken (the main thread, the game blocked in that wait: nothing reads the pads meanwhile) and a wrong
+ * guess at a frame already run lets the game through to the safe point, which rolls back in the frame's idle time.
+ * SSBU_RB_NET_VSDEFER=0: off (the old way). */
+void display_set_rb_pending(int (*fn)(void)); void display_wait_refresh_deferred(void); long long display_vsync_deferred_count(void);
+static DWORD g_rbg_tid; static int g_rbg_vsdefer = -1;
+static int rbg_pending(void) {
+    if (g_rbg_in_match != 1 || g_rbg_noring || !g_rg_ready || g_ra_phase == 2 || !rbn_started() || rbn_loop() || GetCurrentThreadId() != g_rbg_tid) return 0;
+    long long cur = g_rgs_next - 1;
+    if (cur < 1) return 0;
+    rbn_drain(cur);
+    int m = rb_input_peek_mismatch();
+    return m > 0 && m <= cur;
+}                        /* (net4) rollbacks started inside the wait for the tick */
 static int rbg_capture_needed(long long i) {
     static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_NET_CAPNEED"); on = !(e && e[0] == '0'); }
     if (!on || g_rbg_pend > 0 || rbn_loop()) return 1;
@@ -200,6 +214,9 @@ static void rbg_step_body(Ctx *c) {
             double tw = now_ms(); while (rbn_confirmed() < 1 && now_ms() - tw < 5000) { rbn_drain(i); rbg_wait_until(now_ms() + 0.5); }
         }
         g_rbg_tick0 = now_ms(); g_rbg_next = 0; g_rbg_cyc_go = rgs_cyc_now();
+        if (g_rbg_vsdefer < 0) { const char *e = getenv("SSBU_RB_NET_VSDEFER"); g_rbg_vsdefer = !(e && e[0] == '0'); }
+        g_rbg_tid = GetCurrentThreadId();
+        display_set_rb_pending(g_rbg_vsdefer ? rbg_pending : NULL);      /* (net4) */
         return;
     }
     rbn_pass_hash(i);
@@ -336,6 +353,7 @@ static void rbg_step_body(Ctx *c) {
         }
         g_rbg_next += period;
     }
+    display_wait_refresh_deferred();                   /* (net4) the refresh wait a rollback was let through (display.c) */
     rbn_before_frame(i);                               /* opt-in: use packets received during pacing in the next pass */
     double go = now_ms();
     if (g_rbg_last_go > 0 && g_rbg_ng < RBG_NT) g_rbg_gap[g_rbg_ng++] = (float)(go - g_rbg_last_go);
@@ -422,6 +440,7 @@ static void rbg_report(void);
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
+    display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
     if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
@@ -453,7 +472,7 @@ static void rbg_report(void) {
         g_rbg_real, g_rbg_rb, g_rbg_rerun, g_rbg_k[1], g_rbg_k[2], g_rbg_k[3], g_rbg_k[4], g_rbg_k[5], g_rbg_k[6], g_rbg_k[7], g_rbg_k[RG_MAXSLOT + 1] + g_rbg_k[8], g_rbg_miss);
     LOG("r1: RB NET report: stalls for the other player %lld (%.1f ms in all; %lld of them because the ring was short of memory); captures failed %lld, re-run captures not needed %lld; load mean %.3f ms; peer silent %lld\n",
         g_rbg_stalls, g_rbg_stall_ms, g_rbg_short_waits, g_rbg_capfail, g_rbg_capskip, g_rbg_rb ? g_rbg_load_ms / g_rbg_rb : 0.0, g_rbg_gone);
-    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld; rollbacks started inside the wait for the tick %lld (left for the safe point, threads busy: %lld)\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded, g_rbg_wait_rb, g_rbg_wait_busy);
+    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld; rollbacks started inside the wait for the tick %lld (left for the safe point, threads busy: %lld); refresh waits put off for a pending rollback %lld\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded, g_rbg_wait_rb, g_rbg_wait_busy, display_vsync_deferred_count());
     LOG("r1: RB NET report: ring memory (hs14, fix %s): captures given up %lld, old states freed early %lld, captures skipped to keep the oldest needed state %lld\n",
         g_rg_poolfix ? "on" : "OFF", g_rg_short_n, g_rg_freed_slots, g_rg_skip_full);
     LOG("r1: RB NET report: task-worker watchdog releases %lld (since the process start), rollbacks with the workers not held %lld (watchdog paused at H2: %s)\n", g_ra_wd_fired, g_rbg_rb_unheld, g_rbg_wdfix ? "yes" : "NO");
