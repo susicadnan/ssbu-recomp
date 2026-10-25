@@ -7,11 +7,36 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from netplay_proxy import Control, Link, Profile
+from netplay_proxy import Control, Link, Profile, apply_control
 
 UPSTREAM = ('127.0.0.1', 39520)
 CLIENT = ('127.0.0.1', 50123)
+
+
+class ControlApplicationTests(unittest.TestCase):
+    def test_profile_timestamp_is_after_control_file_read(self):
+        clock = [100.0]
+        def read(current):
+            clock[0] += .075                            # model I/O or scheduler delay during the control read
+            return current.updated({'loss_percent': 100})
+        link = Link(UPSTREAM, Profile(39))
+        with patch('netplay_proxy.time.monotonic', side_effect=lambda: clock[0]), patch('netplay_proxy.emit') as event:
+            apply_control(SimpleNamespace(poll=read), link, 99)
+        self.assertEqual(link.profile.loss_percent, 100)
+        event.assert_called_once_with('profile', elapsed_s=1.075,
+                                      profile=dict(latency_ms=39, jitter_ms=0, loss_percent=100))
+
+    def test_bad_control_keeps_the_active_profile(self):
+        def read(current):
+            raise ValueError('bad update')
+        link = Link(UPSTREAM, Profile(39))
+        with patch('netplay_proxy.emit') as event:
+            apply_control(SimpleNamespace(poll=read), link, 0)
+        self.assertEqual(link.profile, Profile(39))
+        event.assert_called_once_with('control_error', message='bad update')
 
 
 class LinkTests(unittest.TestCase):

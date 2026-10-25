@@ -58,7 +58,7 @@ logged. Windows ICMP errors while the lobby starts are counted without stopping 
 python tools/net/test_netplay_proxy.py
 ```
 
-Eleven tests cover bidirectional byte preservation, delay and jitter bounds, seeded loss, full outages, bounded queues,
+Thirteen tests cover bidirectional byte preservation, delay and jitter bounds, seeded loss, full outages, bounded queues,
 packet ordering, live profile changes, peer ownership, socket errors and JSON updates. A real loopback subprocess test
 starts with 100% loss, changes the control file to 0%, and verifies an intact datagram round trip before bounded exit.
 This verifies the test helper; live paired-game use is recorded below.
@@ -78,3 +78,40 @@ baseline 8,069 received/sent, recent 7,823 received/sent. Windows receive errors
 shutdown, when their UDP ports closed. The coordinator then terminated only its owned proxy process; these were not
 clean proxy-exit tests. This validates live forwarding/profile changes, not NAT behavior, bandwidth modeling or
 internet performance. More seeds, loss/outages and recovery transitions remain to be tested.
+
+## Stalled-input recovery experiment (2026-10-25)
+
+Updated integration `fa5ed3d` combined the latest PR3/4/5/6/7/8 runtime changes. The combined core/session suites,
+comparison tests and proxy tests passed, and the full runtime build/package audit passed. Two same-PC pairs used
+fixed input delay 4, the same deterministic bots/seed and executable, no fighter debug file, direct paths off and
+runtime simulation off. The real proxy added 39 ms per direction and applied two requested 350 ms full-loss pulses
+at host frames 600 and 1200. Runs ended normally after 1,800 requested presented fight frames.
+
+| Observed result, host / join | 50 ms retry (default) | 17 ms retry (opt-in) |
+|---|---|---|
+| Finalized checksums, all peer-equal | 1,803 / 1,803 | 1,802 / 1,802 |
+| Peer comparisons | 1,780 / 1,780 | 1,787 / 1,780 |
+| Input retransmissions while stalled | 12 / 12 | 21 / 24 |
+| Stalls through frame 1800 | 2 / 2 | 2 / 2 |
+| Total stall time through frame 1800 | 547 / 552 ms | 351 / 383 ms |
+| Rollbacks through frame 1800 | 2 / 2 | 6 / 4 |
+| Frames replayed through frame 1800 | 7 / 5 | 11 / 6 |
+
+All four games exited 0. Both runs passed strict comparison of their unmodified complete checksum logs with matching
+per-peer coverage and match IDs, zero reported desyncs and zero final-pad differences. The first 1,800 complete hashes
+also matched **across retry configurations**, so the logged deterministic outcome survived the different recovery
+schedules. Neither proxy run overflowed its queue or reported socket/send errors/unexpected peers. Loss counts were
+79/94, and final drained counters reconciled: 7,152 received / 7,073 sent and 7,754 / 7,660.
+
+These are one pair per setting. The requested pulses were not identical measured intervals: old profile event logs
+showed 406/344 ms for the baseline and 344/344 ms for the faster retry, and the profile event used a timestamp captured
+before the control-file read. Local scheduling and packet order also differed. The lower observed stall time is
+preliminary evidence, **not** a causal 196 ms recovery improvement. Input delay was equal, but the faster option sent
+more retry packets and had more rollbacks in this run. The default remains 50 ms. No full-run R1 p99 is inferred from
+its periodic reports; the table uses explicit frame-1800 cumulative counters.
+
+The helper now timestamps a profile immediately after applying the file update and refreshes its clock before
+flushing due packets. A deterministic test models 75 ms spent in the control read and verifies the event includes
+that delay; another preserves the active profile after an invalid update. All **13** helper tests pass, including the
+real UDP subprocess round trip. The game runs above predate this timestamp fix; tighter multi-seed recovery comparisons
+with accurate application times remain needed.
