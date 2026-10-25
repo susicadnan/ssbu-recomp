@@ -22,3 +22,6 @@ already-enabled runtime setting.
 
 This proves the receive/reset interleaving, not its frequency in ordinary play or an improvement to frame-time
 percentiles. Paired game rematch validation of this specific change is pending. No Slippi comparison has been run.
+
+Build validation: `scripts/make_release.py` completed the full runtime build and package audit at `1816d01` (9 audited
+files, no game content or machine-specific content). The installed executable was not replaced.
