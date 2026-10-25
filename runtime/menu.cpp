@@ -1044,6 +1044,14 @@ static void sec_experimental(void) {
     if (ra_build()) ImGui::TextDisabled("one frame less input delay in fights; costs a second pass of each frame on the CPU");
     else ImGui::TextDisabled("not ready yet: it is being moved onto the normal build (like rollback)");
     ImGui::Separator();
+    /* (1b) every fighter of the base roster available (unlock_all.c: graphics.ini unlock_all_fighters; SSBU_UNLOCK_ALL wins) */
+    static int ua_on = -1, ua_on0;
+    if (ua_on < 0) ua_on = ua_on0 = gfx_unlock_all();
+    if (onoff("ua", ua_on != 0, true)) { ua_on = !ua_on; ini("unlock_all_fighters", k_onoff[ua_on]); }
+    ImGui::SameLine(); ImGui::Text("All fighters unlocked");
+    tag(1, ua_on != ua_on0);
+    ImGui::SameLine(); ImGui::TextDisabled("every fighter of the base game from the start; the save is not changed");
+    ImGui::Separator();
     /* (2) your name: the console user's nickname (nnfs.c) and the name the lobby shows (net_relay.c); graphics.ini player_name */
     static char pname[33], pname0[33];
     static int pname_read;
@@ -1099,7 +1107,7 @@ static void sec_experimental(void) {
         if (getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
         sec_online();
     }
-    if (online_differs() || S.runahead != S0.runahead || strcmp(pname, pname0)) {
+    if (online_differs() || S.runahead != S0.runahead || ua_on != ua_on0 || strcmp(pname, pname0)) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Saved. These changes are used when the game starts again.");
         if (ImGui::Button("Restart the game now")) restart_game();

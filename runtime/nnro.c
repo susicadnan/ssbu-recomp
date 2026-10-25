@@ -317,6 +317,7 @@ static ImportFn function_at(uint64_t addr) {
 }
 
 #include "fighter_sdk/hook_host.c"             /* S3: the hook table: replace any lifted function by address or name (track M) */
+#include "unlock_all.c"                        /* every fighter of the base roster available (graphics.ini unlock_all_fighters) */
 #include "fighter_sdk/fighter_host.c"          /* S1: fighter C++ source: loading, per-function switch, differential test */
 
 /* PLT stub of a lifted module: `void f_<stub>(Ctx *c) { nro_import(c, &nromod_<name>, <symbol index>); }`,

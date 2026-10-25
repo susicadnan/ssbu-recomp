@@ -23,6 +23,8 @@ static char g_gfx_language[16];                      /* U1: language = auto ("")
 int gfx_menu(void) { gfx_options(); return g_gfx_menu; }
 static int g_gfx_stats;                              /* U1: stats_overlay = off | on */
 int gfx_stats_overlay(void) { gfx_options(); return g_gfx_stats; }
+static int g_gfx_unlock_all;                         /* unlock_all_fighters = off | on (unlock_all.c) */
+int gfx_unlock_all(void) { gfx_options(); return g_gfx_unlock_all; }
 int gfx_volume(void) { gfx_options(); return g_gfx_volume; }
 const char *gfx_language(void) { gfx_options(); return g_gfx_language; }
 
@@ -147,7 +149,12 @@ static const char *const k_default_ini =
 "\r\n"
 "; language = auto | ja | en-US | en-GB | fr | fr-CA | de | it | es | es-419 | zh-Hans | zh-Hant | ko | nl | ru\r\n"
 ";   auto: the Windows display language. SSBU_LANGUAGE=<code> wins. Read at start.\r\n"
-"language = auto\r\n";
+"language = auto\r\n"
+"\r\n"
+"; unlock_all_fighters = off | on\r\n"
+";   on: every fighter of the base game can be chosen from the start, whatever the save data says. Nothing is written to\r\n"
+";   the save (off again = the game's own unlocks). Not a mod: online rooms are unaffected. SSBU_UNLOCK_ALL=1 / 0 wins.\r\n"
+"unlock_all_fighters = off\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -219,6 +226,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "stats_overlay")) g_gfx_stats = !_stricmp(val, "on") || !strcmp(val, "1");      /* U1 (menu.cpp, F2) */
         else if (!_stricmp(key, "menu")) g_gfx_menu = !_stricmp(val, "on") || !strcmp(val, "1");      /* U1 (menu.cpp) */
         else if (!_stricmp(key, "volume")) { g_gfx_volume = -1; if (_stricmp(val, "auto")) { int v = atoi(val); g_gfx_volume = v < 0 ? 0 : v > 100 ? 100 : v; } }
+        else if (!_stricmp(key, "unlock_all_fighters")) g_gfx_unlock_all = !_stricmp(val, "on") || !strcmp(val, "1");      /* unlock_all.c */
         else if (!_stricmp(key, "language")) { g_gfx_language[0] = 0; if (_stricmp(val, "auto")) snprintf(g_gfx_language, sizeof g_gfx_language, "%s", val); }
         else unknown++;
     }
