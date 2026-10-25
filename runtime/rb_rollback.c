@@ -35,6 +35,8 @@ void input_mark(const char *what);                      /* nnhid.c: the input se
 /* (hs12) matches in one session: 0 = between matches, 1 = an online match runs (its base state made), 2 = a match that was
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
 static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
+static int g_rbg_mr_done;                                 /* (net4) this match's report written (once: at the fight's end, or at the exit during a fight) */
+static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
  * first safe point with the fight on ("RA: first save: no quiet moment within 200 ms: not now"), it was made one pass later, and
  * that game called fight frame 218 "frame 0" while the other called 217 so: every frame one apart. Now the frames are counted
@@ -185,7 +187,8 @@ static void rbg_step_body(Ctx *c) {
             printf("[rbnet] rollback OFF for this match (not enough memory): delay-based, the game waits for the other player's input every frame\n"); fflush(stdout);
         }
         if (g_rbg_wdfix) g_ra_wd_pause = 1;
-        g_rbg_in_match = 1;
+        g_rbg_in_match = 1; g_rbg_mr_done = 0;
+        { static int reg; if (!reg++) atexit(rbg_match_report_atexit); }      /* (net4) the window closed during a fight: the report still written */
         if (i > 0) LOG("r1: RB NET: the base state was made %lld passes after the first safe point with the fight on (fight frame %lld): it is frame %lld, as on the other game (net3)\n", i, g_rbg_ff_first, i);
         rbn_start(i);
         rbn_pass_hash(0);                               /* (hs12) the checksum of frame 1 starts here (run tw8: frame-line lines from before the base, a different number on the two games, made frame 1 of match 2 differ) */
@@ -437,6 +440,7 @@ static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     *b = p.buttons; *lx = p.lx; *ly = p.ly; *rx = p.rx; *ry = p.ry;
 }
 static void rbg_report(void); static void rbg_match_report(void);
+static void rbg_match_report_atexit(void) { if (g_rbg_in_match == 1) rbg_match_report(); }
 /* (hs12) r1_ring.c rgs_step, every safe point while no fight is on: the end of a match (once): its report, the ring
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 static void rbg_fight_off(void) {
@@ -472,7 +476,8 @@ static void rbg_dist(const char *what, const float *v, int n, const unsigned cha
 void rbn_match_numbers(double *rtt_mean_ms, double *rtt_best_ms, long long *desyncs, long long *repeats, long long *rx, long long *tx);
 void rbn_link(int *jitter_ms, int *loss_pct); int net_rb_path(void); const char *net_peer_name(void); void menu_popup(const char *title, const char *text);
 static void rbg_match_report(void) {
-    if (!g_rbg_real || rbn_loop()) return;
+    if (!g_rbg_real || rbn_loop() || g_rbg_mr_done) return;
+    g_rbg_mr_done = 1;
     double rtt_mean, rtt_best; long long desyncs, repeats, rx, tx; int jitter, loss;
     rbn_match_numbers(&rtt_mean, &rtt_best, &desyncs, &repeats, &rx, &tx); rbn_link(&jitter, &loss);
     float *w = malloc((size_t)(g_rbg_ng ? g_rbg_ng : 1) * sizeof *w); double p99 = 0, p90 = 0, mean = 0, over = 0;
