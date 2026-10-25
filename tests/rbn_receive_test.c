@@ -6,7 +6,16 @@
 #include "../runtime/rb_net.c"
 
 int g_game_build;
-int net_rb_send(const void *p, int n) { (void)p; (void)n; return 1; }
+static int sent_pads, last_sent_newest, last_sent_count;
+int net_rb_send(const void *p, int n) {
+    const uint8_t *b = p;
+    if (n > 2 && b[0] == RB_MSG_PADS) {
+        RbMsg m;
+        if (!rb_msg_parse(b, (size_t)n - 2, &m)) abort();
+        sent_pads++; last_sent_newest = m.newest; last_sent_count = m.count;
+    }
+    return 1;
+}
 int net_rb_ready(void) { return 1; }
 int net_rb_no_destination(void) { return 0; }
 int net_mode(void) { return 2; }
@@ -84,6 +93,44 @@ static void boundary_tests(void) {
     g_loop = 0;
     rbn_match_reset(); rbn_before_frame(0);
     CHECK(!g_preframe_pads && !g_started, "no drain between matches; per-match telemetry resets");
+}
+
+static void resend_tests(void) {
+    reset_session(0);
+    g_resend_ms = 17;
+    rbn_local_pad(18, (RbPad){7});
+    sent_pads = 0;
+    for (int half_ms = 0; half_ms < 2000; half_ms++) rbn_resend(half_ms / 2.0);
+    CHECK(sent_pads == 59 && g_stall_resends == 59, "one second of polling is bounded to 59 retries at 17 ms");
+    CHECK(last_sent_newest == 20 && last_sent_count == 20, "stalled retries carry the same outstanding input history");
+    CHECK(rb_input_local_latest() == 20, "retries do not invent simulation frames");
+    g_started = 0; rbn_resend(1001); CHECK(sent_pads == 59, "no retransmit between matches");
+    g_started = 1; g_loop = 1; rbn_resend(1001); CHECK(sent_pads == 59, "no retransmit in the loop bot"); g_loop = 0;
+    rbn_match_reset(); CHECK(g_stall_resends == 0 && g_resend_last_ms < 0, "retry timer and counter reset between matches");
+
+    /* Both simulations are stopped: drive only the production retry function with a virtual monotonic clock. Drop
+     * all packets until a one-way blackout ends; the first successful retry arrives 39 ms later (78 ms RTT).
+     * Sweep blackout endpoints so a favorable alignment with either retry period cannot select the result. */
+    double means[2] = {0}, worst[2] = {0};
+    for (int policy = 0; policy < 2; policy++) {
+        reset_session(0); g_resend_ms = policy ? 17 : 50;
+        rbn_local_pad(18, (RbPad){7});
+        for (int blackout_ms = 1; blackout_ms <= 200; blackout_ms++) {
+            g_resend_last_ms = -1; double delivered_at = -1;
+            for (int ms = 0; ms <= 300; ms++) {
+                int before = sent_pads; rbn_resend(ms);
+                if (sent_pads > before && ms >= blackout_ms) { delivered_at = ms + 39; break; }
+            }
+            CHECK(delivered_at >= 0, "stalled peer eventually receives the outstanding packet");
+            double recovery = delivered_at - blackout_ms;
+            means[policy] += recovery / 200;
+            if (recovery > worst[policy]) worst[policy] = recovery;
+        }
+    }
+    CHECK(means[1] < means[0] && worst[1] < worst[0], "shorter bounded retry improves mean and worst blackout recovery");
+    printf("RECOVERY_MODEL 200 blackout endpoints, 39 ms transit | mean %.2f -> %.2f ms | worst %.2f -> %.2f ms after blackout\n",
+           means[0], means[1], worst[0], worst[1]);
+    g_resend_ms = 50;
 }
 
 /* Identical precomputed delivery schedules are replayed with the feature off and on. Every packet has 16 redundant
@@ -169,9 +216,14 @@ static void compare(const char *name, int latency, int jitter, int loss, int wor
 int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
+    _putenv("SSBU_RB_NET_RESEND_MS=");
     CHECK(rbn_on() && !g_predrain, "feature defaults off");
+    CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
+    g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
+    g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
+    resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);
     compare("jitter-loss", 27000, 9000, 15, 6500, 1);

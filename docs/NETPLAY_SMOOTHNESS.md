@@ -1,5 +1,25 @@
 # Pre-frame input receive experiment
 
+## Input retries while stalled
+
+`SSBU_RB_NET_RESEND_MS=17` is a separate optional experiment: retry outstanding inputs about once per frame while
+waiting for the other player's inputs. The default remains 50 ms. Valid values are integers 8 through 50; malformed
+or out-of-range values fall back to 50. Input delay, packet format and the normal per-frame sending rate are unchanged.
+
+Both games can stop simulating at their prediction limit after a burst of packet loss. A retry must therefore use the
+monotonic clock, independent of new game frames. The session now owns the retry timer and bounds the send rate even
+though the stall loop polls every half millisecond. The timer resets between matches. End-of-match reports include
+the interval and retry count. Test this separately from PREDRAIN before trying them together.
+
+`rbn_receive_test` drives the actual retry function with a virtual clock and sweeps 200 blackout endpoints (1..200 ms),
+then delivers the first surviving retry after 39 ms of one-way transit. At 50 ms vs 17 ms retry intervals, the mean time
+from the blackout ending until delivery is 63.50 vs 47.13 ms; worst case 88 vs 55 ms. One second of half-millisecond
+polls produces 59 retries at 17 ms, with identical input history and no invented simulation frames. This is a
+single-sender recovery model, not a two-PC benchmark, and does not model congestion. Faster retries increase traffic
+while stalled; game-level and real-network comparisons remain pending. The default is unchanged.
+
+## Receiving after pacing
+
 The main thread drains incoming inputs at the safe point, then waits for the next 60 Hz tick. A packet arriving during
 that wait used to remain queued until after the next simulation pass. That pass could predict an input already received
 by the network thread, and then replay it when the safe point finally applied the packet.

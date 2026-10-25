@@ -16,6 +16,7 @@
  *   SSBU_RB_NET_AHEAD=<n>  most frames this game runs ahead of the newest remote pad (default 7 = the ring depth)
  *   SSBU_RB_NET_FIND=0     (R3 net3) no opponent search through the lobby (lobby / LAN mode without a room: the old way)
  *   SSBU_RB_NET_PREDRAIN=1 experimental: apply inputs received during pacing before the next simulation pass (default off)
+ *   SSBU_RB_NET_RESEND_MS=<8..50> experimental: retry interval while stalled, milliseconds (default 50)
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <stdio.h>
@@ -41,6 +42,7 @@ int net_online(void);
 
 static int g_on = -1, g_loop, g_loop_lat = 4, g_local, g_delay_cfg = -1, g_ahead = 7, g_started, g_peer_started;
 static int g_predrain;
+static int g_resend_ms = 50;
 static unsigned g_bot_seed; static int g_bot;
 static FILE *g_hlog;
 static volatile LONG64 g_cur;                          /* the frame this game is on (read by the receive thread for PONGs) */
@@ -64,6 +66,8 @@ int rbn_on(void) {
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
     { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = v && atoi(v) > 0; }
+    { const char *v = getenv("SSBU_RB_NET_RESEND_MS"); char *end; long ms = v ? strtol(v, &end, 10) : 0;
+      g_resend_ms = v && end != v && !*end && ms >= 8 && ms <= 50 ? (int)ms : 50; }
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
     g_local = 0;
     if (!g_loop && net_online() && net_mode() == 3) g_local = 1;      /* NET_MODE_JOIN */
@@ -629,6 +633,8 @@ static int g_delay, g_remote = 1;
 static long long g_peer_ack, g_sent_newest;
 static long long g_stat_pred, g_stat_padget, g_stat_mis;
 static long long g_preframe_pads;
+static double g_resend_last_ms = -1;
+static long long g_stall_resends;
 static long long g_ts_n; static double g_ts_extra;     /* time sync: extra ms per frame for the next frames */
 static int g_ts_left;
 static uint64_t g_hacc = 0xcbf29ce484222325ull; static int g_hlines;
@@ -894,7 +900,14 @@ double rbn_pace_extra(long long f) {
     return 0;
 }
 int rbn_rtt_ms(void) { return g_rtt_us > 0 ? (int)(g_rtt_us / 1000) : -1; }
-void rbn_resend(void) { if (g_started) send_pads(); }
+/* Main-thread stall loop only. Retrying while simulation is stopped must not depend on advancing a frame. Bound the
+ * rate here, including when no packet can be sent, so short polling intervals cannot flood the peer or relay. */
+void rbn_resend(double now_ms) {
+    if (!g_started || g_loop) return;
+    if (g_resend_last_ms >= 0 && now_ms - g_resend_last_ms < g_resend_ms) return;
+    g_resend_last_ms = now_ms;
+    if (rb_input_local_latest() > 0) { send_pads(); g_stall_resends++; }
+}
 /* the match-start barrier: an empty PADS message says "in the match" (count 0, newest 0) */
 void rbn_hello(void) {
     if (!g_started || g_loop) return;
@@ -917,6 +930,7 @@ void rbn_match_reset(void) {
     g_started = 0; g_peer_started = 0; g_f0 = 0; InterlockedExchange(&g_peer_mode, -1); g_peer_ack = 0; g_sent_newest = 0;
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
     g_preframe_pads = 0;
+    g_resend_last_ms = -1; g_stall_resends = 0;
     g_hacc = 0xcbf29ce484222325ull; g_hlines = 0; g_lacc_n = 0;
     memset(g_hash, 0, sizeof g_hash); memset(g_hframe, 0, sizeof g_hframe); g_hfinal_upto = 0;
     g_desync = 0; g_check_ok = 0; g_desync_first = -1; g_peer_check_f = 0; g_peer_check = 0;
@@ -940,6 +954,7 @@ void rbn_report(FILE *o, long long frames) {
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
+    fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);

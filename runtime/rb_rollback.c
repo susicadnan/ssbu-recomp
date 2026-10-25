@@ -19,7 +19,7 @@ void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long 
 void rbn_drain(long long cur); int rbn_take_mismatch(void); long long rbn_confirmed(void); int rbn_peer_gone(void);
 void rbn_before_frame(long long cur);
 void rbn_pass_hash(long long f); void rbn_finalize(long long cur); double rbn_pace_extra(long long f); void rbn_report(FILE *o, long long frames);
-int rbn_delay(void); int rbn_rtt_ms(void); double rbn_offset_ms(void); void rbn_resend(void); void rbn_status(char *out, size_t n); void rbn_hello(void); int rbn_peer_started(void); void rbn_choose_delay(void);
+int rbn_delay(void); int rbn_rtt_ms(void); double rbn_offset_ms(void); void rbn_resend(double now_ms); void rbn_status(char *out, size_t n); void rbn_hello(void); int rbn_peer_started(void); void rbn_choose_delay(void);
 
 int rbn_match_cancelled(void); void rbn_match_reset(void); int rbn_match_number(void);      /* (hs12) */
 void rbn_set_lockstep(int on); int rbn_loop(void);      /* (hs13) */
@@ -282,9 +282,9 @@ static void rbg_step_body(Ctx *c) {
         if (!g_rbg_noring && g_rg_short && g_rgs_next - rbn_confirmed() <= rbn_ahead() && !stalled) g_rbg_short_waits++;
         if (rbn_peer_gone()) { if (!g_rbg_gone++) LOG("r1: RB NET: no message from the other player for 5 s at frame %lld: going on alone (guesses)\n", i); break; }
         if (!stalled) { stalled = 1; ts = now_ms(); g_rbg_stalls++; r1_ring_let_go(); }
-        {   /* while waiting: our newest pads again every 50 ms (a lost datagram must not leave both games waiting), a line every 2 s */
-            static double last_tx, last_log; double now = now_ms();
-            if (now - last_tx >= 50) { last_tx = now; rbn_resend(); }
+        {   /* while waiting: bounded input retries (default 50 ms), even with both games stalled; a line every 2 s */
+            static double last_log; double now = now_ms();
+            rbn_resend(now);
             if (now - ts >= 2000 && now - last_log >= 2000) { last_log = now; char st[200]; rbn_status(st, sizeof st);
                 LOG("r1: RB NET: waiting for the other player at frame %lld for %.0f ms: %s\n", i, now - ts, st); }
         }
