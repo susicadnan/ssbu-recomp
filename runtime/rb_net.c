@@ -585,12 +585,9 @@ static void send_msg(const RbMsg *m) {
 void rbn_rx(const uint8_t *p, int n) {
     if (rbn_on() > 0 && n > 0 && hs_rx(p, n)) return;  /* the match handshake */
     if (rbn_on() <= 0 || n <= 0 || n > RQ_MAX) { InterlockedIncrement64(&g_rx_bad); return; }
-    if (p[0] == RB_MSG_PADS && n >= RB_PADS_HEAD + 2 && (n - RB_PADS_HEAD) % RB_PAD_WIRE == 2) {     /* (hs12) the match tag, (hs14) then the mode byte, at the end */
-        if (!g_started || p[n - 2] != pads_tag()) { InterlockedIncrement64(&g_rx_oldmatch); return; }      /* (between matches: the other game sends them again) */
-        InterlockedExchange(&g_peer_mode, p[n - 1]);    /* (before it is queued: rbn_drain sees it with the message that starts the match) */
-        n -= 2;
-    }
-    InterlockedIncrement64(&g_rx_pkts); InterlockedExchange64(&g_rx_last_ms, (LONG64)GetTickCount64());
+    int tagged_pads = p[0] == RB_MSG_PADS && n >= RB_PADS_HEAD + 2 && (n - RB_PADS_HEAD) % RB_PAD_WIRE == 2;
+    if (tagged_pads) n -= 2;                            /* match tag, then mode byte; validated with queue publication below */
+    if (p[0] != RB_MSG_PADS) { InterlockedIncrement64(&g_rx_pkts); InterlockedExchange64(&g_rx_last_ms, (LONG64)GetTickCount64()); }
     if (p[0] == RB_MSG_PING) {                          /* answered at once on this thread (the round trip excludes the frame wait) */
         RbMsg m, r; if (!rb_msg_parse(p, (size_t)n, &m)) { InterlockedIncrement64(&g_rx_bad); return; }
         memset(&r, 0, sizeof r); r.type = RB_MSG_PONG; r.frame = (int32_t)g_cur; r.time_us = now_us(); r.echo_us = m.time_us;
@@ -608,6 +605,13 @@ void rbn_rx(const uint8_t *p, int n) {
         return;
     }
     AcquireSRWLockExclusive(&g_rq_lock);
+    /* Reset/start uses this same lock. A tag checked before taking it could pass in match A, pause, then be queued
+     * after match B starts. Validate and publish the mode atomically with enqueueing so neither crosses the reset. */
+    if (tagged_pads) {
+        if (!g_started || p[n] != pads_tag()) { InterlockedIncrement64(&g_rx_oldmatch); ReleaseSRWLockExclusive(&g_rq_lock); return; }
+        InterlockedExchange(&g_peer_mode, p[n + 1]);
+    }
+    if (p[0] == RB_MSG_PADS) { InterlockedIncrement64(&g_rx_pkts); InterlockedExchange64(&g_rx_last_ms, (LONG64)GetTickCount64()); }
     if (!g_rq) g_rq = calloc(RQ_N, sizeof *g_rq);
     LONG next = (g_rq_head + 1) % RQ_N;
     if (g_rq && next != g_rq_tail) { g_rq[g_rq_head].at_us = now_us(); g_rq[g_rq_head].at_frame = g_cur; g_rq[g_rq_head].n = n; memcpy(g_rq[g_rq_head].b, p, (size_t)n); g_rq_head = next; }
@@ -694,7 +698,8 @@ static int auto_delay(void) {
     return d < 1 ? 1 : d > 6 ? 6 : d;
 }
 void rbn_start(long long f0) {
-    g_f0 = f0; g_started = 1; g_match_n++;
+    g_f0 = f0;
+    AcquireSRWLockExclusive(&g_rq_lock); g_started = 1; g_match_n++; ReleaseSRWLockExclusive(&g_rq_lock);
     if (g_hlog) { fprintf(g_hlog, "m %d id %08x\n", g_match_n, g_match_id); fflush(g_hlog); }      /* (rbn_cmp.py: frames are per match) */
     g_remote = 1 - g_local;
     if (g_peerdelay < 0) { const char *e = getenv("SSBU_RB_NET_PEERDELAY"); g_peerdelay = !(e && e[0] == '0'); }
@@ -947,7 +952,11 @@ double rbn_offset_ms(void) { return rb_ts_offset() / 1000.0; }
  * belongs to one match starts over (input queues and frames at the next rbn_start, checksums, counters, the block check,
  * received messages not drained yet); the round trip, the pings and the transport stay. */
 void rbn_match_reset(void) {
-    g_started = 0; g_peer_started = 0; g_f0 = 0; InterlockedExchange(&g_peer_mode, -1); g_peer_ack = 0; g_sent_newest = 0;
+    AcquireSRWLockExclusive(&g_rq_lock);
+    g_started = 0; InterlockedExchange(&g_peer_mode, -1); g_rq_tail = g_rq_head; g_tsq_n = 0;
+    InterlockedExchange64(&g_cur, 0);
+    ReleaseSRWLockExclusive(&g_rq_lock);
+    g_peer_started = 0; g_f0 = 0; g_peer_ack = 0; g_sent_newest = 0;
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
     g_preframe_pads = 0;
     g_resend_last_ms = -1; g_stall_resends = 0;
@@ -957,8 +966,6 @@ void rbn_match_reset(void) {
     memset(g_acc_n, 0, sizeof g_acc_n); memset(g_acc_var, 0, sizeof g_acc_var); memset(g_un, 0, sizeof g_un); memset(g_unl, 0, sizeof g_unl);
     g_padcheck_bad = 0; g_padcheck_first = -1;
     AcquireSRWLockExclusive(&g_hs_lock); g_hs_mine_ok = 0; g_hs_blk_done = 0; memset(g_hs_peer_have, 0, sizeof g_hs_peer_have); ReleaseSRWLockExclusive(&g_hs_lock);
-    AcquireSRWLockExclusive(&g_rq_lock); g_rq_tail = g_rq_head; g_tsq_n = 0; ReleaseSRWLockExclusive(&g_rq_lock);
-    InterlockedExchange64(&g_cur, 0);
     if (g_hs_cancelled) menu_notice(NULL);
     InterlockedExchange(&g_hs_cancelled, 0);
     printf("[rbnet] match %d over: the session is ready for the next match (pads of an older match dropped so far: %lld)\n", g_match_n, (long long)g_rx_oldmatch);
