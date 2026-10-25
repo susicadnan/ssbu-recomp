@@ -48,6 +48,17 @@ static uint64_t now_us(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); if 
 int rbn_on(void) {
     if (g_on >= 0) return g_on;
     const char *e = getenv("SSBU_RB_NET");
+    /* (net4) no variable (the game started without Play SSBU.bat's scripts/run.py, or an older run.py): rollback over the
+     * online connection when online play is on and graphics.ini does not say "rollback = off" (on by default: a room
+     * whose other player has it off is played with the game's own netcode, as before) */
+    if (!e && net_online() > 0) {
+        int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
+        int set = net_ini_value("rollback", v, sizeof v);
+        if (!set || !(!v[0] || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"))) {
+            _putenv("SSBU_RB_NET=net"); e = getenv("SSBU_RB_NET");      /* (every other reader of the variable sees it too: rbn_handshake_wanted, the menu) */
+            printf("[rbnet] rollback on from graphics.ini (%s)\n", set ? "rollback = on" : "no rollback key: on by default");
+        }
+    }
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }

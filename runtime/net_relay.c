@@ -135,6 +135,7 @@ static int ini_value(const char *key, char *out, size_t n) {     /* "key = value
     fclose(f);
     return found;
 }
+int net_ini_value(const char *key, char *out, size_t n) { return ini_value(key, out, n); }     /* (net4) rb_net.c rbn_on */
 static int is_off(const char *v) { return !*v || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"); }
 
 /* ---------------------------------------------------------------- O1: the mod set this game loads
@@ -1424,6 +1425,36 @@ static void send_join(void) {
     tx(p, BASE + 2 + g_mods_wire_len, &g_lobby);
 }
 
+/* (net4, client thread, about once a second) a Local Wireless room with another player whose datagrams still go through the
+ * lobby SERVER 10 s after it joined: said once per room, on screen and in the log, with who should change what. The relay adds
+ * the way to the server and back to every datagram (testers 2026-10-25: 293 ms round trip relayed, 78 ms direct, the same two
+ * players). HOST / JOIN / LAN modes are left out: their lobby is one of the players' games, so relayed is about as fast. */
+static void room_path_check(uint64_t t) {
+    static uint64_t since; static int said;
+    int n = nnldn_players();
+    if (n < 2 || g_mode != NET_MODE_LOBBY) { since = 0; said = 0; return; }
+    if (!since) since = t;
+    if (said || t - since < 10000) return;
+    uint32_t other = nnldn_other_ip();
+    int listed = 0, direct = 0;
+    char name[NAME_LEN + 1] = "the other player";
+    AcquireSRWLockShared(&g_peers_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (other && g_peers[i].ip != other) continue;
+        listed = 1; direct |= fresh(&g_peers[i], t);
+        if (other) snprintf(name, sizeof name, "%s", g_peers[i].name);
+    }
+    ReleaseSRWLockShared(&g_peers_lock);
+    said = 1;
+    if (direct) return;
+    char text[400];
+    if (!g_direct) snprintf(text, sizeof text, "You have \"Relay only\" on (F1 > Experimental): everything goes through the lobby server, which adds lag.\nUntick it and restart the game for a direct connection.");
+    else if (!listed) snprintf(text, sizeof text, "%s has \"Relay only\" on: everything goes through the lobby server, which adds lag.\nAsk them to untick it in F1 > Experimental and restart.", other ? name : "Another player of this room");
+    else snprintf(text, sizeof text, "No direct connection to %s could be made (a router or firewall): the lobby server relays the game, which adds lag.\nAllowing the game through the Windows firewall on both PCs usually fixes it.", name);
+    say("room: %s", text);
+    menu_popup("Online: slow connection", text);
+}
+
 static DWORD WINAPI client_thread(LPVOID unused) {
     (void)unused;
     static uint8_t buf[65536];
@@ -1471,6 +1502,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             else say("lost the lobby %s: joining again", g_server);
         }
         if (g_joined && t - last_tick >= 50) { peers_tick(t); last_tick = t; }
+        { static uint64_t last_path; if (g_joined && t - last_path >= 1000) { last_path = t; room_path_check(t); } }     /* (net4) */
         if (g_joined && t - (uint64_t)g_rooms_wanted < 5000 && t - g_rooms_sent >= 2000) rooms_ask(t);     /* O1: while someone looks */
         if (g_joined) mm_tick(t);                                                                         /* O2 */
         struct sockaddr_in from;

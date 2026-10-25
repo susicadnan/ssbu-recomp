@@ -927,7 +927,7 @@ static void restart_game(void) {
          * (testers 2026-10-25: "he had it enabled and restarted", the room match used the game's own netcode). The new copy
          * now gets the variable from the key as run.py would; a value set by hand (not "net") is left as it is. */
         char v[16]; const char *cur = getenv("SSBU_RB_NET");
-        int on = ini_read("rollback", v, sizeof v) && !off_word(v);
+        int on = ini_read("rollback", v, sizeof v) ? !off_word(v) : 1;
         if (on && !cur) SetEnvironmentVariableW(L"SSBU_RB_NET", L"net");
         else if (!on && cur && !strcmp(cur, "net")) SetEnvironmentVariableW(L"SSBU_RB_NET", NULL);
     }
@@ -1088,7 +1088,7 @@ static void sec_experimental(void) {
 #else
             rb_have = 0;
 #endif
-            rb_on = ini_read("rollback", v, sizeof v) && !off_word(v); rb_on0 = rb_on;
+            rb_on = ini_read("rollback", v, sizeof v) ? !off_word(v) : 1; rb_on0 = rb_on;      /* (net4) on unless graphics.ini says off (scripts/run.py: the same default) */
         }
         if (onoff("rb", rb_on != 0, rb_have || rb_on)) { rb_on = !rb_on; ini("rollback", rb_on ? "on" : "off"); }
         ImGui::SameLine(); ImGui::Text("Rollback netcode");

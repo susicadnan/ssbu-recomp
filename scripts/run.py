@@ -31,8 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_location  # noqa: E402
 
 
-def ini_on(path, key):
-    """`key = on` (or 1 / yes / true) in a graphics.ini; False when the file or the key is missing."""
+def ini_on(path, key, default=False):
+    """`key = on` (or 1 / yes / true) in a graphics.ini; `default` when the file or the key is missing."""
     try:
         with open(path, encoding='utf-8-sig', errors='replace') as f:
             for line in f:
@@ -41,7 +41,7 @@ def ini_on(path, key):
                     return v.split('#')[0].split(';')[0].strip().lower() in ('on', '1', 'yes', 'true')
     except OSError:
         pass
-    return False
+    return default
 
 
 def main():
@@ -125,7 +125,7 @@ def main():
         state = json.load(f)
     work = os.path.join(a.build, 'work')
     rollback = False
-    if a.play and a.exe == main_exe and not (a.linux or a.mac) and ini_on(os.path.join(a.build, 'config', 'graphics.ini'), 'rollback'):
+    if a.play and a.exe == main_exe and not (a.linux or a.mac) and ini_on(os.path.join(a.build, 'config', 'graphics.ini'), 'rollback', True):
         # F1 > Experimental > Rollback netcode: the normal exe and game DLL with SSBU_RB_NET (since R4 the ring saves the fight on
         # the normal build: runtime/rb_learned.c); the old pair ssbu_native_rb.exe + ssbu_game_r1.dll of an older install is not used
         rollback = True
