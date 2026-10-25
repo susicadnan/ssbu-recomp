@@ -6,13 +6,15 @@
 #include "../runtime/rb_net.c"
 
 int g_game_build;
-static int sent_pads, last_sent_newest, last_sent_count;
+static int sent_pads, last_sent_newest, last_sent_count, last_sent_check_frame;
+static uint32_t last_sent_check;
 int net_rb_send(const void *p, int n) {
     const uint8_t *b = p;
     if (n > 2 && b[0] == RB_MSG_PADS) {
         RbMsg m;
         if (!rb_msg_parse(b, (size_t)n - 2, &m)) abort();
         sent_pads++; last_sent_newest = m.newest; last_sent_count = m.count;
+        last_sent_check_frame = m.check_frame; last_sent_check = m.check;
     }
     return 1;
 }
@@ -93,6 +95,30 @@ static void boundary_tests(void) {
     g_loop = 0;
     rbn_match_reset(); rbn_before_frame(0);
     CHECK(!g_preframe_pads && !g_started, "no drain between matches; per-match telemetry resets");
+}
+
+static void live_checksum_tests(void) {
+    rbn_match_reset(); CHECK(!rbn_hash_wanted(), "state collection is disabled between rollback matches");
+    reset_session(1);
+    CHECK(rbn_hash_wanted(), "active rollback match requests state even without a fighter log");
+    for (int f = 1; f <= 4; f++) {
+        rbn_local_pad(f, (RbPad){0});
+        receive_one(f, 0); rbn_drain(f);
+        rbn_pad(0, f); rbn_pad(1, f);
+        uint8_t state[40] = {0}; state[0] = (uint8_t)f; state[8] = 7;  /* representative logged fields, no game data */
+        rbn_hash_add(state, sizeof state); rbn_pass_hash(f); rbn_finalize(f);
+    }
+    CHECK(g_hfinal_upto == 4 && g_hframe[4] == 4, "state supplied without a fighter log becomes a finalized checksum");
+    uint32_t expected = (uint32_t)(g_hash[4] ^ (g_hash[4] >> 32));
+    rbn_resend(0);
+    CHECK(last_sent_check_frame == 4 && last_sent_check == expected, "ordinary input packets carry the finalized checksum");
+    RbMsg peer = {0}; peer.type = RB_MSG_PADS; peer.player = 1; peer.newest = 4; peer.check_frame = 4; peer.check = expected;
+    receive(&peer, 0); rbn_drain(4);
+    CHECK(g_check_ok == 1 && g_desync == 0, "matching peer checksum is compared without fighter-file logging");
+    peer.check ^= 1; receive(&peer, 0); rbn_drain(4);
+    CHECK(g_desync == 1 && g_desync_first == 4, "different peer checksum detects divergence");
+    rbn_match_reset(); CHECK(!rbn_hash_wanted() && !g_check_ok && !g_desync, "checksum activity and results reset between matches");
+    printf("LIVE_CHECKSUM_PIPELINE finalized frame 4 sent and compared; intentional mismatch detected\n");
 }
 
 static void resend_tests(void) {
@@ -217,12 +243,14 @@ int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
     _putenv("SSBU_RB_NET_RESEND_MS=");
-    CHECK(rbn_on() && !g_predrain, "feature defaults off");
+    _putenv("SSBU_FIGHT_HASH=");
+    CHECK(rbn_on() && g_predrain, "pre-frame receive defaults on after in-game validation");
     CHECK(g_resend_ms == 50, "retry interval defaults to the previous 50 ms");
     g_on = -1; _putenv("SSBU_RB_NET_PREDRAIN=1"); CHECK(rbn_on() && g_predrain, "environment enables feature");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=17"); CHECK(rbn_on() && g_resend_ms == 17, "bounded retry interval can be configured");
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
+    live_checksum_tests();
     resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);

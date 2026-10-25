@@ -841,7 +841,7 @@ void rbn_hash_add(const void *p, size_t n) {
  * player, whether the reads varied) and the extra fighter fields of rbn_hash_extra: a frame whose final simulation got a
  * wrong pad now differs from the other game's. SSBU_RB_NET_CKPADS=0 = the old checksum (test). */
 static int g_ckpads = -1;
-int rbn_hash_wanted(void) { return g_on > 0; }
+int rbn_hash_wanted(void) { return g_on > 0 && g_started; }
 void rbn_hash_extra(const void *p, size_t n) {          /* folded into the frame's checksum only (not a "d" line field) */
     if (g_on <= 0) return;
     if (g_ckpads < 0) { const char *e = getenv("SSBU_RB_NET_CKPADS"); g_ckpads = !(e && e[0] == '0'); }
