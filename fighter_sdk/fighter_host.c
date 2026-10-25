@@ -1235,10 +1235,6 @@ static void fh_hook(Ctx *c, void *user) {
         if ((tracked && g_fh_out) || net_hash) {
             long long f = tracked ? ++g_fh_f[k].frame : 0;
             int entry = tracked ? g_fh_f[k].entry : -1;
-            /* The eight-slot lifetime table serves debug frame counts. New objects after rematches must still
-             * contribute to online checksums even when that table is full; resolve their entry without indexing it. */
-            if (!tracked) { double id = 0;
-                if (fd_value("FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID", &id)) entry = (int)fd_call(c, FD_N("24WorkModule__get_int_impl") "i", boma, (uint64_t)(int64_t)id, 0, 0, 0, 0, 0, NULL); }
             float x = 0, y = 0, mf = 0, dmg = 0;
             int st = (int)fd_call(c, FD_N("30StatusModule__status_kind_impl"), boma, 0, 0, 0, 0, 0, 0, NULL);
             uint64_t mot = fd_call(c, FD_N("30MotionModule__motion_kind_impl"), boma, 0, 0, 0, 0, 0, 0, NULL);
@@ -1252,7 +1248,10 @@ static void fh_hook(Ctx *c, void *user) {
             memset(&rec, 0, sizeof rec);
             rec.f = f; rec.k = entry; rec.st = st; rec.mot = mot; rec.mf = mf; rec.x = x; rec.y = y; rec.dmg = dmg; rec.rh = rh;
             if (tracked) g_fh_run = fh_fnv(g_fh_run, &rec, sizeof rec);
-            { void rbn_hash_add(const void *p, size_t n); struct { int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } r3 = {rec.k, rec.st, rec.mot, rec.mf, rec.x, rec.y, rec.dmg, rec.rh};
+            /* Entry lookup uses an optional generated debug header: one installation may resolve 0/1 while another
+             * gets -1. Never hash that installation-dependent identity. Preserve the record layout with an unknown
+             * entry marker; fighter state is still collected and hashed in the same frame-line call order. */
+            { void rbn_hash_add(const void *p, size_t n); struct { int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } r3 = {-1, rec.st, rec.mot, rec.mf, rec.x, rec.y, rec.dmg, rec.rh};
               rbn_hash_add(&r3, sizeof r3); }      /* R3 (rb_net.c, SSBU_RB_NET only): the frame's checksum, without the per-process frame count */
             if (g_fh_out && tracked) {               /* file diagnostics use the debug table; network checksums do not */
                 uint32_t bx, by, bm, bd; memcpy(&bx, &x, 4); memcpy(&by, &y, 4); memcpy(&bm, &mf, 4); memcpy(&bd, &dmg, 4);

@@ -14,9 +14,11 @@ and desync-reporting path consumes the checksums; this change does not add state
 of game memory. It uses the same logged fighter/RNG/input subset as the existing explicit-file tests.
 
 Network collection is also independent of the eight-entry lifetime table used for debug frame counts. If a new fighter
-object is no longer represented in that table, its entry is resolved directly and its state still contributes to the
-network checksum. File diagnostics continue to use tracked entries. This does not reset game RNG state or change
-first-fight initialization; natural long-rematch coverage is still required.
+object is no longer represented in that table, its state still contributes to the network checksum. Network records
+use an unknown-entry marker (-1), independently of the optional generated debug header; otherwise a developer with
+that header could hash entry IDs 0/1 while a runtime-only installation hashes -1 and report a false desync. Fighter
+state remains ordered by frame-line calls. File diagnostics retain their resolved IDs and tracked frame counts. This
+does not reset game RNG state or change first-fight initialization; natural table exhaustion remains untested.
 
 ## Verified and pending
 
@@ -66,7 +68,7 @@ is not a natural multi-rematch reproduction.
 
 The installed test setup lacks `fighters/sdk_generated/lua_const.h`. Its fighter entry lookup therefore returned -1
 in both builds, including the original tracked path. The regression proves collection continues for uncached objects;
-successful uncached entry-ID lookup and natural long-session coverage still need validation with that optional header.
+cross-installation identity validation is described separately below, and natural table exhaustion is still untested.
 No full-run performance improvement or Slippi comparison is inferred from these runs.
 
 ## Natural rematch result (2026-10-25)
@@ -82,5 +84,11 @@ one observed run, not an off/on cost measurement or an internet benchmark.
 The harness's stop expression initially targeted a message in the separate R1 file while its driver watched stdout.
 The games were stopped after the completed match-2 reports/at the 300-second harness limit; this run therefore does
 not establish clean shutdown. The checksum logs were flushed by the match-end reports. This verifies a natural
-rematch with collection continuing; it does not naturally exhaust all eight debug slots or validate entry-ID lookup
-with the missing generated header.
+rematch with collection continuing; it does not naturally exhaust all eight debug slots.
+
+## Installation-independent network identity
+
+The network record now reserves its entry field as -1 even when debug metadata resolves a fighter ID. Optional debug
+headers must not change peer checksums for identical gameplay. This also removes repeated constant lookup for actors
+outside the debug table. The fighter-hook translation unit compiles; a private before/after paired-game fixture is
+being prepared to exercise differing debug identities without changing game state.
