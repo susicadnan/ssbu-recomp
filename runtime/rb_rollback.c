@@ -436,13 +436,13 @@ static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     RbPad p = rbn_pad(id, f);
     *b = p.buttons; *lx = p.lx; *ly = p.ly; *rx = p.rx; *ry = p.ry;
 }
-static void rbg_report(void);
+static void rbg_report(void); static void rbg_match_report(void);
 /* (hs12) r1_ring.c rgs_step, every safe point while no fight is on: the end of a match (once): its report, the ring
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
-    if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
+    if (g_rbg_in_match == 1) { rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
@@ -531,5 +531,4 @@ static void rbg_report(void) {
     rbg_dist("main-thread CPU per tick with rollback (million cycles, shown as ms)", g_rbg_wcyc, g_rbg_nw, g_rbg_wk, 1);
     rbg_dist("main-thread CPU per tick without rollback (million cycles, shown as ms)", g_rbg_wcyc, g_rbg_nw, g_rbg_wk, 0);
     rbn_report(g_log, g_rbg_real);
-    rbg_match_report();                                 /* (net4) */
 }
