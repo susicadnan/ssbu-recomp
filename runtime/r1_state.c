@@ -49,6 +49,7 @@ void r1_register_heap(void) { r1_on(); }
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <emmintrin.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -282,7 +283,11 @@ static void threads_report(const char *when) {
 
 
 /* ---------------------------------------------------------------- the other guest threads: held at a wait while memory is copied */
-typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; } Th;
+typedef struct { HANDLE h; Ctx *c; const char *name; uint64_t from; const char *imp; Ctx regs; int held, parked, same; double wait_ms; uint64_t rsp, rip; int cok; int pre; } Th;
+/* (R5 fast1) pre: the thread is a task worker that ra_workers_hold suspended at the kick (H1) and found blocked there: the hold
+ * at H2 takes it as held without suspending it again (three system calls per thread saved), and no release of ours resumes
+ * it (ra_workers_release does, at H2's end, as before). SSBU_RB_HOLD_PRE=0: the old way (suspended again, checked again). */
+static void th_resume(Th *t) { if (t->held && !t->pre) ResumeThread(t->h); t->held = 0; t->pre = 0; }
 /* (R3 hs16) cok: rsp / rip read by th_blocked while this thread is held (suspended by us ever since): live_rsps uses them
  * instead of asking Windows again (GetThreadContext of a thread blocked in the kernel costs ~20 us: 0.5 ms per capture) */
 static int g_audio_free;
@@ -332,7 +337,9 @@ static void slow_report(const char *when) {        /* which thread made the hold
     b[o] = 0;
     if (o) LOG("r1: hold %s: slow threads:%s\n", when, b);
 }
-static void unpark(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+static HANDLE g_ra_wh[16]; static int g_ra_nwh; static uint64_t g_ra_wh_rsp[16], g_ra_wh_rip[16]; static long long g_ra_pre_held, g_ra_wd_held_back;      /* the workers held from the kick (ra_workers_hold); (fast1) where each was found blocked at H1 */
+static volatile LONG g_ra_wh_on; static void ra_wh_give_back(void) { InterlockedCompareExchange(&g_ra_wh_on, 1, 2); }      /* (fast1) the workers' hold is ours no more */
+static void unpark(void) { for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]); ra_wh_give_back(); }
 static void restore_thread_regs(void) {     /* callee-saved registers + sp of each thread held at the same wait as at the save */
     for (int i = 0; i < g_nth; i++) {
         Th *t = &g_th[i];
@@ -1167,22 +1174,66 @@ static uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the q
 /* (R3 net3) g_cp_cond set: each queued page is copied only if it differs from its source (a ring load: most learned pages
  * already hold the value being loaded; reading both is cheaper than writing the page); g_cp_wrote[k] counts the copies */
 static int g_cp_cond; static volatile long long g_cp_wrote[9];
+/* (R5 fast1: cheaper captures and loads, plan: the cloud thread "Speed up rollback state save and restore")
+ *  - SSBU_RB_COPY_NT (default 2): the page copies store with non-temporal (streaming) stores: a load writes ~24 MB that
+ *    nothing reads before the re-run pass, a capture writes pool buffers that nothing reads before a load, so the
+ *    write-allocate read of every destination line (a third of a copy's memory traffic) is left out. 0 = memcpy;
+ *    1 = the pool copies of captures only; 2 = loads too (SSBU_RB_COPY_NT_LOAD, see cp_run's callers).
+ *  - SSBU_RB_COPY_SPIN=<ms> (default 0.3): a copy thread that finished its share keeps looking for the next job for that
+ *    long before it sleeps on its event: the two or three fan-outs of one capture (compare, copy) then start in
+ *    microseconds instead of a scheduler wake-up each. 0 = always the event.
+ *  - the compare of a capture copies as it goes (g_cp_fbuf: pool buffers taken in advance; r1_ring.c ls_capture): a
+ *    changed page is copied by the thread that found it, while it is in that core's cache, instead of a second pass. */
+static int g_cp_nt = -1, g_cp_nt_now; static double g_cp_spin = -1; static volatile LONG g_cp_gok[8];
+static uint8_t **g_cp_fbuf; static LONG g_cp_fcnt; static volatile LONG g_cp_fn; static uint32_t *g_cp_fdst;      /* fused copy: buffers, their count, taken so far; per job: 1 + the buffer taken (0 = none) */
+static void cp_page(uint8_t *d, const uint8_t *s) {
+    if (g_cp_nt_now && !(((uintptr_t)d | (uintptr_t)s) & 15)) {
+        const __m128i *a = (const __m128i *)s; __m128i *b = (__m128i *)d;
+        for (int i = 0; i < PG / 64; i++, a += 4, b += 4) {
+            __m128i x0 = _mm_load_si128(a), x1 = _mm_load_si128(a + 1), x2 = _mm_load_si128(a + 2), x3 = _mm_load_si128(a + 3);
+            _mm_stream_si128(b, x0); _mm_stream_si128(b + 1, x1); _mm_stream_si128(b + 2, x2); _mm_stream_si128(b + 3, x3);
+        }
+    } else memcpy(d, s, PG);
+}
 static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
-    if (g_cp_cmp) { for (size_t i = a; i < b; i++) g_cp_cmp[i] = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; }
-    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) if (memcmp(g_cj[i].d, g_cj[i].s, PG)) { memcpy(g_cj[i].d, g_cj[i].s, PG); w++; } g_cp_wrote[k < 9 ? k : 8] += w; }
-    else for (size_t i = a; i < b; i++) memcpy(g_cj[i].d, g_cj[i].s, PG); }
-static DWORD WINAPI cp_thread(void *p) { int k = (int)(intptr_t)p; for (;;) { WaitForSingleObject(g_cp_go[k], INFINITE); cp_part(k + 1); SetEvent(g_cp_done[k]); } return 0; }
+    if (g_cp_cmp) {
+        for (size_t i = a; i < b; i++) {
+            int diff = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; g_cp_cmp[i] = (uint8_t)diff;
+            if (diff && g_cp_fbuf) { LONG n = InterlockedIncrement(&g_cp_fn) - 1; if (n < g_cp_fcnt) { cp_page(g_cp_fbuf[n], g_cj[i].d); g_cp_fdst[i] = (uint32_t)n + 1; } else g_cp_fdst[i] = 0; }
+            else if (g_cp_fbuf) g_cp_fdst[i] = 0;
+        }
+    }
+    else if (g_cp_cond) { long long w = 0; for (size_t i = a; i < b; i++) if (memcmp(g_cj[i].d, g_cj[i].s, PG)) { cp_page(g_cj[i].d, g_cj[i].s); w++; } g_cp_wrote[k < 9 ? k : 8] += w; }
+    else for (size_t i = a; i < b; i++) cp_page(g_cj[i].d, g_cj[i].s);
+    if (g_cp_nt_now) _mm_sfence(); }
+static DWORD WINAPI cp_thread(void *p) {
+    int k = (int)(intptr_t)p;
+    for (;;) {
+        double t0 = g_cp_spin > 0 ? now_ms() : 0;
+        while (!InterlockedExchange(&g_cp_gok[k], 0)) {   /* a go (posted before its event is signaled; a signal left over from a go taken while spinning is consumed here and ignored) */
+            if (g_cp_spin <= 0 || now_ms() - t0 > g_cp_spin) { WaitForSingleObject(g_cp_go[k], INFINITE); continue; }
+            YieldProcessor();
+        }
+        cp_part(k + 1); SetEvent(g_cp_done[k]);
+    }
+    return 0;
+}
 static void cp_init(void) {
     if (g_ncp >= 0) return;
     const char *e = getenv("SSBU_RUNAHEAD_COPY_THREADS"); g_ncp = e ? atoi(e) : rgs_wanted() ? 6 : 2;      /* (R2 round 3: the ring, 6) */ if (g_ncp > 8) g_ncp = 8; if (g_ncp < 0) g_ncp = 0;
     SYSTEM_INFO si; GetSystemInfo(&si); if (g_ncp > (int)si.dwNumberOfProcessors - 2) g_ncp = (int)si.dwNumberOfProcessors > 2 ? (int)si.dwNumberOfProcessors - 2 : 0;
+    e = getenv("SSBU_RB_COPY_NT"); g_cp_nt = e ? atoi(e) : 2; e = getenv("SSBU_RB_COPY_SPIN"); g_cp_spin = e ? atof(e) : 0.3;
+    LOG("r1: page copies: %d helper threads; non-temporal stores %s; helpers spin %.2f ms for the next job\n", g_ncp, g_cp_nt >= 2 ? "captures and loads" : g_cp_nt == 1 ? "captures" : "off", g_cp_spin);
     for (int k = 0; k < g_ncp; k++) { g_cp_go[k] = CreateEventA(NULL, FALSE, FALSE, NULL); g_cp_done[k] = CreateEventA(NULL, FALSE, FALSE, NULL); HANDLE t = CreateThread(NULL, 0, cp_thread, (void *)(intptr_t)k, 0, NULL); SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); CloseHandle(t); }
 }
-static void cp_run(void) {                            /* every queued page, then the queue is empty */
-    if (g_ncp > 0 && g_ncj >= 64) { for (int k = 0; k < g_ncp; k++) SetEvent(g_cp_go[k]); cp_part(0); WaitForMultipleObjects((DWORD)g_ncp, g_cp_done, TRUE, INFINITE); }
+/* nt: 0 = memcpy, 1 = non-temporal stores if SSBU_RB_COPY_NT >= 1 (a capture's pool copies), 2 = if >= 2 (a load) */
+static void cp_run_nt(int nt) {                       /* every queued page, then the queue is empty */
+    g_cp_nt_now = g_cp_nt >= nt && nt > 0;
+    if (g_ncp > 0 && g_ncj >= 64) { for (int k = 0; k < g_ncp; k++) { InterlockedExchange(&g_cp_gok[k], 1); SetEvent(g_cp_go[k]); } cp_part(0); WaitForMultipleObjects((DWORD)g_ncp, g_cp_done, TRUE, INFINITE); }
     else { int keep = g_ncp; g_ncp = 0; cp_part(0); g_ncp = keep; }
-    g_ncj = 0;
+    g_ncj = 0; g_cp_nt_now = 0;
 }
+static void cp_run(void) { cp_run_nt(0); }
 static int g_cp_defer;                                /* mark_sweep queues its copies (run-ahead) instead of doing them */
 static size_t mark_sweep(int dir) {
     size_t n = 0;
@@ -1497,10 +1548,21 @@ static int ra_hold_save(void) {
     static int all_first = -1; if (all_first < 0) { const char *e = getenv("SSBU_RB_HOLD_ALL"); all_first = rgs_wanted() && e && atoi(e) != 0; }      /* opt-in: saved ~0.07 ms only; rb2f1 crashed with it (cause not shown) */
     static uint8_t pre[256];                                /* (R2 round 3, ring only) every thread suspended first, then checked: the kernel delivers the suspends together */
     if (all_first) for (int i = 0; i < g_nth; i++) pre[i] = !ra_free(g_th[i].name) && SuspendThread(g_th[i].h) != (DWORD)-1;
+    static int pre_on = -1; if (pre_on < 0) { const char *e = getenv("SSBU_RB_HOLD_PRE"); pre_on = !(e && e[0] == '0'); }
+    int pre_held = pre_on && InterlockedCompareExchange(&g_ra_wh_on, 2, 1) == 1;      /* (fast1) the workers are held since the kick: ours until unpark */
     for (int i = 0; i < g_nth; i++) {
         Th *t = &g_th[i];
         if (ra_free(t->name)) continue;
         double t0 = now_ms();
+        if (pre_held) {
+            int w; for (w = 0; w < g_ra_nwh; w++) if (g_ra_wh[w] == t->h) break;
+            if (w < g_ra_nwh && waiting_import(t->c->in_import)) {
+                t->held = 1; t->parked = 1; t->pre = 1; t->rsp = g_ra_wh_rsp[w]; t->rip = g_ra_wh_rip[w]; t->cok = 1; t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c;
+                if (all_first && pre[i]) { ResumeThread(t->h); pre[i] = 0; }
+                g_ra_pre_held++; if (g_hp_on) hp_add(t->name, now_ms() - t0, 0);
+                continue;
+            }
+        }
         if (all_first && pre[i]) {
             pre[i] = 0;
             if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; t->from = t->c->import_from; t->imp = t->c->in_import; t->regs = *t->c; continue; }
@@ -1514,7 +1576,8 @@ static int ra_hold_save(void) {
             ResumeThread(t->h); spins++;
             if (now_ms() - t0 > g_ra_park_ms) {
                 if (g_hp_on) hp_add(t->name, now_ms() - t0, spins);
-                for (int j = 0; j < i; j++) if (g_th[j].held) { ResumeThread(g_th[j].h); g_th[j].held = 0; }
+                for (int j = 0; j < i; j++) th_resume(&g_th[j]);
+                ra_wh_give_back();
                 if (all_first) for (int j = i + 1; j < g_nth; j++) if (pre[j]) { ResumeThread(g_th[j].h); pre[j] = 0; }
                 g_ra_busy = t->name; g_ra_busy_imp = t->c->in_import;      /* (R3 lwr) and the import it was in (log) */
                 if (strstr(t->name, "TaskWorker")) g_ra_skip_why[0]++; else if (ra_audio(t->name)) g_ra_skip_why[1]++; else g_ra_skip_why[2]++;
@@ -1527,7 +1590,7 @@ static int ra_hold_save(void) {
     }
     return 1;
 }
-static void ra_release_save(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+static void ra_release_save(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) th_resume(&g_th[i]); ra_wh_give_back(); }
 /* restore: each thread at the SAME wait as at the save (the audio threads were never let go) */
 static void ra_hold_restore(void) {
     g_th_mismatch = 0; g_th_running = 0;
@@ -1575,7 +1638,8 @@ static int ra_hold_quiet(double limit) {
         if (ra_hold_save()) {
             double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
             if (fq) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
-            for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+            for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]);
+            ra_wh_give_back();
             g_ra_busy = "a job fiber (task worker)"; g_ra_skip_why[3]++;
         }
         tries++;
@@ -1617,7 +1681,8 @@ static void ra_restore(Ctx *c) {
     for (double tq = now_ms();;) {                       /* the same quiet moment as at the save (the speculative pass's jobs finished) */
         ra_hold_restore();
         if (ra_fibers_quiet() || now_ms() - tq > 200) { if (g_ra_busy_fibers) LOG("r1: RA restore: %d fibers still busy after 200 ms\n", g_ra_busy_fibers); break; }
-        for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+        for (int i = 0; i < g_nth; i++) if (g_th[i].held && !ra_audio(g_th[i].name)) th_resume(&g_th[i]);
+        ra_wh_give_back();
         g_ra_fiber_waits++;
         SwitchToThread();
     }
@@ -1721,8 +1786,12 @@ static void ra_kick(Ctx *c, void *user) {            /* hook on FUN 0x710354c720
  * submission (H2), in every pass: at H2 they are always in the same state (blocked at their idle wait, the kick's jobs
  * queued and not started, its event signaled and not consumed), which is what a save / restore needs. Cost: the kick's
  * jobs start after the submission instead of during it. A watchdog lets them go if H2 does not come within 200 ms. */
-static HANDLE g_ra_wh[16]; static int g_ra_nwh; static volatile LONG g_ra_wh_on; static HANDLE g_ra_wd_ev; static long long g_ra_wh_fail, g_ra_wd_fired;
+static HANDLE g_ra_wd_ev; static long long g_ra_wh_fail, g_ra_wd_fired;
 static void ra_workers_release(void) { if (InterlockedExchange(&g_ra_wh_on, 0)) for (int i = 0; i < g_ra_nwh; i++) ResumeThread(g_ra_wh[i]); g_ra_nwh = 0; }
+static void ra_workers_release_wd(void) {              /* (fast1) the watchdog: not while a hold at H2 counts on them (g_ra_wh_on 2): it lets them go itself */
+    if (InterlockedCompareExchange(&g_ra_wh_on, 0, 1) == 1) { for (int i = 0; i < g_ra_nwh; i++) ResumeThread(g_ra_wh[i]); g_ra_nwh = 0; }
+    else g_ra_wd_held_back++;
+}
 static DWORD WINAPI ra_watchdog(void *p) {
     (void)p;
     for (;;) {
@@ -1731,7 +1800,7 @@ static DWORD WINAPI ra_watchdog(void *p) {
         while (WaitForSingleObject(g_ra_wd_ev, 200) == WAIT_TIMEOUT) {
             if (g_ra_wd_pause == 1) continue;            /* (the first, full save takes seconds; R3: the safe point's waits) */
             if (g_ra_wd_pause == 2 && now_ms() - t0 < 10000) continue;      /* R3 online match: a slow pass must not let them go (10 s: H2 never came) */
-            if (g_ra_wh_on) { g_ra_wd_fired++; ra_workers_release(); }
+            if (g_ra_wh_on) { g_ra_wd_fired++; ra_workers_release_wd(); }
             break;
         }
     }
@@ -1744,7 +1813,7 @@ static void ra_workers_hold(void) {
         if (!h || GetThreadId(h) == me || !nm || !strstr(nm, "TaskWorker")) continue;
         if (SuspendThread(h) == (DWORD)-1) continue;
         if (!th_blocked(h)) { ResumeThread(h); g_ra_wh_fail++; continue; }      /* busy: not held (that pass will likely skip its save) */
-        g_ra_wh[g_ra_nwh++] = h;
+        g_ra_wh_rsp[g_ra_nwh] = g_tb_rsp; g_ra_wh_rip[g_ra_nwh] = g_tb_rip; g_ra_wh[g_ra_nwh++] = h;
     }
     InterlockedExchange(&g_ra_wh_on, 1);
     SetEvent(g_ra_wd_ev);
