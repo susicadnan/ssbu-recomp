@@ -674,6 +674,13 @@ static int auto_delay(void) {
     if (g_loop) return 2;
     int rtt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
     if (rtt <= 0) return 2;
+    /* (net4) jitter: the best round trip plus 1.5 x (mean - best) of the pings so far (every 100 ms from the start). A
+     * steady link changes nothing (78 ms: mean 78.9, best 78.1); a jittery one gets the frame its late packets need.
+     * Measured, two games, 78 ms + 0..10 ms jitter + 2 % loss: delay 3 -> 20-28 rollbacks, tick p99 34-44 ms; delay 4 ->
+     * 0 rollbacks, p99 21.5 ms, identical. SSBU_RB_NET_JITTER=0: the best round trip alone (the old way). */
+    {   static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
+        double mean = 0; AcquireSRWLockExclusive(&g_rq_lock); if (g_rtt_n >= 10) mean = g_rtt_sum / g_rtt_n; ReleaseSRWLockExclusive(&g_rq_lock);
+        if (jit && g_rtt_min_us > 0 && mean > g_rtt_min_us) rtt = (int)(g_rtt_min_us + 1.5 * (mean - g_rtt_min_us)); }
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
     /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
      * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
