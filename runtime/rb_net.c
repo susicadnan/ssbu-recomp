@@ -17,6 +17,7 @@
  *   SSBU_RB_NET_FIND=0     (R3 net3) no opponent search through the lobby (lobby / LAN mode without a room: the old way)
  *   SSBU_RB_NET_PREDRAIN=0 apply inputs received during pacing before the next simulation pass: default ON (=0 off)
  *   SSBU_RB_NET_RESEND_MS=<8..50> experimental: retry interval while stalled, milliseconds (default 50)
+ *   SSBU_RB_NET_RECENT_RTT=1 experimental: choose match delay from the last 32 RTT samples (default off)
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <stdio.h>
@@ -43,6 +44,7 @@ int net_online(void);
 static int g_on = -1, g_loop, g_loop_lat = 4, g_local, g_delay_cfg = -1, g_ahead = 7, g_started, g_peer_started;
 static int g_predrain;
 static int g_resend_ms = 50;
+static int g_recent_rtt;
 static unsigned g_bot_seed; static int g_bot;
 static FILE *g_hlog;
 static volatile LONG64 g_cur;                          /* the frame this game is on (read by the receive thread for PONGs) */
@@ -66,6 +68,7 @@ int rbn_on(void) {
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
     { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = !(v && v[0] == '0'); }      /* (net4: on by default after two in-game pair tests, identical; =0 off) */
+    { const char *v = getenv("SSBU_RB_NET_RECENT_RTT"); g_recent_rtt = v && atoi(v) > 0; }
     { const char *v = getenv("SSBU_RB_NET_RESEND_MS"); char *end; long ms = v ? strtol(v, &end, 10) : 0;
       g_resend_ms = v && end != v && !*end && ms >= 8 && ms <= 50 ? (int)ms : 50; }
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
@@ -563,6 +566,34 @@ static volatile LONG g_rq_head, g_rq_tail; static SRWLOCK g_rq_lock = SRWLOCK_IN
 static volatile LONG64 g_rx_pkts, g_rx_bad, g_rx_drop, g_tx_pkts, g_tx_fail, g_rx_last_ms, g_rx_oldmatch;
 static volatile LONG g_rtt_us = -1, g_rtt_min_us = -1;
 static long long g_rtt_n; static double g_rtt_sum;      /* (under g_rq_lock) */
+#define RTT_RECENT 32                                  /* pings every 100 ms: about 3.2 seconds of current path conditions */
+static int g_rtt_recent[RTT_RECENT], g_rtt_recent_n, g_rtt_recent_i;   /* under g_rq_lock; retained between rematches */
+static void rtt_sample_locked(int us) {                 /* caller holds g_rq_lock */
+    InterlockedExchange(&g_rtt_us, us); if (g_rtt_min_us < 0 || us < g_rtt_min_us) InterlockedExchange(&g_rtt_min_us, us);
+    g_rtt_sum += us; g_rtt_n++;
+    g_rtt_recent[g_rtt_recent_i] = us; g_rtt_recent_i = (g_rtt_recent_i + 1) % RTT_RECENT;
+    if (g_rtt_recent_n < RTT_RECENT) g_rtt_recent_n++;
+}
+typedef struct { long long n; int best_us; double mean_us; } RbnRttStats;
+static RbnRttStats rtt_stats(int recent) {
+    RbnRttStats s;
+    AcquireSRWLockExclusive(&g_rq_lock);
+    s.n = g_rtt_n; s.best_us = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
+    s.mean_us = g_rtt_n ? g_rtt_sum / g_rtt_n : 0;
+    if (recent && g_rtt_recent_n) {
+        long long sum = 0; s.n = g_rtt_recent_n; s.best_us = g_rtt_recent[0];
+        for (int k = 0; k < g_rtt_recent_n; k++) { int us = g_rtt_recent[k]; sum += us; if (us < s.best_us) s.best_us = us; }
+        s.mean_us = sum / (double)s.n;
+    }
+    ReleaseSRWLockExclusive(&g_rq_lock);
+    return s;
+}
+static int rtt_for_delay(int jitter) {
+    RbnRttStats s = rtt_stats(g_recent_rtt);
+    if (jitter && s.n >= 10 && s.best_us > 0 && s.mean_us > s.best_us)
+        return (int)(s.best_us + 1.5 * (s.mean_us - s.best_us));
+    return s.best_us;
+}
 #define TSQ 64
 static int32_t g_tsq[TSQ]; static int g_tsq_n;          /* clock-offset samples waiting for the main thread (under g_rq_lock) */
 /* (hs14) the mode byte at the end of every PADS message (after the match tag): bit 7 = this game plays the match WITHOUT the
@@ -597,9 +628,8 @@ void rbn_rx(const uint8_t *p, int n) {
         RbMsg m; if (!rb_msg_parse(p, (size_t)n, &m)) { InterlockedIncrement64(&g_rx_bad); return; }
         long rtt = (long)(now_us() - m.echo_us);
         if (rtt <= 0 || rtt >= 5000000) return;
-        InterlockedExchange(&g_rtt_us, rtt); if (g_rtt_min_us < 0 || rtt < g_rtt_min_us) InterlockedExchange(&g_rtt_min_us, rtt);
         AcquireSRWLockExclusive(&g_rq_lock);
-        g_rtt_sum += rtt; g_rtt_n++;
+        rtt_sample_locked((int)rtt);
         if (g_started && m.frame > 0 && g_cur > 0 && g_tsq_n < TSQ) g_tsq[g_tsq_n++] = (int32_t)((g_cur - m.frame) * 16683 - rtt / 2);   /* > 0: this game runs ahead */
         ReleaseSRWLockExclusive(&g_rq_lock);
         return;
@@ -623,8 +653,10 @@ static int rbn_peer_heard_ms(void) {                    /* (R3 lwr) any rollback
     return last ? (int)(GetTickCount64() - (ULONGLONG)last) : -1;
 }
 static void rtt_reset(void) {                           /* (R3 net3) */
-    AcquireSRWLockExclusive(&g_rq_lock); g_rtt_sum = 0; g_rtt_n = 0; ReleaseSRWLockExclusive(&g_rq_lock);
+    AcquireSRWLockExclusive(&g_rq_lock); g_rtt_sum = 0; g_rtt_n = 0;
+    memset(g_rtt_recent, 0, sizeof g_rtt_recent); g_rtt_recent_n = g_rtt_recent_i = 0;
     InterlockedExchange(&g_rtt_us, -1); InterlockedExchange(&g_rtt_min_us, -1);
+    ReleaseSRWLockExclusive(&g_rq_lock);
 }
 /* a thread that pings the other player every 100 ms from the start (the delay is chosen from it when the match begins) */
 static DWORD WINAPI ping_thread(void *u) {
@@ -650,6 +682,26 @@ static long long g_stat_pred, g_stat_padget, g_stat_mis;
 static long long g_preframe_pads;
 static double g_resend_last_ms = -1;
 static long long g_stall_resends;
+/* Time from network-thread enqueue to main-thread consumption, excluding network transit. A bounded histogram
+ * avoids allocation/sorting on the simulation thread. Bins 0..31 are [n,n+1) ms; bin 32 is the overflow bucket. */
+static struct { uint64_t samples, sum_us, max_us, bins[33]; } g_rx_wait;
+static void rx_wait_sample(uint64_t us) {
+    unsigned bin = us >= 32000 ? 32 : (unsigned)(us / 1000);
+    g_rx_wait.samples++; g_rx_wait.sum_us += us; g_rx_wait.bins[bin]++;
+    if (us > g_rx_wait.max_us) g_rx_wait.max_us = us;
+}
+static double rx_wait_bound(int percent) {
+    if (!g_rx_wait.samples) return 0;
+    uint64_t rank = (g_rx_wait.samples * (unsigned)percent + 99) / 100, seen = 0;
+    for (unsigned bin = 0; bin < 33; bin++) {
+        seen += g_rx_wait.bins[bin];
+        if (seen >= rank) {
+            uint64_t bound = bin == 32 ? g_rx_wait.max_us : (bin + 1) * 1000;
+            return (bound < g_rx_wait.max_us ? bound : g_rx_wait.max_us) / 1000.0;
+        }
+    }
+    return g_rx_wait.max_us / 1000.0;
+}
 static long long g_ts_n; static double g_ts_extra;     /* time sync: extra ms per frame for the next frames */
 static int g_ts_left;
 static uint64_t g_hacc = 0xcbf29ce484222325ull; static int g_hlines;
@@ -662,7 +714,7 @@ void rbn_set_lockstep(int on) { g_lockstep = on; }
 int rbn_loop(void) { return g_loop; }
 static int lock_delay(void) {                           /* the delay that covers the whole one-way trip (+ 1 frame): the wait is short or none */
     if (g_loop) return g_loop_lat + 1;
-    int rt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
+    int rt = rtt_for_delay(0);
     if (rt <= 0) return 4;
     int d = (int)ceil(rt / 2000.0 / (1000.0 / 60.0)) + 1;
     return d < 1 ? 1 : d > 12 ? 12 : d;
@@ -676,15 +728,13 @@ static int auto_delay(void) {
         return pd > d ? pd : d;
     }
     if (g_loop) return 2;
-    int rtt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
-    if (rtt <= 0) return 2;
     /* (net4) jitter: the best round trip plus 1.5 x (mean - best) of the pings so far (every 100 ms from the start). A
      * steady link changes nothing (78 ms: mean 78.9, best 78.1); a jittery one gets the frame its late packets need.
      * Measured, two games, 78 ms + 0..10 ms jitter + 2 % loss: delay 3 -> 20-28 rollbacks, tick p99 34-44 ms; delay 4 ->
      * 0 rollbacks, p99 21.5 ms, identical. SSBU_RB_NET_JITTER=0: the best round trip alone (the old way). */
-    {   static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
-        double mean = 0; AcquireSRWLockExclusive(&g_rq_lock); if (g_rtt_n >= 10) mean = g_rtt_sum / g_rtt_n; ReleaseSRWLockExclusive(&g_rq_lock);
-        if (jit && g_rtt_min_us > 0 && mean > g_rtt_min_us) rtt = (int)(g_rtt_min_us + 1.5 * (mean - g_rtt_min_us)); }
+    static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
+    int rtt = rtt_for_delay(jit);
+    if (rtt <= 0) return 2;
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
     /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
      * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
@@ -712,6 +762,9 @@ void rbn_start(long long f0) {
     printf("[rbnet] match %d (id %08x) start at frame %lld: local player %d, input delay %d frames (round trip %.1f ms, best %.1f ms)\n", g_match_n, g_match_id, f0, g_local + 1, g_delay,
            g_rtt_us > 0 ? g_rtt_us / 1000.0 : -1.0, g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1.0);
     fflush(stdout);
+    if (g_recent_rtt && g_delay_cfg < 0) { RbnRttStats s = rtt_stats(1);
+        printf("[rbnet] delay uses recent RTT window: %lld samples, mean %.1f ms, best %.1f ms (history retained across rematches)\n",
+               s.n, s.mean_us / 1000.0, s.best_us > 0 ? s.best_us / 1000.0 : -1.0); fflush(stdout); }
 }
 /* after the start barrier: the delay again from the round trip measured meanwhile (no frame has run: the queues start over;
  * pads of the other game already queued are sent again by it, from our acknowledgement on) */
@@ -807,6 +860,7 @@ void rbn_drain(long long cur) {
         RbMsg m;
         if (!rb_msg_parse(b, (size_t)n, &m)) { g_rx_bad++; continue; }
         if (m.type != RB_MSG_PADS || !g_started || m.player != g_remote) continue;
+        if (m.count) { uint64_t consumed = now_us(); rx_wait_sample(consumed >= at ? consumed - at : 0); }
         g_peer_started = 1;
         for (int k = 0; k < m.count; k++) rb_input_remote_put(g_remote, m.newest - k, m.pads[k]);
         if (m.ack > g_peer_ack && m.ack <= rb_input_local_latest()) g_peer_ack = m.ack;      /* (hs12: never an acknowledgement of pads not sent yet) */
@@ -960,6 +1014,7 @@ void rbn_match_reset(void) {
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
     g_preframe_pads = 0;
     g_resend_last_ms = -1; g_stall_resends = 0;
+    memset(&g_rx_wait, 0, sizeof g_rx_wait);
     g_hacc = 0xcbf29ce484222325ull; g_hlines = 0; g_lacc_n = 0;
     memset(g_hash, 0, sizeof g_hash); memset(g_hframe, 0, sizeof g_hframe); g_hfinal_upto = 0;
     g_desync = 0; g_check_ok = 0; g_desync_first = -1; g_peer_check_f = 0; g_peer_check = 0;
@@ -975,13 +1030,20 @@ int rbn_match_number(void) { return g_match_n; }
 void rbn_report(FILE *o, long long frames) {
     if (g_on <= 0) return;
     if (g_hlog) fflush(g_hlog);
+    RbnRttStats all_rtt = rtt_stats(0);
     fprintf(o, "[rbnet] report (match %d, id %08x): %lld frames; delay %d; round trip mean %.1f ms (best %.1f, %lld samples); clock offset estimate %.1f ms, time-sync corrections %lld\n",
-            g_match_n, g_match_id, frames, g_delay, g_rtt_n ? g_rtt_sum / g_rtt_n / 1000.0 : -1.0, g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1.0, g_rtt_n, rb_ts_offset() / 1000.0, g_ts_n);
+            g_match_n, g_match_id, frames, g_delay, all_rtt.n ? all_rtt.mean_us / 1000.0 : -1.0, all_rtt.best_us > 0 ? all_rtt.best_us / 1000.0 : -1.0, all_rtt.n, rb_ts_offset() / 1000.0, g_ts_n);
+    if (g_recent_rtt) { RbnRttStats s = rtt_stats(1);
+        fprintf(o, "[rbnet] report: recent RTT window %lld samples, mean %.1f ms, best %.1f ms; fixed input delay %s\n",
+                s.n, s.n ? s.mean_us / 1000.0 : -1.0, s.best_us > 0 ? s.best_us / 1000.0 : -1.0, g_delay_cfg >= 0 ? "yes (window does not override it)" : "no"); }
     fprintf(o, "[rbnet] report: pads given %lld, predicted %lld (%.1f%%), mispredictions %lld; finalized frames %lld; checksums compared %lld, DESYNCS %lld (first %lld)\n",
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
     fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
+    fprintf(o, "[rbnet] report: input receive-queue wait (not network transit): %llu packets, mean %.3f ms, p50/p95/p99 upper bounds %.3f/%.3f/%.3f ms, max %.3f ms\n",
+            (unsigned long long)g_rx_wait.samples, g_rx_wait.samples ? g_rx_wait.sum_us / (double)g_rx_wait.samples / 1000.0 : 0.0,
+            rx_wait_bound(50), rx_wait_bound(95), rx_wait_bound(99), g_rx_wait.max_us / 1000.0);
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);
