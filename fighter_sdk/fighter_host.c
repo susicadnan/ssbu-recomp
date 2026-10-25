@@ -1161,6 +1161,7 @@ static void fd_hook(Ctx *c, void *user) {
  * first battle frame (SSBU_DET_OFF=1 leaves them alone, for diagnosis). */
 void input_mark(const char *what);                      /* nnhid.c */
 int rbn_handshake_wanted(void); uint64_t rbn_match_seed(void);   /* rb_net.c (R3: 0 / 0 without SSBU_RB_NET) */
+int rbn_on(void); int rbn_hash_wanted(void);
 static ImportFn g_fh_orig;
 static struct { uint64_t boma; int entry; long long frame; } g_fh_f[8];
 static int g_fh_n, g_fh_det, g_fh_detoff;
@@ -1228,9 +1229,16 @@ static void fh_hook(Ctx *c, void *user) {
                 input_mark("fight");
             }
         }
-        if (k < g_fh_n && !g_fh_out) ++g_fh_f[k].frame;
-        if (k < g_fh_n && g_fh_out) {
-            long long f = ++g_fh_f[k].frame;
+        int net_hash = rbn_hash_wanted();
+        int tracked = k < g_fh_n;
+        if (tracked && !g_fh_out && !net_hash) ++g_fh_f[k].frame;
+        if ((tracked && g_fh_out) || net_hash) {
+            long long f = tracked ? ++g_fh_f[k].frame : 0;
+            int entry = tracked ? g_fh_f[k].entry : -1;
+            /* The eight-slot lifetime table serves debug frame counts. New objects after rematches must still
+             * contribute to online checksums even when that table is full; resolve their entry without indexing it. */
+            if (!tracked) { double id = 0;
+                if (fd_value("FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID", &id)) entry = (int)fd_call(c, FD_N("24WorkModule__get_int_impl") "i", boma, (uint64_t)(int64_t)id, 0, 0, 0, 0, 0, NULL); }
             float x = 0, y = 0, mf = 0, dmg = 0;
             int st = (int)fd_call(c, FD_N("30StatusModule__status_kind_impl"), boma, 0, 0, 0, 0, 0, 0, NULL);
             uint64_t mot = fd_call(c, FD_N("30MotionModule__motion_kind_impl"), boma, 0, 0, 0, 0, 0, 0, NULL);
@@ -1242,25 +1250,27 @@ static void fh_hook(Ctx *c, void *user) {
             if (rb) { for (int i = 0; i < 45; i++) w[i] = rd32(rb + 4ull * i); for (int i = 0; i < 9; i++) rc += w[i * 5 + 4]; rh = fh_fnv(rh, w, sizeof w); }
             struct { long long f; int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } rec;
             memset(&rec, 0, sizeof rec);
-            rec.f = f; rec.k = g_fh_f[k].entry; rec.st = st; rec.mot = mot; rec.mf = mf; rec.x = x; rec.y = y; rec.dmg = dmg; rec.rh = rh;
-            g_fh_run = fh_fnv(g_fh_run, &rec, sizeof rec);
+            rec.f = f; rec.k = entry; rec.st = st; rec.mot = mot; rec.mf = mf; rec.x = x; rec.y = y; rec.dmg = dmg; rec.rh = rh;
+            if (tracked) g_fh_run = fh_fnv(g_fh_run, &rec, sizeof rec);
             { void rbn_hash_add(const void *p, size_t n); struct { int k, st; uint64_t mot; float mf, x, y, dmg; uint64_t rh; } r3 = {rec.k, rec.st, rec.mot, rec.mf, rec.x, rec.y, rec.dmg, rec.rh};
               rbn_hash_add(&r3, sizeof r3); }      /* R3 (rb_net.c, SSBU_RB_NET only): the frame's checksum, without the per-process frame count */
-            uint32_t bx, by, bm, bd; memcpy(&bx, &x, 4); memcpy(&by, &y, 4); memcpy(&bm, &mf, 4); memcpy(&bd, &dmg, 4);
-            /* N12: SSBU_FIGHT_HASH_WORK=<int work id, hex or constant name>: that int variable of each fighter at the end of
-             * the line ("w <value>"); not part of H (the hash stays comparable with runs without it) */
-            static int wk_on = -1; static double wk_id;
-            if (wk_on < 0) { const char *w = getenv("SSBU_FIGHT_HASH_WORK"); wk_on = w && w[0] && (fd_value(w, &wk_id) || ((wk_id = (double)strtoul(w, NULL, 16)), wk_id != 0)); }
-            char wtxt[32] = "";
-            if (wk_on) snprintf(wtxt, sizeof wtxt, " w %d", (int)fd_call(c, FD_N("24WorkModule__get_int_impl") "i", boma, (uint64_t)(int64_t)wk_id, 0, 0, 0, 0, 0, NULL));
-            fprintf(g_fh_out, "F %lld e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)%s\n",
-                    f, g_fh_f[k].entry, st, (unsigned long long)mot, bm, bx, by, bd, rc, (unsigned)(rh ^ (rh >> 32)), (unsigned long long)g_fh_run, (double)x, (double)y, (double)mf, (double)dmg, wtxt);
-            if ((f & 63) == 0) fflush(g_fh_out);
-            if (k == 0 && f % 300 == 0 && rb) {            /* which generators are drawn from: the 9 call counters */
-                printf("[fight] frame %lld: generator calls", f);
-                for (int i = 0; i < 9; i++) printf(" %u", w[i * 5 + 4]);
-                printf("; frame line on thread %lu, pad poll on thread %lu; polls that saw 0 / 1 / 2 / 3+ new fight frames: %lld %lld %lld %lld; frame ends %lld, of them %lld reported dropped refreshes (%lld in all)\n", (unsigned long)GetCurrentThreadId(), (unsigned long)g_fh_poll_tid,
-                       g_fh_poll_hist[0], g_fh_poll_hist[1], g_fh_poll_hist[2], g_fh_poll_hist[3], g_fh_frame_ends, g_fh_drop_calls, g_fh_drop_frames);
+            if (g_fh_out && tracked) {               /* file diagnostics use the debug table; network checksums do not */
+                uint32_t bx, by, bm, bd; memcpy(&bx, &x, 4); memcpy(&by, &y, 4); memcpy(&bm, &mf, 4); memcpy(&bd, &dmg, 4);
+                /* N12: SSBU_FIGHT_HASH_WORK=<int work id, hex or constant name>: that int variable of each fighter at the end of
+                 * the line ("w <value>"); not part of H (the hash stays comparable with runs without it) */
+                static int wk_on = -1; static double wk_id;
+                if (wk_on < 0) { const char *w = getenv("SSBU_FIGHT_HASH_WORK"); wk_on = w && w[0] && (fd_value(w, &wk_id) || ((wk_id = (double)strtoul(w, NULL, 16)), wk_id != 0)); }
+                char wtxt[32] = "";
+                if (wk_on) snprintf(wtxt, sizeof wtxt, " w %d", (int)fd_call(c, FD_N("24WorkModule__get_int_impl") "i", boma, (uint64_t)(int64_t)wk_id, 0, 0, 0, 0, 0, NULL));
+                fprintf(g_fh_out, "F %lld e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)%s\n",
+                        f, g_fh_f[k].entry, st, (unsigned long long)mot, bm, bx, by, bd, rc, (unsigned)(rh ^ (rh >> 32)), (unsigned long long)g_fh_run, (double)x, (double)y, (double)mf, (double)dmg, wtxt);
+                if ((f & 63) == 0) fflush(g_fh_out);
+                if (k == 0 && f % 300 == 0 && rb) {            /* which generators are drawn from: the 9 call counters */
+                    printf("[fight] frame %lld: generator calls", f);
+                    for (int i = 0; i < 9; i++) printf(" %u", w[i * 5 + 4]);
+                    printf("; frame line on thread %lu, pad poll on thread %lu; polls that saw 0 / 1 / 2 / 3+ new fight frames: %lld %lld %lld %lld; frame ends %lld, of them %lld reported dropped refreshes (%lld in all)\n", (unsigned long)GetCurrentThreadId(), (unsigned long)g_fh_poll_tid,
+                           g_fh_poll_hist[0], g_fh_poll_hist[1], g_fh_poll_hist[2], g_fh_poll_hist[3], g_fh_frame_ends, g_fh_drop_calls, g_fh_drop_frames);
+                }
             }
         }
     }
@@ -1309,10 +1319,11 @@ int fight_seq_ticks(void) {
 }
 static void fh_exit(void) { if (g_fh_out) { fflush(g_fh_out); if (g_fh_out != stdout) fclose(g_fh_out); g_fh_out = NULL; } }
 static void fight_hash_start(void) {
+    int net_on = rbn_on() > 0;                       /* configure rollback before the cached handshake predicate reads its environment */
     const char *h = getenv("SSBU_FIGHT_HASH"), *d = getenv("SSBU_DETERMINISTIC"), *o = getenv("SSBU_DET_OFF");
     g_fh_det = (d && d[0] && d[0] != '0') || rbn_handshake_wanted();      /* R3: a match between online players needs it (no extra logic frames; generators from the agreed seed) */
     g_fh_detoff = o ? atoi(o) : 0;
-    if ((!h || !h[0] || h[0] == '0') && !g_fh_det) return;
+    if ((!h || !h[0] || h[0] == '0') && !g_fh_det && !net_on) return;
     if (h && h[0] && h[0] != '0') g_fh_out = strcmp(h, "1") == 0 ? stdout : fopen(h, "w");
     int id = hook_install_name("_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv", fh_hook, NULL, &g_fh_orig);
     printf("[fight] SSBU_FIGHT_HASH %s, SSBU_DETERMINISTIC %d (off mask %d); hook on the fighters' frame line: %s\n", g_fh_out ? "on" : "off", g_fh_det, g_fh_detoff, id ? "installed or waiting for lua2cpp_common" : hook_error());
