@@ -101,6 +101,18 @@ def emit(event, **data):
     print(json.dumps(dict(event=event, **data), sort_keys=True), flush=True)
 
 
+def apply_control(control, link, start):
+    try:
+        changed = control.poll(link.profile)
+    except (OSError, ValueError) as exc:
+        emit('control_error', message=str(exc))
+    else:
+        if changed is not None:
+            link.profile = changed
+            # Reading the control file can block or be descheduled. Timestamp the application, not an earlier loop.
+            emit('profile', elapsed_s=round(time.monotonic() - start, 3), profile=asdict(changed))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--listen-port', type=int, default=39521)
@@ -132,14 +144,8 @@ def main(argv=None):
         try:
             while (now := time.monotonic()) < start + args.duration:
                 if control:
-                    try:
-                        changed = control.poll(link.profile)
-                    except (OSError, ValueError) as exc:
-                        emit('control_error', message=str(exc))
-                    else:
-                        if changed is not None:
-                            link.profile = changed
-                            emit('profile', elapsed_s=round(now - start, 3), profile=asdict(changed))
+                    apply_control(control, link, start)
+                now = time.monotonic()                  # due packets/status must also use the post-file-read time
                 link.flush(now, sock.sendto)
                 if now >= next_status:
                     emit('status', elapsed_s=round(now - start, 3), queued=len(link.pending), **link.counts)
