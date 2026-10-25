@@ -19,5 +19,20 @@ sides. Hex case is normalized by value. Existing fixture hashes now use the prod
 Validation: 23 comparison/runner tests pass (the old parser fails seven new assertions). The Windows session suite
 passes with undefined-behavior traps. Its shutdown test holds a checksum record in a buffered stream, checks the
 underlying OS file has zero bytes, invokes the real exit reporter, then verifies the full record reached the OS file
-and the counters were emitted once. This isolates flushing from rewind/close side effects. Full build/audit and
-paired game exit validation follow separately.
+and the counters were emitted once. This isolates flushing from rewind/close side effects. The stricter parser
+rejects the actual partial log and still accepts its independently bounded complete 1..1152-frame extraction.
+
+
+## Paired normal-exit result (2026-10-25)
+
+Full runtime build/package audit at `13e4e25` passes. Its separately named executable ran beside the installed module
+DLLs; the installed executable was not replaced. Two instances on one PC, 39 ms outgoing simulated delay each,
+automatic delay 3, bots 7/11, fixed seed, detailed net logging, explicit fighter files and 1,200 requested presented
+fight frames. This branch is independent of PR6, so its collector still needs the optional fighter file.
+
+Both game processes exited 0 through normal shutdown (85/81 seconds). Each emitted the final netplay report once.
+The stricter comparator accepted both unmodified full logs and found **1,202 identical complete finalized checksums**,
+frame 1..1202 with equal coverage and match IDs. A few simulation frames ran while the normal exit request completed;
+the test does not reinterpret the requested presentation limit as exact simulation-frame coverage. No tail record was
+cropped or repaired. Final reports show positive peer checksum comparisons, zero desyncs and zero final-pad differences.
+This verifies exit-path flushing and reporting; it does not establish internet performance or final R1 timing coverage.
