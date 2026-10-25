@@ -27,44 +27,65 @@ class ComparisonTests(unittest.TestCase):
         self.assertNotEqual(self.compare_logs('m 1 id abcd\n', 'm 1 id abcd\n'), 0)
 
     def test_second_empty_match_fails(self):
-        log = 'm 1 id abcd\nf 1 h 123\nm 2 id def\n'
+        log = 'm 1 id abcd\nf 1 h 0000000000000123\nm 2 id def\n'
         self.assertNotEqual(self.compare_logs(log, log), 0)
 
     def test_equal_logs_pass(self):
-        log = 'm 1 id abcd\nf 1 h 123\nf 2 h 456\n'
+        log = 'm 1 id abcd\nf 1 h 0000000000000123\nf 2 h 0000000000000456\n'
         self.assertEqual(self.compare_logs(log, log, '--min-frames', '2', '--strict'), 0)
 
     def test_hash_mismatch_fails(self):
-        self.assertNotEqual(self.compare_logs('f 1 h 123\n', 'f 1 h 456\n'), 0)
+        self.assertNotEqual(self.compare_logs('f 1 h 0000000000000123\n', 'f 1 h 0000000000000456\n'), 0)
 
     def test_different_match_ids_fail(self):
-        self.assertNotEqual(self.compare_logs('m 1 id a\nf 1 h 1\n', 'm 1 id b\nf 1 h 1\n'), 0)
+        self.assertNotEqual(self.compare_logs('m 1 id a\nf 1 h 0000000000000001\n', 'm 1 id b\nf 1 h 0000000000000001\n'), 0)
 
     def test_insufficient_common_frames_fail(self):
-        self.assertNotEqual(self.compare_logs('f 1 h 1\n', 'f 1 h 1\n', '--min-frames', '2'), 0)
+        self.assertNotEqual(self.compare_logs('f 1 h 0000000000000001\n', 'f 1 h 0000000000000001\n', '--min-frames', '2'), 0)
 
     def test_common_tail_policy_is_explicit(self):
-        a, b = 'f 1 h 1\nf 2 h 2\n', 'f 1 h 1\n'
+        a, b = 'f 1 h 0000000000000001\nf 2 h 0000000000000002\n', 'f 1 h 0000000000000001\n'
         self.assertEqual(self.compare_logs(a, b), 0)
         self.assertNotEqual(self.compare_logs(a, b, '--strict'), 0)
 
     def test_matching_gaps_fail_in_strict_mode(self):
-        log = 'f 1 h 1\nf 3 h 3\n'
+        log = 'f 1 h 0000000000000001\nf 3 h 0000000000000003\n'
         self.assertNotEqual(self.compare_logs(log, log, '--strict'), 0)
 
     def test_conflicting_duplicate_hash_fails(self):
-        self.assertNotEqual(self.compare_logs('f 1 h 2\nf 1 h 1\n', 'f 1 h 1\n'), 0)
+        self.assertNotEqual(self.compare_logs('f 1 h 0000000000000002\nf 1 h 0000000000000001\n', 'f 1 h 0000000000000001\n'), 0)
 
     def test_identical_duplicate_hash_is_harmless(self):
-        self.assertEqual(self.compare_logs('f 1 h 1\nf 1 h 1\n', 'f 1 h 1\n'), 0)
+        self.assertEqual(self.compare_logs('f 1 h 0000000000000001\nf 1 h 0000000000000001\n', 'f 1 h 0000000000000001\n'), 0)
 
     def test_invalid_records_fail(self):
-        for log in ('f 0 h 1\n', 'f 1 h garbage\n', 'f 1 h\n', 'm 1 nope x\n', 'm -1 id x\nf 1 h 1\n'):
+        for log in ('f 0 h 0000000000000001\n', 'f 1 h garbage\n', 'f 1 h\n', 'm 1 nope x\n', 'm -1 id x\nf 1 h 0000000000000001\n'):
             with self.subTest(log=log):
                 self.assertNotEqual(self.compare_logs(log, log), 0)
 
     def test_debug_lines_are_ignored(self):
-        self.assertEqual(self.compare_logs('d 1 diagnostic\nf 1 h 1\n', 'f 1 h 1\n'), 0)
+        self.assertEqual(self.compare_logs('d 1 diagnostic\nf 1 h 0000000000000001\n', 'f 1 h 0000000000000001\n'), 0)
+
+
+    def test_truncated_hashes_fail_even_when_both_files_match(self):
+        for value in ('1', '5b41384a6b693e', '123456789abcdef'):
+            with self.subTest(value=value):
+                log = 'f 1 h ' + value + '\n'
+                self.assertNotEqual(self.compare_logs(log, log, '--strict'), 0)
+
+    def test_unterminated_records_fail(self):
+        for log in ('f 1 h 0123456789abcdef', 'm 1 id abcd\nf 1 h 0123456789abcdef\nm 2 id def'):
+            with self.subTest(log=log):
+                self.assertNotEqual(self.compare_logs(log, log), 0)
+
+    def test_hash_prefix_and_sign_are_not_wire_log_format(self):
+        for value in ('0x0123456789abcdef', '+0123456789abcdef', '-000000000000001'):
+            with self.subTest(value=value):
+                log = 'f 1 h ' + value + '\n'
+                self.assertNotEqual(self.compare_logs(log, log), 0)
+
+    def test_hash_case_does_not_change_its_value(self):
+        self.assertEqual(self.compare_logs('f 1 h 0123456789abcdef\n', 'f 1 h 0123456789ABCDEF\n'), 0)
 
 
 class PairRunnerTests(unittest.TestCase):

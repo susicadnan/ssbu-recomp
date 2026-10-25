@@ -26,6 +26,7 @@ static void receive_test_lock(PSRWLOCK lock) {
     }
     AcquireSRWLockExclusive(lock);
 }
+#include <io.h>
 
 int g_game_build;
 static int sent_pads, last_sent_newest, last_sent_count, last_sent_check_frame;
@@ -416,6 +417,29 @@ static void compare(const char *name, int latency, int jitter, int loss, int wor
     printf("TIMING_MODEL %-14s | rollbacks %d -> %d | replayed %d -> %d | predicted %d -> %d | state identical\n",
            name, old.rollbacks, next.rollbacks, old.replayed, next.replayed, old.predicted, next.predicted);
 }
+static void exit_report_tests(void) {
+    FILE *out = tmpfile(), *saved = g_hlog;
+    CHECK(out != NULL, "shutdown report output created");
+    if (!out) return;
+    g_on = 0; rbn_exit_report(out);
+    CHECK(ftell(out) == 0, "disabled rollback has no shutdown report");
+    g_on = 1; reset_session(1);
+    g_hlog = tmpfile();
+    CHECK(g_hlog != NULL, "checksum test stream created");
+    if (!g_hlog) { g_hlog = saved; fclose(out); return; }
+    char buffer[4096]; setvbuf(g_hlog, buffer, _IOFBF, sizeof buffer);
+    const char *record = "f 1 h 0123456789abcdef\n";
+    fputs(record, g_hlog);
+    HANDLE handle = (HANDLE)_get_osfhandle(_fileno(g_hlog)); LARGE_INTEGER size;
+    CHECK(GetFileSizeEx(handle, &size) && size.QuadPart == 0, "checksum starts buffered, not written to the OS file");
+    rbn_exit_report(out);
+    CHECK(GetFileSizeEx(handle, &size) && size.QuadPart == (LONGLONG)strlen(record),
+          "shutdown flushes complete checksum bytes before ExitProcess");
+    long n = ftell(out); CHECK(n > 0, "active session writes its final counters");
+    rbn_exit_report(out); CHECK(ftell(out) == n, "repeated shutdown entry does not duplicate the report");
+    fclose(g_hlog); g_hlog = saved; fclose(out);
+    printf("EXIT_REPORT buffered checksum bytes flushed; final counters emitted once\n");
+}
 int main(void) {
     _putenv("SSBU_RB_NET=net"); _putenv("SSBU_RB_NET_HANDSHAKE=0"); _putenv("SSBU_RB_NET_PREDRAIN=");
     _putenv("SSBU_RB_NET_DELAY=2"); _putenv("SSBU_RB_NET_BOT="); _putenv("SSBU_RB_NET_LOG=");
@@ -443,6 +467,7 @@ int main(void) {
     compare("jitter-loss", 27000, 9000, 15, 6500, 1);
     compare("late-loss", 47000, 12000, 15, 6500, 0);
     compare("no-wait", 27000, 9000, 15, PERIOD_US, 0);
+    exit_report_tests();
     printf("rbn_receive_test: %s\n", fails ? "FAILED" : "all passed");
     free(g_rq);
     return fails ? 1 : 0;
