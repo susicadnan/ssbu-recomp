@@ -66,6 +66,10 @@ int rbn_on(void) {
     if (!g_loop && net_online() && net_mode() == 3) g_local = 1;      /* NET_MODE_JOIN */
     if ((e = getenv("SSBU_RB_NET_PLAYER"))) g_local = atoi(e) ? 1 : 0;
     if ((e = getenv("SSBU_RB_NET_DELAY"))) g_delay_cfg = atoi(e);
+    else if (net_online() > 0) {                        /* (net4) graphics.ini rollback_delay = <frames> | auto (default) */
+        int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
+        if (net_ini_value("rollback_delay", v, sizeof v) && v[0] >= '0' && v[0] <= '9') { g_delay_cfg = atoi(v); if (g_delay_cfg > 12) g_delay_cfg = 12; }
+    }
     if ((e = getenv("SSBU_RB_NET_BOT")) && *e) { g_bot = 1; g_bot_seed = (unsigned)strtoul(e, NULL, 0); }
     if ((e = getenv("SSBU_RB_NET_AHEAD")) && atoi(e) > 0) g_ahead = atoi(e);
     if ((e = getenv("SSBU_RB_NET_LOG")) && *e) g_hlog = fopen(e, "w");
@@ -650,8 +654,14 @@ static int auto_delay(void) {
     int rtt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
     if (rtt <= 0) return 2;
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
-    int d = (int)(one_way - 2.0 + 0.5);                   /* up to 2 frames of lateness covered by rollback */
-    return d < 1 ? 1 : d > 4 ? 4 : d;
+    /* (net4) delay = the one-way trip less one frame, rounded up: the other player's pad of a frame comes at most about 2
+     * frames late, so a rollback runs 1 or 2 frames again. A re-run frame costs about 5 ms here (testers 2026-10-25: load
+     * 5.5 ms + 4.9 ms per frame), so a 2-frame rollback still fits in one 16.7 ms frame and a 3-frame one does not; the old
+     * rule (one-way less 2, rounded) left 3-frame rollbacks on most changes of the other player's pad: a hitch each time.
+     * 78 ms round trip: 2 frames (was 1); 150 ms: 4 (was 3); 200 ms and more: 5 (was 4). graphics.ini rollback_delay = <n>
+     * (or SSBU_RB_NET_DELAY) fixes it instead. */
+    int d = (int)ceil(one_way - 1.0);
+    return d < 1 ? 1 : d > 5 ? 5 : d;
 }
 void rbn_start(long long f0) {
     g_f0 = f0; g_started = 1; g_match_n++;
