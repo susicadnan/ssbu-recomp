@@ -34,6 +34,22 @@ class Profile:
         return Profile(**(asdict(self) | values))
 
 
+def blackout_duration(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 5000:
+        raise ValueError('blackout_ms must be finite and between 0 and 5000')
+    return value
+
+
+@dataclass(frozen=True)
+class ControlUpdate:
+    profile: Profile
+    blackout_ms: float | None = None
+
+    def __post_init__(self):
+        if self.blackout_ms is not None:
+            blackout_duration(self.blackout_ms)
+
+
 class Link:
     def __init__(self, upstream, profile, seed=1, queue_limit=4096):
         self.upstream, self.profile = upstream, profile
@@ -42,7 +58,13 @@ class Link:
         self.pending = []
         self.serial = 0
         self.queue_limit = queue_limit
-        self.counts = dict(received=0, sent=0, lost=0, queue_full=0, send_errors=0, receive_errors=0, unexpected_peer=0, peak_queued=0)
+        self.blackout_from = self.blackout_until = 0.0
+        self.counts = dict(received=0, sent=0, lost=0, blackout_lost=0, queue_full=0, send_errors=0, receive_errors=0, unexpected_peer=0, peak_queued=0)
+
+    def blackout(self, duration_ms, now):
+        duration_ms = blackout_duration(duration_ms)
+        self.blackout_from, self.blackout_until = now, now + duration_ms / 1000
+        return self.blackout_until
 
     def receive(self, payload, source, now):
         if source == self.upstream:
@@ -58,8 +80,10 @@ class Link:
                 return
             target = self.upstream
         self.counts['received'] += 1
-        if self.rng.random() * 100 < self.profile.loss_percent:
+        blocked = self.blackout_from <= now < self.blackout_until
+        if self.rng.random() * 100 < self.profile.loss_percent or blocked:
             self.counts['lost'] += 1
+            self.counts['blackout_lost'] += int(blocked)
             return
         if len(self.pending) >= self.queue_limit:
             self.counts['queue_full'] += 1
@@ -94,7 +118,11 @@ class Control:
         if signature == self.signature:
             return None
         self.signature = signature
-        return current.updated(json.loads(self.path.read_text(encoding='utf-8-sig')))
+        values = json.loads(self.path.read_text(encoding='utf-8-sig'))
+        if not isinstance(values, dict):
+            raise ValueError('control must be an object')
+        duration = blackout_duration(values.pop('blackout_ms')) if 'blackout_ms' in values else None
+        return ControlUpdate(current.updated(values), duration)
 
 
 def emit(event, **data):
@@ -108,9 +136,14 @@ def apply_control(control, link, start):
         emit('control_error', message=str(exc))
     else:
         if changed is not None:
-            link.profile = changed
+            link.profile = changed.profile
             # Reading the control file can block or be descheduled. Timestamp the application, not an earlier loop.
-            emit('profile', elapsed_s=round(time.monotonic() - start, 3), profile=asdict(changed))
+            at = time.monotonic()
+            until = link.blackout(changed.blackout_ms, at) if changed.blackout_ms is not None else None
+            emit('profile', elapsed_s=round(at - start, 6), profile=asdict(link.profile))
+            if changed.blackout_ms is not None:
+                emit('blackout', elapsed_s=round(at - start, 6), duration_ms=changed.blackout_ms,
+                     until_s=round(until - start, 6))
 
 
 def main(argv=None):

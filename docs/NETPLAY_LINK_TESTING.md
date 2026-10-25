@@ -58,7 +58,7 @@ logged. Windows ICMP errors while the lobby starts are counted without stopping 
 python tools/net/test_netplay_proxy.py
 ```
 
-Thirteen tests cover bidirectional byte preservation, delay and jitter bounds, seeded loss, full outages, bounded queues,
+Eighteen tests cover bidirectional byte preservation, delay and jitter bounds, seeded loss, full outages, bounded queues,
 packet ordering, live profile changes, peer ownership, socket errors and JSON updates. A real loopback subprocess test
 starts with 100% loss, changes the control file to 0%, and verifies an intact datagram round trip before bounded exit.
 This verifies the test helper; live paired-game use is recorded below.
@@ -112,6 +112,33 @@ its periodic reports; the table uses explicit frame-1800 cumulative counters.
 
 The helper now timestamps a profile immediately after applying the file update and refreshes its clock before
 flushing due packets. A deterministic test models 75 ms spent in the control read and verifies the event includes
-that delay; another preserves the active profile after an invalid update. All **13** helper tests pass, including the
-real UDP subprocess round trip. The game runs above predate this timestamp fix; tighter multi-seed recovery comparisons
+that delay; another preserves the active profile after an invalid update. Those **13** helper tests passed, including the
+real UDP subprocess round trip. The timed-outage coverage below expands the suite. The game runs above predate this timestamp fix; tighter multi-seed recovery comparisons
 with accurate application times remain needed.
+
+## Timer-controlled blackout commands
+
+For repeatable short dropouts, atomically replace the control file with:
+
+```json
+{"blackout_ms":350}
+```
+
+This arms one blackout from the time the proxy applies the command through an exclusive deadline 350 ms later.
+Every new datagram is checked against that interval using its proxy receive timestamp. The regular profile remains
+unchanged, and forwarding resumes automatically at the deadline; no second file read or control update is needed.
+A changed file arms a new interval, even with the same duration. An unchanged file does not rearm it. A new command
+replaces an active interval, and `{"blackout_ms":0}` cancels it. Finite numeric durations from 0 through 5,000 ms are
+accepted; null, booleans, strings and out-of-range values are rejected without changing the active state.
+
+Latency/jitter/loss profile fields can accompany the command. Previously queued datagrams retain their scheduled
+arrival times, as with ordinary loss updates. The blackout affects new arrivals, not packets already in flight.
+The JSON `blackout` event records application time, duration and the exclusive deadline; periodic counters include
+`blackout_lost`, a subset of total configured drops. Local CPU scheduling and packet order still vary between runs,
+but they cannot stretch the deadline by delaying a separate restoration file update.
+
+All **18** helper tests pass. New tests cover both directions and exact start/end boundaries, automatic recovery
+without any later control read, in-flight packets, cancellation, command validation and one-shot file behavior.
+A second real UDP subprocess test verifies a packet is dropped during a timed blackout and the same client can
+complete an intact round trip afterward without another file update. Multi-seed game comparisons using this command
+are the next validation step; earlier manual-restoration game results above are not reinterpreted as timed tests.
