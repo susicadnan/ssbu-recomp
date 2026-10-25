@@ -12,7 +12,13 @@ static void receive_test_lock(PSRWLOCK lock);
 /* Deterministically pause the receiver immediately before it acquires the queue lock. The callback completes a
  * match transition on the main side; no sleeps or production test hook are needed to exercise that interleaving. */
 static void (*before_receive_lock)(void);
+static DWORD paused_receiver_tid;
+static HANDLE receiver_at_lock, receiver_continue;
 static void receive_test_lock(PSRWLOCK lock) {
+    if (lock == &g_rq_lock && GetCurrentThreadId() == paused_receiver_tid) {
+        SetEvent(receiver_at_lock);
+        if (WaitForSingleObject(receiver_continue, 10000) != WAIT_OBJECT_0) abort();
+    }
     if (lock == &g_rq_lock && before_receive_lock) {
         void (*transition)(void) = before_receive_lock;
         before_receive_lock = NULL;
@@ -104,6 +110,37 @@ static void session_boundary_tests(void) {
     receive_one(1, 8); rbn_drain(0);
     CHECK(rbn_pad(1, 1).buttons == 8, "current input remains usable after an idle transition");
     printf("SESSION_BOUNDARY reset/start and reset/idle inserted before enqueue lock\n");
+}
+
+static DWORD WINAPI paused_receive(void *unused) {
+    (void)unused;
+    paused_receiver_tid = GetCurrentThreadId();
+    receive_one(1, 99);
+    return 0;
+}
+static void threaded_boundary_tests(void) {
+    for (int i = 0; i < 16; i++) {
+        reset_session(1);
+        long long old = g_rx_oldmatch;
+        receiver_at_lock = CreateEventA(NULL, TRUE, FALSE, NULL);
+        receiver_continue = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!receiver_at_lock || !receiver_continue) abort();
+        HANDLE thread = CreateThread(NULL, 0, paused_receive, NULL, 0, NULL);
+        if (!thread || WaitForSingleObject(receiver_at_lock, 10000) != WAIT_OBJECT_0) abort();
+        if (i & 1) transition_to_menus(); else transition_to_next_match();
+        SetEvent(receiver_continue);
+        if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) abort();
+        paused_receiver_tid = 0;
+        CloseHandle(thread); CloseHandle(receiver_at_lock); CloseHandle(receiver_continue);
+        receiver_at_lock = receiver_continue = NULL;
+        if (i & 1) rbn_start(0);
+        rbn_drain(0);
+        CHECK(g_rx_oldmatch == old + 1 && !g_peer_started && g_peer_mode == -1 && rbn_confirmed() == 0,
+              "a real receive thread cannot publish old input or mode after a main-thread transition");
+        receive_one(1, 7); rbn_drain(0);
+        CHECK(rbn_pad(1, 1).buttons == 7, "current input remains intact after joining the paused receiver");
+    }
+    printf("THREADED_SESSION_BOUNDARY 16 event-controlled receive/main-thread transitions\n");
 }
 
 static void boundary_tests(void) {
@@ -272,6 +309,7 @@ int main(void) {
     g_on = -1; _putenv("SSBU_RB_NET_RESEND_MS=0"); CHECK(rbn_on() && g_resend_ms == 50, "invalid retry interval cannot cause busy resending");
     boundary_tests();
     session_boundary_tests();
+    threaded_boundary_tests();
     resend_tests();
     compare("low-latency", 9000, 0, 0, 6500, 0);
     compare("during-wait", 27000, 0, 0, 6500, 1);

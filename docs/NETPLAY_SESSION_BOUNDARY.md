@@ -25,3 +25,22 @@ percentiles. Paired game rematch validation of this specific change is pending. 
 
 Build validation: `scripts/make_release.py` completed the full runtime build and package audit at `1816d01` (9 audited
 files, no game content or machine-specific content). The installed executable was not replaced.
+
+The fixture additionally uses two real Windows threads and events to suspend the receiver at that boundary while
+the main thread resets the session, alternating immediate restart and an idle interval across 16 transitions. All
+pass on the fix; the old runtime fails 39 assertions in total (7 single-thread interleaving checks plus 32 checks in
+the two-thread cases). The event waits are bounded, and no production timing hook was added.
+
+## Paired rematch validation (2026-10-25)
+
+Built runtime `1816d01` was tested as a separately named executable beside the installed module DLLs. Two instances
+on one PC, bots 7/11, a fixed handshake seed, 39 ms outgoing simulated delay each, one stock and walkoff after frame
+1000. This independent branch uses explicit fighter files to produce network checksums; PR6 removes that dependency
+separately. No private race fixture was injected into the game build.
+
+Both peers completed two natural matches. Strict comparison at a 400-frame minimum found **485 matching finalized
+checksums in match 1 and 1,093 in match 2**, identical coverage and match IDs. Both second-match reports showed zero
+desyncs and zero final-pad differences. The driver stopped each test process after the real match-2 reset message
+and flushed reports (118/116 seconds); this was a controlled harness stop, not a clean-shutdown test. The quiet slot
+was released after verifying no game process remained. This complements the controlled race regression; ordinary
+rematches do not prove the rare interleaving occurred in-game.
