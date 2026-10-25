@@ -18,6 +18,7 @@ int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_sta
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
 void rbn_drain(long long cur); int rbn_take_mismatch(void); long long rbn_confirmed(void); int rbn_peer_gone(void);
 void rbn_before_frame(long long cur);
+long long rbn_snapshot_floor(int correcting);
 void rbn_pass_hash(long long f); void rbn_finalize(long long cur); double rbn_pace_extra(long long f); void rbn_report(FILE *o, long long frames);
 int rbn_delay(void); int rbn_rtt_ms(void); double rbn_offset_ms(void); void rbn_resend(double now_ms); void rbn_status(char *out, size_t n); void rbn_hello(void); int rbn_peer_started(void); void rbn_choose_delay(void);
 
@@ -72,8 +73,8 @@ static long long g_rbg_test_f = -2; static int g_rbg_test_ms, g_rbg_test_k;    /
 static int g_rbg_recap = -1, g_rbg_keep = -1, g_rbg_cur_k; static long long g_rbg_recap_first;
 static double g_rbg_t_pre, g_rbg_t_load, g_rbg_t_rerun, g_rbg_t_recap, g_rbg_t_pass0; static long long g_rbg_n_rerun, g_rbg_n_recap;
 
-/* (hs14) every capture of the match tells the ring the oldest frame a rollback may still need (r1_ring.c g_rg_need): the
- * newest frame with both players' pads known (a wrong guess can only be at a later frame, and loads the state before it) */
+/* Every capture tells the ring the oldest state a rollback may still need. Received inputs can confirm a frame whose
+ * correction has not run yet, so queued mismatches and corrections taken for a load must also constrain that floor. */
 static long long g_rbg_short_waits, g_rbg_mid_dropped;      /* (net4) wrong guesses answered by the rollback running (pads taken between its re-run passes) */
 /* (R3 pub1) a load refused at a wrong guess at frame g_rbg_pend (r1_ring_load -1): the state before it must stay in the ring
  * until the rollback is made next tick; g_rbg_refused_tick: no second try in the same tick (each try may hold for 500 ms) */
@@ -91,7 +92,12 @@ static int rbg_capture_needed(long long i) {
     if (!on || g_rbg_pend > 0 || rbn_loop()) return 1;
     return rbn_confirmed() < i + 1;
 }
-static int rbg_capture(long long i, Ctx *c) { g_rg_need = rbn_confirmed(); if (g_rbg_pend > 0 && g_rbg_pend - 1 < g_rg_need) g_rg_need = g_rbg_pend - 1; return r1_ring_capture(i, c); }
+static int rbg_capture_for(long long i, Ctx *c, int correcting) {
+    g_rg_need = rbn_snapshot_floor(correcting);
+    if (g_rbg_pend > 0 && g_rbg_pend - 1 < g_rg_need) g_rg_need = g_rbg_pend - 1;
+    return r1_ring_capture(i, c);
+}
+static int rbg_capture(long long i, Ctx *c) { return rbg_capture_for(i, c, 0); }
 void rbn_stats(int *delay, int *last, int *maxk) { *delay = rbn_delay(); *last = (int)g_rbg_last_k; *maxk = (int)g_rbg_max_k; }   /* net_relay.c net_stats_get (F2) */
 
 static void rbg_wait_until(double t) {                  /* a high-resolution timer for the long part, a spin for the last 0.3 ms */
@@ -247,7 +253,7 @@ static void rbg_step_body(Ctx *c) {
             /* captured anyway, with the threads kept held for the load that follows (R2 round 2: load hold 3.5 -> 0.2 ms);
              * SSBU_RB_NET_KEEP=0: no capture, the load holds the threads itself */
             double tp = now_ms();
-            if (g_rbg_keep == 1) { g_rg_keep = 1; if (!rbg_capture(i, c)) g_rbg_capfail++; g_rg_keep = 0; }
+            if (g_rbg_keep == 1) { g_rg_keep = 1; if (!rbg_capture_for(i, c, m)) g_rbg_capfail++; g_rg_keep = 0; }
             else if (g_rbg_keep == 2) r1_ring_hold();
             g_rbg_t_pre += now_ms() - tp;
             if (rbg_rollback(c, i, m)) return;

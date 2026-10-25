@@ -880,6 +880,13 @@ void rbn_before_frame(long long cur) {
 int rbn_take_mismatch(void) { int m = rb_input_take_mismatch(); if (m) g_stat_mis++; return m; }
 void rbn_put_mismatch(int m) { rb_input_put_mismatch(m); if (m) g_stat_mis--; }      /* (R3 pub1) r1_ring_load refused: the wrong guess stays pending */
 long long rbn_confirmed(void) { return rb_input_remote_latest(g_remote); }
+long long rbn_snapshot_floor(int correcting) {
+    long long floor = rbn_confirmed();
+    int pending = rb_input_pending_mismatch();
+    if (pending > 0 && pending - 1 < floor) floor = pending - 1;
+    if (correcting > 0 && correcting - 1 < floor) floor = correcting - 1;
+    return floor;
+}
 int rbn_peer_gone(void) {
     if (g_loop || !g_started) return 0;
     LONG64 last = g_rx_last_ms;
