@@ -1395,6 +1395,14 @@ static void draw_stats(void) {
             ImVec4 c = ns.loss_pct >= 5 || ns.jitter_ms >= 15 ? ImVec4(1, 0.5f, 0.3f, 1) : ImVec4(0.6f, 0.9f, 0.6f, 1);
             ImGui::TextColored(c, "jitter %d ms  loss %d %%  %s", ns.jitter_ms, ns.loss_pct < 0 ? 0 : ns.loss_pct, v);
         }
+        {   /* (net4) connection bars, as a Wi-Fi icon: 4 = good link, 1 = bad */
+            int bars = ns.ping_ms < 0 ? 0 : (ns.loss_pct >= 5 || ns.jitter_ms >= 20 || ns.path == NET_PATH_RELAYED) ? 1 : (ns.jitter_ms >= 10 || ns.ping_ms >= 150) ? 2 : (ns.jitter_ms >= 6 || ns.ping_ms >= 90) ? 3 : 4;
+            ImVec2 p = ImGui::GetCursorScreenPos(); ImDrawList *dl = ImGui::GetWindowDrawList(); float h = ImGui::GetTextLineHeight();
+            ImU32 on = bars >= 3 ? IM_COL32(110, 230, 110, 255) : bars == 2 ? IM_COL32(250, 200, 60, 255) : IM_COL32(250, 90, 70, 255), off = IM_COL32(120, 120, 120, 120);
+            for (int i = 0; i < 4; i++) { float bh = h * (0.35f + 0.22f * i); dl->AddRectFilled(ImVec2(p.x + i * (h * 0.45f), p.y + h - bh), ImVec2(p.x + i * (h * 0.45f) + h * 0.35f, p.y + h), i < bars ? on : off, 1.0f); }
+            ImGui::Dummy(ImVec2(h * 1.9f, h)); ImGui::SameLine();
+            ImGui::Text("%s", bars == 4 ? "excellent" : bars == 3 ? "good" : bars == 2 ? "fair" : bars == 1 ? "poor" : "connecting");
+        }
     }
     ImGui::Text("run-ahead %s", !ra_cfg ? "off" : r1_ra_phase() ? "on (running)" : "on");
     ImGui::End();

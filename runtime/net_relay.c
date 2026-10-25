@@ -479,6 +479,16 @@ static volatile LONG64 g_rb_rx_other;                  /* (R3 net3) rollback mes
 static volatile LONG g_rb_nodst; static volatile uint32_t g_rb_dst_said;
 static volatile uint32_t g_rb_direct_from;            /* (net4) the player whose rollback messages came straight from it (T_RB_DIRECT) */
 int net_rb_no_destination(void) { return g_rb_nodst; }
+/* (net4) the match report: how the rollback messages went (1 direct, 2 through the lobby, 0 none), and the other player's name */
+int net_rb_path(void) { return g_rb_out_direct > g_rb_out_relay ? 1 : g_rb_out_relay ? 2 : 0; }
+const char *net_peer_name(void) {
+    static char n[NAME_LEN + 1];
+    uint32_t other = nnldn_other_ip(); n[0] = 0;
+    AcquireSRWLockShared(&g_peers_lock);
+    for (int i = 0; i < g_npeers; i++) if (!other || g_peers[i].ip == other) { snprintf(n, sizeof n, "%s", g_peers[i].name); break; }
+    ReleaseSRWLockShared(&g_peers_lock);
+    return n[0] ? n : "?";
+}
 int net_rb_send(const void *p, int n) {
     if (!net_rb_ready() || n <= 0 || n > 1400) return 0;
     uint32_t dst = nnldn_other_ip(), room = dst;

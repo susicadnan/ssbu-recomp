@@ -14,6 +14,7 @@
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "rb.h"
+#include <time.h>                                       /* (net4) the match report's date */
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
 void rbn_drain(long long cur); int rbn_take_mismatch(void); long long rbn_confirmed(void); int rbn_peer_gone(void);
@@ -465,6 +466,44 @@ static void rbg_dist(const char *what, const float *v, int n, const unsigned cha
         LOG("r1: RB NET TIMING %s: %d, mean %.2f median %.2f p90 %.2f p99 %.2f max %.2f ms; over 16.67 ms: %.0f (%.2f%%)\n", what, m, s / m, w[m / 2], w[m * 9 / 10], w[m * 99 / 100], w[m - 1], over, 100.0 * over / m); }
     free(w);
 }
+/* (net4, 2026-10-25) THE MATCH REPORT: one small file per online match, build\logs\matches\match_<date>.txt (the exe runs in
+ * build\work), with the numbers that say how the match went: the link (round trip, jitter, loss, direct or relayed), the
+ * delay, the rollbacks, the frame times, desyncs. A popup names it. Players paste that file instead of the whole log. */
+void rbn_match_numbers(double *rtt_mean_ms, double *rtt_best_ms, long long *desyncs, long long *repeats, long long *rx, long long *tx);
+void rbn_link(int *jitter_ms, int *loss_pct); int net_rb_path(void); const char *net_peer_name(void); void menu_popup(const char *title, const char *text);
+static void rbg_match_report(void) {
+    if (!g_rbg_real || rbn_loop()) return;
+    double rtt_mean, rtt_best; long long desyncs, repeats, rx, tx; int jitter, loss;
+    rbn_match_numbers(&rtt_mean, &rtt_best, &desyncs, &repeats, &rx, &tx); rbn_link(&jitter, &loss);
+    float *w = malloc((size_t)(g_rbg_ng ? g_rbg_ng : 1) * sizeof *w); double p99 = 0, p90 = 0, mean = 0, over = 0;
+    if (w && g_rbg_ng) { memcpy(w, g_rbg_gap, (size_t)g_rbg_ng * sizeof *w); qsort(w, (size_t)g_rbg_ng, sizeof *w, cmp_f); for (int i = 0; i < g_rbg_ng; i++) { mean += w[i]; over += w[i] > 20.0; } mean /= g_rbg_ng; p90 = w[g_rbg_ng * 9 / 10]; p99 = w[g_rbg_ng * 99 / 100]; }
+    free(w);
+    int path = net_rb_path();
+    char when[32]; time_t t = time(NULL); struct tm tmv; localtime_s(&tmv, &t); strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tmv);
+    char fname[64]; strftime(fname, sizeof fname, "match_%Y%m%d_%H%M%S.txt", &tmv);
+    CreateDirectoryA("../logs", NULL); CreateDirectoryA("../logs/matches", NULL);
+    char path_s[128]; snprintf(path_s, sizeof path_s, "../logs/matches/%s", fname);
+    FILE *f = fopen(path_s, "w");
+    const char *verdict = desyncs ? "DESYNC: the two games disagreed; both players need the same exe and mods" :
+                          path == 2 ? "relayed through the lobby server: a direct connection would cut the ping (Relay only? firewall?)" :
+                          loss >= 5 ? "packet loss: wired connection, no downloads or streams during the match" :
+                          jitter >= 15 ? "jittery link (Wi-Fi?): a wired connection would make it steadier" :
+                          p99 > 25 ? "mostly smooth; a few late frames (rollbacks or the PC)" : "smooth";
+    if (f) {
+        fprintf(f, "OpenSmash match report  %s  (player %d of 2, other player: %s)\n\n", when, rbn_local_player() + 1, net_peer_name());
+        fprintf(f, "Link      round trip %.0f ms (best %.0f), jitter %d ms, loss %d %%, %s\n", rtt_mean, rtt_best, jitter < 0 ? 0 : jitter, loss < 0 ? 0 : loss, path == 1 ? "DIRECT between the two PCs" : path == 2 ? "RELAYED through the lobby server" : "path unknown");
+        fprintf(f, "Delay     %d frames of input delay (%.0f ms)\n", rbn_delay(), rbn_delay() * 1000.0 / 60.0);
+        fprintf(f, "Rollbacks %lld in %lld frames (%.1f per minute), longest %d frames; waits for the other player %lld (%.0f ms in all)\n", g_rbg_rb, g_rbg_real, g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0, (int)g_rbg_max_k, g_rbg_stalls, g_rbg_stall_ms);
+        fprintf(f, "Frames    mean %.2f ms, p90 %.2f, p99 %.2f (16.67 = perfect); frames later than 20 ms: %.0f of %d\n", mean, p90, p99, over, g_rbg_ng);
+        fprintf(f, "Packets   sent %lld, received %lld, repeats %lld; desyncs %lld\n", tx, rx, repeats, desyncs);
+        fprintf(f, "Verdict   %s\n", verdict);
+        fprintf(f, "\n(exe build: see the first lines of the game log; one file per match in this folder; paste it to report a match)\n");
+        fclose(f);
+        LOG("r1: RB NET: match report written: %s\n", path_s);
+        char text[300]; snprintf(text, sizeof text, "Saved to build\\logs\\matches\\%s\nPing %.0f ms, jitter %d, loss %d %%, %s; delay %d frames; %lld rollbacks; %s", fname, rtt_mean, jitter < 0 ? 0 : jitter, loss < 0 ? 0 : loss, path == 1 ? "direct" : path == 2 ? "RELAYED" : "?", rbn_delay(), g_rbg_rb, verdict);
+        menu_popup("Match report", text);
+    }
+}
 static void rbg_report(void) {
     if (g_rbg <= 0 || (!g_rg_ready && !g_rbg_noring) || !g_rbg_real) return;
     if (g_rbg_noring) LOG("r1: RB NET report: this match ran WITHOUT rollback (not enough memory for the ring: %s); matches without the ring so far %lld\n", g_rg_nomem == 2 ? "broken for the session" : "base not made", g_rbg_noring_matches);
@@ -492,4 +531,5 @@ static void rbg_report(void) {
     rbg_dist("main-thread CPU per tick with rollback (million cycles, shown as ms)", g_rbg_wcyc, g_rbg_nw, g_rbg_wk, 1);
     rbg_dist("main-thread CPU per tick without rollback (million cycles, shown as ms)", g_rbg_wcyc, g_rbg_nw, g_rbg_wk, 0);
     rbn_report(g_log, g_rbg_real);
+    rbg_match_report();                                 /* (net4) */
 }

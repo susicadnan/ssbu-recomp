@@ -1019,6 +1019,11 @@ void rbn_match_reset(void) {
     fflush(stdout);
 }
 int rbn_match_number(void) { return g_match_n; }
+/* (net4) the match report (rb_rollback.c rbg_match_report): the numbers of this file */
+void rbn_match_numbers(double *rtt_mean_ms, double *rtt_best_ms, long long *desyncs, long long *repeats, long long *rx, long long *tx) {
+    AcquireSRWLockExclusive(&g_rq_lock); *rtt_mean_ms = g_rtt_n ? g_rtt_sum / g_rtt_n / 1000.0 : -1; ReleaseSRWLockExclusive(&g_rq_lock);
+    *rtt_best_ms = g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1; *desyncs = g_desync; *repeats = g_rep_sent; *rx = g_rx_pkts; *tx = g_tx_pkts;
+}
 void rbn_report(FILE *o, long long frames) {
     if (g_on <= 0) return;
     if (g_hlog) fflush(g_hlog);
