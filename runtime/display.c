@@ -763,6 +763,9 @@ int latency_mode(void) {
         printf("display: latency = %s%s (margin %.1f ms)%c", g_lat_mode == 2 ? "lowest" : g_lat_mode == 1 ? "low" : "normal",
                g_lat_mode ? ": the game is released late in the frame so that it reads the pad just in time for the next tick" : "", g_lat_margin, 10);
     }
+    /* (net4) an online rollback match runs as "normal": low / lowest release the game late in the frame, on purpose just in
+     * time for the tick, which takes away the spare time a rollback hides in (every rollback then shows as a late frame) */
+    { int rbn_started(void); if (g_lat_mode && rbn_started()) return 0; }
     return g_lat_mode;
 }
 typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks; int polls, press; } L1Frame;
