@@ -68,3 +68,19 @@ The installed test setup lacks `fighters/sdk_generated/lua_const.h`. Its fighter
 in both builds, including the original tracked path. The regression proves collection continues for uncached objects;
 successful uncached entry-ID lookup and natural long-session coverage still need validation with that optional header.
 No full-run performance improvement or Slippi comparison is inferred from these runs.
+
+## Natural rematch result (2026-10-25)
+
+A normal production-source `f6cd4e9` executable completed two online matches in one process session on each peer,
+with no forced-table fixture and no fighter debug files. Same-PC pair, fixed handshake seed, bots 7/11, 39 ms outgoing
+delay each, one stock and walkoff after frame 1000. Strict comparison at a 400-frame minimum found **485 matching
+finalized frames in match 1 and 1,093 in match 2**, with equal per-match coverage and IDs. The first fight ended early;
+the attempted 1,000-frame minimum did not pass for that match. Both second-match reports showed zero desyncs and zero
+final-pad differences. The second match's complete 1,092 tick intervals had p99 17.04/16.71 ms on host/joiner. This is
+one observed run, not an off/on cost measurement or an internet benchmark.
+
+The harness's stop expression initially targeted a message in the separate R1 file while its driver watched stdout.
+The games were stopped after the completed match-2 reports/at the 300-second harness limit; this run therefore does
+not establish clean shutdown. The checksum logs were flushed by the match-end reports. This verifies a natural
+rematch with collection continuing; it does not naturally exhaust all eight debug slots or validate entry-ID lookup
+with the missing generated header.
