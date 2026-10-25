@@ -36,6 +36,12 @@
  *   over) -> ls_fight_off(); r1_on_commit / r1_on_decommit / r1_wrote -> ls_range; ra_init: g_mark = mark_bind() || ls_bind();
  *   r1_init -> ls_init(); collect() -> ls_pool_meta; rgs_report -> ls_report(). */
 static int g_ls_on = -1, g_ls_active, g_ls_cmp, g_ls_off_done;
+/* (R5 fast1) THE CHURN GUARD of the decay (SSBU_LS_DECAY, default 8): a page that left the set and came back (its first
+ * write faulted again) within 3 n captures is written too often to be worth a fault each time (a fault costs some 5-10 us
+ * of the game's frame, its place in the set about a microsecond of every capture): it is PINNED and never decays again in
+ * this match. A page that comes back later stays decayable: a rare writer is better out of the set. Per ring page:
+ * 0 = never decayed, 1..128 = decayed at capture (value - 1) mod 128, 255 = pinned. */
+static volatile uint8_t *g_ls_pin; static long long g_ls_pinned, g_ls_returned;
 static volatile uint8_t *g_ls_st;                       /* per ring page id (windows 1 + 2): 0 untracked, 1 read-only, 2 learned, 3 opening */
 static size_t g_ls_n1, g_ls_np;
 static uint32_t *g_ls_list; static volatile LONG g_ls_n; static LONG g_ls_cap = 1 << 21; static volatile LONG g_ls_over;
@@ -104,6 +110,10 @@ static int ls_open(size_t id, EXCEPTION_POINTERS *e) {   /* the page writable fo
         if (__sync_bool_compare_and_swap(&g_ls_st[id], (uint8_t)1, (uint8_t)3)) {
             DWORD old; int ok = VirtualProtect(ls_addr(id), PG, PAGE_READWRITE, &old) != 0;
             if (!ok) InterlockedIncrement64(&g_ls_protfail);
+            if (g_ls_pin && g_ls_pin[id] && g_ls_pin[id] != 255) {      /* (fast1) back after a decay: pinned when it came back soon */
+                unsigned age = ((unsigned)g_ls_caps - (unsigned)(g_ls_pin[id] - 1)) & 127u; InterlockedIncrement64(&g_ls_returned);
+                if (age < 3u * (unsigned)g_ls_decay) { g_ls_pin[id] = 255; InterlockedIncrement64(&g_ls_pinned); } else g_ls_pin[id] = 0;
+            }
             ls_push(id); MemoryBarrier(); g_ls_st[id] = 2;
             if (e) { InterlockedIncrement64(&g_ls_faults); ls_note_writer(e); }
             return ok;
@@ -124,6 +134,7 @@ static void ls_protect_run(size_t a, size_t b) {         /* ids [a, b): read-onl
 static void ls_protect_all(void) {                       /* threads held: every committed RW simulation page of the windows (g_r = r1's ranges) */
     double t0 = now_ms(); long long before = g_ls_prot_pages;
     memset((void *)g_ls_st, 0, g_ls_np); g_ls_n = 0; g_ls_over = 0;
+    if (g_ls_pin) memset((void *)g_ls_pin, 0, g_ls_np);      /* (fast1) a new base: no page pinned or decayed yet */
     for (int i = 0; i < g_nr; i++) {
         size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
         if (!ls_id(a, &id0) || !ls_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;      /* not (wholly) in one window */
@@ -143,7 +154,9 @@ static void ls_after_setup(void) {                       /* mark_setup done, thr
         g_ls_lc = VirtualAlloc(NULL, (size_t)g_ls_cap * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!g_ls_st || !g_ls_list || !g_ls_lc) { LOG("r1: LS: allocation FAILED: off\n"); g_ls_st = NULL; g_ls_on = 0; return; }
         g_ls_cmp = !(getenv("SSBU_LS_CMP") && getenv("SSBU_LS_CMP")[0] == '0');      /* (R3 net3) default ON: the same tick time, a quarter of the ring memory (SSBU_LS_CMP=0: every learned page copied) */
-        if (getenv("SSBU_LS_DECAY")) { g_ls_decay = atoi(getenv("SSBU_LS_DECAY")); if (g_ls_decay > 0) g_ls_cmp = 1; }
+        {   const char *d = getenv("SSBU_LS_DECAY"); g_ls_decay = d ? atoi(d) : g_ls_cmp ? 8 : 0; if (g_ls_decay > 0) g_ls_cmp = 1;      /* (fast1) default: every 8 captures, with the churn guard */
+            g_ls_pin = g_ls_decay > 0 ? VirtualAlloc(NULL, g_ls_np, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL;
+            if (g_ls_decay > 0 && !g_ls_pin) { g_ls_decay = 0; LOG("r1: LS: churn-guard allocation FAILED: no decay\n"); } }
         g_ls_mod_exe = GetModuleHandleA(NULL);
         {   const char *names[] = {getenv("SSBU_R1_GAMEDLL"), "ssbu_game.dll", "ssbu_game_p15n3.dll", "ssbu_game_eh_o1.dll", "ssbu_game_1305x.dll"};
             for (int i = 0; i < 5 && !g_ls_mod_game; i++) if (names[i] && names[i][0]) g_ls_mod_game = GetModuleHandleA(names[i]); }
@@ -173,8 +186,8 @@ static void ls_decay_run(void) {                         /* threads held, after 
     for (LONG k = 0; k < n; k++) {
         uint32_t v = g_ls_list[k]; if (!v) continue;
         size_t id = v - 1; int w = id >= g_ls_n1; size_t j = w ? id - g_ls_n1 : id; DWORD old;
-        if ((uint32_t)g_ls_caps - g_ls_lc[k] >= (uint32_t)g_ls_decay && g_ls_st[id] == 2 && !ls_ns(id) && (w || !g_dc[j]) &&
-            VirtualProtect(ls_addr(id), PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; nd++; continue; }
+        if ((uint32_t)g_ls_caps - g_ls_lc[k] >= (uint32_t)g_ls_decay && g_ls_st[id] == 2 && !ls_ns(id) && (w || !g_dc[j]) && (!g_ls_pin || g_ls_pin[id] != 255) &&
+            VirtualProtect(ls_addr(id), PG, PAGE_READONLY, &old)) { g_ls_st[id] = 1; if (g_ls_pin) g_ls_pin[id] = (uint8_t)(1 + ((unsigned)g_ls_caps & 127u)); nd++; continue; }
         g_ls_list[m] = v; g_ls_lc[m] = g_ls_lc[k]; m++;
     }
     g_ls_n = m;
@@ -182,13 +195,16 @@ static void ls_decay_run(void) {                         /* threads held, after 
     g_ls_decayed += nd; g_ls_decays++; g_ls_decay_ms += now_ms() - t0;
     if (g_ls_decays <= 3 || g_ls_decays % 20 == 0) LOG("r1: LS decay %lld: %lld pages read-only again in %.2f ms, set now %ld pages\n", g_ls_decays, nd, now_ms() - t0, (long)m);
 }
-static void ls_capture(void (*fn)(uint32_t id, int w, size_t j)) {
+/* (fast1) nx jobs are already queued ahead of the learned pages (r1_ring_capture: the extras, compared in the same fan-out;
+ * their results go to xdiff[0 .. nx), their fused copies are at g_cp_fdst[0 .. nx)) */
+static void rg_fused_prepare(size_t njobs); static void rg_cap_page_done(uint32_t id, uint32_t q);
+static void ls_capture(void (*fn)(uint32_t id, int w, size_t j), size_t nx, uint8_t *xdiff) {
     g_ls_caps++;
     if (!g_ls_cmp) { long long b = g_rg_cur ? (long long)g_rg_cur->pages : 0; ls_each(fn); if (g_rg_cur) g_ls_cap_pages += (long long)g_rg_cur->pages - b; return; }
     double t0 = now_ms();
-    if (g_ls_ccap < (size_t)g_ls_n + 1024) { g_ls_ccap = (size_t)g_ls_n * 2 + 65536; free(g_ls_cids); free(g_ls_ck); free(g_ls_cdiff); g_ls_cids = malloc(g_ls_ccap * 4); g_ls_ck = malloc(g_ls_ccap * 4); g_ls_cdiff = malloc(g_ls_ccap); }
-    g_ls_cn = 0; g_ncj = 0;
-    LONG n = g_ls_n; if (n > g_ls_cap) n = g_ls_cap; if ((size_t)n > g_ls_ccap) n = (LONG)g_ls_ccap;
+    if (g_ls_ccap < (size_t)g_ls_n + nx + 1024) { g_ls_ccap = (size_t)g_ls_n * 2 + nx + 65536; free(g_ls_cids); free(g_ls_ck); free(g_ls_cdiff); g_ls_cids = malloc(g_ls_ccap * 4); g_ls_ck = malloc(g_ls_ccap * 4); g_ls_cdiff = malloc(g_ls_ccap); }
+    g_ls_cn = 0; if (!nx) g_ncj = 0;
+    LONG n = g_ls_n; if (n > g_ls_cap) n = g_ls_cap; if ((size_t)n > g_ls_ccap - nx) n = (LONG)(g_ls_ccap - nx);
     for (LONG k = 0; k < n; k++) {
         uint32_t v = g_ls_list[k]; if (!v) continue;
         uint32_t id = v - 1; int w = id >= g_ls_n1; size_t j = w ? id - g_ls_n1 : id;
@@ -199,14 +215,17 @@ static void ls_capture(void (*fn)(uint32_t id, int w, size_t j)) {
         if (src == NULL || src == (uint8_t *)1 || (!w && g_dc[j])) { g_ls_cids[g_ls_cn++] = id | 0x80000000u; continue; }   /* zero / decommitted: taken as it is */
         g_ls_cids[g_ls_cn++] = id; cp_add(rg_addr(id), src);
     }
-    g_cp_cmp = g_ls_cdiff; cp_run(); g_cp_cmp = NULL;    /* the queued (now, newest value) pairs: g_ls_cdiff[q] = 1 if they differ */
+    rg_fused_prepare(g_ncj);                             /* (fast1) buffers for the changed pages: the compare copies them as it goes */
+    g_cp_cmp = g_ls_cdiff; cp_run_nt(1); g_cp_cmp = NULL;    /* the queued (now, newest value) pairs: g_ls_cdiff[q] = 1 if they differ */
     g_ls_cmp_ms += now_ms() - t0;
-    size_t q = 0;
+    if (nx) memcpy(xdiff, g_ls_cdiff, nx);
+    size_t q = nx;
     for (size_t i = 0; i < g_ls_cn; i++) {
         uint32_t id = g_ls_cids[i] & 0x7fffffffu; int w = id >= g_ls_n1; size_t j = w ? id - g_ls_n1 : id;
-        if (!(g_ls_cids[i] & 0x80000000u) && !g_ls_cdiff[q++]) { g_ls_cap_same++; continue; }
+        if (!(g_ls_cids[i] & 0x80000000u)) { if (!g_ls_cdiff[q++]) { g_ls_cap_same++; continue; } }
         g_ls_lc[g_ls_ck[i]] = (uint32_t)g_ls_caps;
-        fn(id, w, j); g_ls_cap_pages++;
+        if (!(g_ls_cids[i] & 0x80000000u) && g_cp_fbuf && g_cp_fdst[q - 1]) rg_cap_page_done(id, (uint32_t)(q - 1)); else fn(id, w, j);
+        g_ls_cap_pages++;
     }
 }
 static void ls_capture_end(void) {                       /* r1_ring_capture, after the copies (threads still held) */
@@ -429,7 +448,8 @@ static void ls_report(void) {
         LOG("r1: LS report: bases %lld (%.1f ms protecting), pages made read-only %lld, writable again at fight ends %lld; learned set %ld pages (%.1f MB; list overflow %ld); first-write faults %lld: game DLL %lld, script modules %lld, exe %lld, other %lld, unknown %lld; repeated faults %lld, busy waits %lld, protect failures %lld; kernel-write opens (r1_wrote) %lld, decommits learned %lld, commits made read-only %lld; file reads repeated after ERROR_NOACCESS %lld\n",
             g_ls_bases, g_ls_prot_ms, g_ls_prot_pages, g_ls_unprot_pages, (long)g_ls_n, g_ls_n * (double)PG / 1048576.0, (long)g_ls_over, (long long)g_ls_faults, (long long)g_ls_fault_mod[0], (long long)g_ls_fault_mod[1], (long long)g_ls_fault_mod[2], (long long)g_ls_fault_mod[3], (long long)g_ls_fault_mod[4],
             (long long)g_ls_refault, (long long)g_ls_spin, (long long)g_ls_protfail, (long long)g_ls_wrote_open, (long long)g_ls_dec_learn, (long long)g_ls_commit_prot, (long long)g_read_retry);
-        if (g_ls_decays) LOG("r1: LS decay every %d captures: %lld runs, %lld pages made read-only again (%.0f per run), %.3f ms per run\n", g_ls_decay, g_ls_decays, g_ls_decayed, (double)g_ls_decayed / g_ls_decays, g_ls_decay_ms / g_ls_decays);
+        if (g_ls_decays) LOG("r1: LS decay every %d captures: %lld runs, %lld pages made read-only again (%.0f per run), %.3f ms per run; came back %lld, of them pinned (back within %d captures) %lld; set now %ld pages (%.1f MB)\n", g_ls_decay, g_ls_decays, g_ls_decayed, (double)g_ls_decayed / g_ls_decays, g_ls_decay_ms / g_ls_decays,
+            (long long)g_ls_returned, 3 * g_ls_decay, (long long)g_ls_pinned, (long)g_ls_n, g_ls_n * (double)PG / 1048576.0);
         LOG("r1: LS captures %lld: pages taken %.0f per capture%s (compare %.3f ms per capture, %.0f unchanged pages skipped per capture)\n", g_ls_caps, g_ls_caps ? (double)g_ls_cap_pages / g_ls_caps : 0, g_ls_cmp ? " (changed only)" : " (the whole set)",
             g_ls_caps ? g_ls_cmp_ms / g_ls_caps : 0, g_ls_caps ? (double)g_ls_cap_same / g_ls_caps : 0);
         for (int i = 0; i < g_ls_nw; i++) LOG("r1: LS   writer not in the game code: %s+%llx  %lld first writes\n", g_ls_w[i].mod, (unsigned long long)g_ls_w[i].off, g_ls_w[i].n);

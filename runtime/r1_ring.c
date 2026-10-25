@@ -182,6 +182,39 @@ static void rg_cap_page(uint32_t id, int w, size_t j) {
     if (g_rgpg_on > 0) rgpg_note(rg_addr(id));
 }
 static void rg_load_page(uint32_t id, int w, size_t j) { (void)w; (void)j; rg_touch(id); }
+/* (R5 fast1) the compare of a capture copies the changed pages as it finds them (r1_state.c cp_part, g_cp_fbuf), into pool
+ * buffers taken in advance: as many as the last capture needed and a half more (the rest go back to the pool after). A page
+ * found changed after the buffers ran out is taken the old way (rg_cap_page: copied in a second pass). SSBU_RB_FUSE=0: off. */
+static uint32_t *g_rg_fidx; static size_t g_rg_fcap; static LONG g_rg_fuse_last = 1024; static int g_rg_fuse = -1; static long long g_rg_fused_pages, g_rg_fused_short, g_rg_fused_caps;
+static void rg_fused_prepare(size_t njobs) {
+    if (g_rg_fuse < 0) { const char *e = getenv("SSBU_RB_FUSE"); g_rg_fuse = !(e && e[0] == '0'); }
+    g_cp_fbuf = NULL; g_cp_fcnt = 0; g_cp_fn = 0;
+    if (!g_rg_fuse || !njobs) return;
+    size_t want = (size_t)g_rg_fuse_last + (size_t)g_rg_fuse_last / 2 + 128; if (want > njobs) want = njobs;
+    if (g_rg_fcap < want) { g_rg_fcap = want + 1024; free(g_rg_fidx); g_rg_fidx = malloc(g_rg_fcap * sizeof *g_rg_fidx); }
+    static uint8_t **bufs; static size_t bcap; if (bcap < g_rg_fcap) { bcap = g_rg_fcap; free(bufs); bufs = malloc(bcap * sizeof *bufs); }
+    static size_t dcap; if (dcap < njobs) { dcap = njobs + 4096; free(g_cp_fdst); g_cp_fdst = malloc(dcap * sizeof *g_cp_fdst); }
+    if (!g_rg_fidx || !bufs || !g_cp_fdst) { g_rg_fcap = 0; return; }
+    LONG n = 0;
+    for (; (size_t)n < want; n++) { uint32_t nb = rg_pool_get_cap(); if (!nb) break; g_rg_fidx[n] = nb; bufs[n] = rg_pool_ptr(nb); }
+    g_cp_fcnt = n; g_cp_fbuf = bufs;
+}
+static void rg_fused_finish(void) {                      /* after the compare: the buffers not used go back; the demand is remembered */
+    if (!g_cp_fbuf) return;
+    LONG used = g_cp_fn < g_cp_fcnt ? g_cp_fn : g_cp_fcnt;
+    for (LONG n = used; n < g_cp_fcnt; n++) rg_pool_put(g_rg_fidx[n]);
+    if (g_cp_fn > g_cp_fcnt) g_rg_fused_short++;
+    g_rg_fuse_last = g_cp_fn; g_rg_fused_pages += used; g_rg_fused_caps++;
+    g_cp_fbuf = NULL; g_cp_fcnt = 0;
+}
+static void rg_cap_page_done(uint32_t id, uint32_t q) {  /* page id: its bytes are already in the pool buffer the compare took for job q */
+    uint32_t nb = g_rg_fidx[g_cp_fdst[q] - 1];
+    if (g_rg_fail_now) { rg_pool_put(nb); if (g_rg_poolfix) rg_remark(id); return; }
+    uint32_t old = g_rg_idx[id];
+    if (!rg_push(g_rg_cur, id, old)) { rg_pool_put(nb); g_rg_fail_now = 1; if (g_rg_poolfix) rg_remark(id); return; }
+    g_rg_idx[id] = nb; g_rg_cur->pages++;
+    if (g_rgpg_on > 0) rgpg_note(rg_addr(id));
+}
 static void rg_remark(uint32_t id) {                     /* (hs14) a window page marked as written again (a capture given up) */
     if (id < g_rg_n1) (*pm1)[id] = 1; else if (id < g_rg_n1 + g_rg_n2) (*pm2)[id - g_rg_n1] = 1;
 }
@@ -249,7 +282,7 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     s->ctx = *c;
     s->nth = g_nth; s->ninfo = g_ninfo;
     memcpy(s->th, g_th, (size_t)g_nth * sizeof *g_th);
-    for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; }
+    for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; s->th[i].pre = 0; }
     s->nfib = g_nfib; memcpy(s->fib, g_fib, (size_t)g_nfib * sizeof *g_fib);
     s->fpool_used = 0;
     if (g_fpool_used && rg_vcom(s->fpool, &s->fpool_com, g_fpool_used, 1u << 20)) { memcpy(s->fpool, g_fpool, g_fpool_used); s->fpool_used = g_fpool_used; }
@@ -368,19 +401,24 @@ int r1_ring_capture(long long frame, Ctx *c) {
     g_rg_cur = s; g_rg_fail_now = 0;
     static uint8_t *xdiff; static size_t xdn; if (xdn < g_rg_nx + 1) { free(xdiff); xdn = g_rg_nx + 1; xdiff = calloc(xdn, 1); }   /* (hs12: the extras can change at a rebase) */
     for (size_t e = 0; e < g_rg_nx; e++) cp_add(g_rg_xa[e], rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e)));      /* (round 3) extras compared by main + the copy threads */
-    g_cp_cmp = xdiff; cp_run(); g_cp_cmp = NULL;
+    int fused = g_ls_active && g_ls_cmp;                   /* (fast1) with the learned set's compare: one fan-out for the extras and the learned pages, the changed ones copied as found */
+    if (!fused) { g_cp_cmp = xdiff; cp_run(); g_cp_cmp = NULL; }
     if (g_rgpg_on < 0) g_rgpg_on = getenv("SSBU_RB_SIM_PAGES") != NULL;
     g_rgpg_kind = g_ra_phase != 2 ? 0 : g_rgs_left > 1 ? 1 : 2; g_rgpg_caps[g_rgpg_kind]++;
-    if (g_ls_active) ls_capture(rg_cap_page); else rg_sweep(rg_cap_page);      /* R4: the learned set (rb_learned.c) instead of the marks */
-    for (size_t e = 0; e < g_rg_nx && !g_rg_fail_now; e++) {             /* extras: the pages that differ from their newest value */
+    if (g_ls_active) ls_capture(rg_cap_page, fused ? g_rg_nx : 0, xdiff); else rg_sweep(rg_cap_page);      /* R4: the learned set (rb_learned.c) instead of the marks */
+    for (size_t e = 0; e < g_rg_nx; e++) {                                /* extras: the pages that differ from their newest value */
         uint32_t id = (uint32_t)(g_rg_n1 + g_rg_n2 + e);
         if (!xdiff[e]) continue;
+        int fd = fused && g_cp_fbuf && g_cp_fdst[e];                       /* (fast1) copied by the compare already */
+        if (g_rg_fail_now) { if (fd) rg_pool_put(g_rg_fidx[g_cp_fdst[e] - 1]); continue; }
+        if (fd) { size_t before = s->pages; rg_cap_page_done(id, (uint32_t)e); if (s->pages != before) { s->pages--; s->xpages++; } continue; }
         uint32_t nb = rg_pool_get_cap();
-        if (!nb || !rg_push(s, id, g_rg_idx[id])) { if (nb) rg_pool_put(nb); g_rg_fail_now = 1; break; }
+        if (!nb || !rg_push(s, id, g_rg_idx[id])) { if (nb) rg_pool_put(nb); g_rg_fail_now = 1; continue; }
         cp_add(rg_pool_ptr(nb), g_rg_xa[e]); g_rg_idx[id] = nb; s->xpages++;
     }
+    if (fused) rg_fused_finish();
     double t2 = now_ms();
-    cp_run();
+    cp_run_nt(1);
     if (g_rg_fail_now && g_rg_poolfix) {                    /* (hs14) given up: this capture's pages back to their previous values, marked again */
         size_t undone = s->nent;
         for (size_t n = s->nent; n-- > 0;) { uint32_t id = s->ent[2 * n], old = s->ent[2 * n + 1]; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = old; rg_remark(id); }
@@ -579,13 +617,13 @@ int r1_ring_load(long long frame, Ctx *c) {
     for (int j = 0; j < ncur; j++) {                      /* held at the same wait as in capture g: stays held; otherwise let go (the loop below waits for it) */
         if (!cur[j].held) continue;
         int keep = 0;
-        for (int i = 0; i < g_nth; i++) if (g_th[i].h == cur[j].h) { if (g_th[i].parked && cur[j].from == g_th[i].from && cur[j].imp == g_th[i].imp) { g_th[i].held = 1; g_th[i].rsp = cur[j].rsp; g_th[i].rip = cur[j].rip; g_th[i].cok = cur[j].cok; keep = 1; } break; }
-        if (keep) g_rg_kept_same++; else ResumeThread(cur[j].h);
+        for (int i = 0; i < g_nth; i++) if (g_th[i].h == cur[j].h) { if (g_th[i].parked && cur[j].from == g_th[i].from && cur[j].imp == g_th[i].imp) { g_th[i].held = 1; g_th[i].rsp = cur[j].rsp; g_th[i].rip = cur[j].rip; g_th[i].cok = cur[j].cok; g_th[i].pre = cur[j].pre; keep = 1; } break; }
+        if (keep) g_rg_kept_same++; else th_resume(&cur[j]);
     }
     for (double tq = now_ms();;) {                        /* each thread at the wait it was held at in that capture, no job running */
         ra_hold_restore();
         if (ra_fibers_quiet() || now_ms() - tq > 200) { if (g_ra_busy_fibers) LOG("r1: RING load: %d fibers still busy after 200 ms\n", g_ra_busy_fibers); break; }
-        for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+        for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]);
         SwitchToThread();
     }
     /* (R3 pub1: fx2j / fx3h, c0000005 in the sound thread's memcpy right after "nus3::audio update not back at its wait after 500 ms
@@ -634,7 +672,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     }
     {   /* (R3 net3) SSBU_RB_LOADCMP=1 (option, default off: measured no faster, na0 / na1): a page is written only if it differs from the value loaded */
         static int lc = -1; if (lc < 0) { const char *e = getenv("SSBU_RB_LOADCMP"); lc = e && e[0] == '1'; }
-        g_cp_cond = lc; cp_run(); g_cp_cond = 0; }
+        g_cp_cond = lc; cp_run_nt(2); g_cp_cond = 0; }
     double t2 = now_ms();
     g_nfib = g->nfib; memcpy(g_fib, g->fib, (size_t)g->nfib * sizeof *g_fib);
     if (g->fpool_used) memcpy(g_fpool, g->fpool, g->fpool_used);
@@ -1023,6 +1061,8 @@ static void rgs_report(void) {
     LOG("r1: RING loads right after a capture with the threads kept held: %lld (threads kept at the same wait: %lld); fibers %d (last); stale fiber-block notes refused %lld\n", g_rg_kept_n, g_rg_kept_same, g_nfib, g_r1_fls_stale);
     LOG("r1: RING capture: median %.3f mean %.3f p99 %.3f ms; parts (means): hold %.3f, sweep + undo log %.3f, page copy (parallel) %.3f, fibers + threads + command buffers + let go %.3f; pages %.0f + extras %.0f mean (%.1f MB)\n",
         rg_pct(g_rgc[0], n, 50), rg_mean(g_rgc[0], n), rg_pct(g_rgc[0], n, 99), rg_mean(g_rgc[1], n), rg_mean(g_rgc[2], n), rg_mean(g_rgc[3], n), rg_mean(g_rgc[4], n), n ? pg / n : 0, n ? xp / n : 0, n ? (pg + xp) / n * PG / 1048576.0 : 0);
+    LOG("r1: RING fast1: fused compare + copy %s: %lld captures, %.0f pages copied by the compare per capture, %lld captures short of buffers; non-temporal stores %d; helpers spin %.2f ms; holds: task workers taken as held since the kick %lld (watchdog releases held back %lld)\n",
+        g_rg_fuse > 0 ? "on" : "off", g_rg_fused_caps, g_rg_fused_caps ? (double)g_rg_fused_pages / g_rg_fused_caps : 0, g_rg_fused_short, g_cp_nt, g_cp_spin, g_ra_pre_held, g_ra_wd_held_back);
     {   long long w = 0; for (int q = 0; q < 9; q++) w += g_cp_wrote[q];
         LOG("r1: RING loads (net3, SSBU_RB_LOADCMP): pages to load %lld, of them written (they differed) %lld (%.1f%%)\n", g_rg_ldpg, w, g_rg_ldpg ? 100.0 * (double)w / (double)g_rg_ldpg : 0.0); }
     for (int k = 0; k < RG_MAXSLOT; k++) {
