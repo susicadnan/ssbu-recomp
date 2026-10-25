@@ -21,7 +21,26 @@ mismatch. It also checks collection stops and counters reset between matches. Th
 undefined-behavior traps, and `nnro.c` (which includes the changed fighter hook) compiles with the Windows toolchain.
 
 The session fixture drives the collector's output directly; it does **not** execute the game getters in the fighter
-hook. Paired game validation remains required: unset `SSBU_FIGHT_HASH` on both games, set `SSBU_RB_NET_LOG` on both,
-and require nonempty matching finalized hashes, positive checksum-comparison counts, zero reported desyncs and zero
-final-pad discrepancies. Compare frame times with the explicit-debug-file case and the current shipping build, because
-collecting state has a cost even when file output is disabled. Keep the PR in draft until this path is verified.
+hook. A paired game run now covers that path as described below. More rematch/network-condition coverage and a matched
+frame-time comparison remain needed, because collecting state has a cost even when file output is disabled.
+
+## Paired game result (2026-10-25)
+
+Codex built `e25094e` with `scripts/make_release.py`; the full runtime build and package audit passed. A separately named
+test executable was placed beside the installed module DLLs (the loader resolves them relative to the executable).
+The installed executable was not replaced. Test saves were copied by the existing driver, and each game used a separate
+renderer cache.
+
+Two instances on one PC, host/join through the in-game lobby, 39 ms simulated outgoing delay on each (about 78 ms RTT),
+bots 7/11, automatic delay 3 frames, 1,200 requested fight frames. Both startup logs confirmed `SSBU_FIGHT_HASH off` and
+deterministic mode on. Both game processes exited with status 0 (85/81 seconds including menus and shutdown).
+
+Strict comparison required at least 1,000 common frames: **1,152 matching finalized frame checksums**, with identical
+coverage from 1 through 1152 and matching match IDs. Periodic reports showed 261/311 checksum comparisons on host/joiner,
+zero reported desyncs and zero final-pad differences. The host's frame-1200 status recorded one two-frame rollback and
+zero stalls. This verifies checksum collection through the actual game getters without the optional debug file.
+
+The timing reports were periodic snapshots covering only 264/317 tick intervals, with p99 33.47/33.44 ms. They are not
+full-run timing distributions or an off/on performance comparison. Remaining comparisons: multiple seeds and rematches,
+jitter/loss, normal game pacing with and without explicit file output, and two-PC internet play. No Slippi comparison
+has been performed. The PR remains in draft for review and further validation.
