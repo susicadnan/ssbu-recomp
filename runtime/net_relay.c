@@ -75,6 +75,7 @@ enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_LEAVE, T_LIST,
        T_PEERS, T_PUNCH, T_DIRECT, T_BCAST };
 enum { T_ROOMS = 17, T_ROOM_INFO, T_ROOMS_END };      /* O1 room browser */
 enum { T_MATCH = 20, T_MATCH_STATE };                 /* O2 matchmaking */
+enum { T_RB_DIRECT = 22 };                            /* (net4) a rollback message straight to the other player (see net_rb_send) */
 #define PROTO 1
 #define NAME_LEN 32
 #define BUILD_LEN 40
@@ -369,6 +370,7 @@ static uint16_t g_lan_port;
 static int g_loopback;
 static char g_reject[80];
 static volatile LONG64 g_out_relay, g_out_direct, g_in_relay, g_in_direct;
+static volatile LONG64 g_rb_out_relay, g_rb_out_direct, g_rb_in_relay, g_rb_in_direct;     /* (net4) rollback messages by path */
 
 enum { PS_PUNCHING, PS_DIRECT, PS_RELAYED };
 typedef struct {
@@ -483,9 +485,33 @@ int net_rb_send(const void *p, int n) {
     if (!dst && g_mode == NET_MODE_LOBBY && !_stricmp(g_code, "public")) { InterlockedIncrement(&g_rb_nodst); return 0; }
     if (dst && dst != g_rb_dst_said) { char a[16]; g_rb_dst_said = dst; printf("[rbnet] rollback messages go to %s (%s)\n", ip_text(dst, a), room ? "the other player of this Local Wireless room" : dst == g_rb_match_peer ? "the opponent the lobby found" : "the game that wrote to this one"); fflush(stdout); }
     uint8_t b[1500];
+    /* (net4) straight to the other player while a direct path to it is fresh (its address and pair secret from the lobby's
+     * PEERS, the path the game's own datagrams take): the input messages no longer go through the lobby server and back,
+     * a whole extra round trip on every pad. Otherwise (no path, or it went quiet) the lobby relays them as before.
+     *   'S' 'U' 1 22 | pair secret u64 | source u32 | message */
+    if (dst && g_direct) {
+        struct sockaddr_in at; uint64_t secret = 0, t = ms_now();
+        AcquireSRWLockShared(&g_peers_lock);
+        for (int i = 0; i < g_npeers && !secret; i++)
+            if (g_peers[i].ip == dst && fresh(&g_peers[i], t)) { at = g_peers[i].cand[g_peers[i].via].at; secret = g_peers[i].secret; }
+        ReleaseSRWLockShared(&g_peers_lock);
+        static volatile LONG route = -1;                /* the path last written in the log: 1 direct, 0 the lobby */
+        if (InterlockedExchange(&route, secret ? 1 : 0) != (secret ? 1 : 0)) {
+            printf("[rbnet] rollback messages %s\n", secret ? "go straight to the other player (direct path)" : "go through the lobby (no direct path to the other player now)");
+            fflush(stdout);
+        }
+        if (secret) {
+            hdr(b, T_RB_DIRECT); s64(b + 4, secret); s32(b + 12, g_ip);
+            memcpy(b + 16, p, (size_t)n);
+            tx(b, 16 + n, &at);
+            InterlockedIncrement64(&g_rb_out_direct);
+            return 1;
+        }
+    }
     hdr(b, T_RB); s64(b + 4, g_cookie); s32(b + 12, dst);
     memcpy(b + 16, p, (size_t)n);
     tx(b, 16 + n, &g_lobby);
+    InterlockedIncrement64(&g_rb_out_relay);
     return 1;
 }
 
@@ -577,10 +603,11 @@ static void peers_tick(uint64_t t) {
             else for (int c = 0; c < q->ncand; c++) hello(q, c, t);
         }
     }
-    if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct)) {
+    if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct || g_rb_out_relay || g_rb_out_direct)) {
         last_report = t;
-        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; %d peer(s)%s",
-                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_in_relay, (long long)g_in_direct, g_npeers,
+        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s",
+                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_in_relay, (long long)g_in_direct,
+                 (long long)g_rb_out_relay, (long long)g_rb_out_direct, (long long)g_rb_in_relay, (long long)g_rb_in_direct, g_npeers,
                  g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "");
     }
     ReleaseSRWLockExclusive(&g_peers_lock);
@@ -597,6 +624,11 @@ static Peer *peer_at(uint64_t secret, const struct sockaddr_in *from, int *cand)
     return NULL;
 }
 
+/* (net4, peers lock held exclusive) a game datagram or rollback message of q arrived on its direct path: the path is alive.
+ * Only the answers to hellos kept it fresh before, so three hellos lost in a row (Wi-Fi) sent every datagram through the
+ * lobby for a while although the path carried the game's traffic all along: a burst of lag in the middle of a fight. */
+static void heard_direct(Peer *q, int c, uint64_t t) { if (q->state == PS_DIRECT && c == q->via) q->last_ack = t; }
+
 static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from) {
     uint64_t t = ms_now();
     int c = 0;
@@ -607,14 +639,29 @@ static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from)
         uint32_t src = g32(b), dst = g32(b + 4);
         uint16_t sport = g16(b + 8), dport = g16(b + 10);
         int ok;
-        AcquireSRWLockShared(&g_peers_lock);
+        AcquireSRWLockExclusive(&g_peers_lock);
         Peer *q = peer_at(secret, from, &c);
         ok = q && q->ip == src && (dst == g_ip || dst == VNET_BROADCAST || dst == 0xFFFFFFFFu) && sport != VNET_LDN_PORT && dport != VNET_LDN_PORT;
-        ReleaseSRWLockShared(&g_peers_lock);
+        if (ok) heard_direct(q, c, t);
+        ReleaseSRWLockExclusive(&g_peers_lock);
         if (ok && nnldn_has_node(src)) {
             InterlockedIncrement64(&g_in_direct);
             nnldn_deliver(src, sport, dst, dport, b + 12, (uint32_t)(n - 24));
         }
+        return;
+    }
+    if (p[3] == T_RB_DIRECT && n > 16) {              /* (net4) a rollback message of the other player, straight from it */
+        uint32_t src = g32(p + 12), mp = g_rb_match_peer;
+        AcquireSRWLockExclusive(&g_peers_lock);
+        Peer *q = peer_at(secret, from, &c);
+        int ok = q && q->ip == src;
+        if (ok) heard_direct(q, c, t);
+        ReleaseSRWLockExclusive(&g_peers_lock);
+        if (!ok || !src || src == g_ip) return;
+        if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); return; }    /* (as T_RB: not our opponent) */
+        g_rb_peer = src;
+        InterlockedIncrement64(&g_rb_in_direct);
+        rbn_rx(p + 16, n - 16);
         return;
     }
     if (p[3] != T_PUNCH || n < 29) return;
@@ -1377,6 +1424,10 @@ static void send_join(void) {
 static DWORD WINAPI client_thread(LPVOID unused) {
     (void)unused;
     static uint8_t buf[65536];
+    /* (net4) this thread hands every datagram received to the game (nnldn_deliver) and answers the rollback pings. It sleeps
+     * in recvfrom nearly all the time, but when a packet comes it must run at once: at NORMAL priority it waited behind the
+     * game's own threads (ABOVE_NORMAL / HIGHEST, os_threads.c host_priority) on a busy PC, so packets reached the game late. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     while (!setup()) {
         if (g_mode == NET_MODE_LOBBY && g_auto && ms_now() - g_unjoined_since > GONE_AFTER_MS) { lobby_fallback_to_lan(); break; }
         Sleep(3000);
@@ -1484,7 +1535,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         case T_RB:                                       /* R3: a rollback message of the other player */
             if (n > 8 && g_joined) { uint32_t src = g32(buf + 4), mp = g_rb_match_peer;
                 if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); break; }     /* (R3 net3) not our opponent */
-                if (src && src != g_ip) { g_rb_peer = src; rbn_rx(buf + 8, n - 8); } }
+                if (src && src != g_ip) { g_rb_peer = src; InterlockedIncrement64(&g_rb_in_relay); rbn_rx(buf + 8, n - 8); } }
             break;
         }
     }
@@ -1548,14 +1599,22 @@ void net_stats_get(NetStats *o) {
     o->state = NET_CONNECTED;
     {   /* R3: an online rollback match (rb_net.c / rb_rollback.c) fills delay and rollback; its own round trip */
         int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk);
-        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); return; }
+        if (rbn_started()) {
+            rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms();
+            static LONG64 seen_d, seen_r; static int last_path;          /* (net4) the path of the messages sent since the last call */
+            LONG64 d = g_rb_out_direct, r = g_rb_out_relay;
+            if (d != seen_d) last_path = NET_PATH_DIRECT; else if (r != seen_r) last_path = NET_PATH_RELAYED;
+            seen_d = d; seen_r = r; o->path = last_path;
+            return;
+        }
     }
     int in_room = nnldn_players();
     o->players = in_room ? in_room : 1;
     o->ping_ms = (int)g_ping;
     if (in_room > 1 && TryAcquireSRWLockShared(&g_peers_lock)) {
         uint64_t t = ms_now();
-        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; break; }
+        o->path = NET_PATH_RELAYED;
+        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; o->path = NET_PATH_DIRECT; break; }
         ReleaseSRWLockShared(&g_peers_lock);
     }
 }

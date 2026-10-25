@@ -1370,6 +1370,8 @@ static void draw_stats(void) {
     else ImGui::TextColored(col, "%s", ns.state >= 0 && ns.state <= 3 ? st[ns.state] : "?");
     if (ns.state == NET_CONNECTED || ns.state == NET_CONNECTING) {
         if (ns.ping_ms >= 0) ImGui::Text("ping %d ms  delay %d f", ns.ping_ms, ns.delay); else ImGui::Text("ping -  delay %d f", ns.delay);
+        if (ns.path == NET_PATH_DIRECT) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "direct to the other player");      /* (net4) */
+        else if (ns.path == NET_PATH_RELAYED) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "through the lobby server (slower)");
         ImGui::Text("rollback %d / %d f", ns.rollback_last, ns.rollback_max);
     }
     ImGui::Text("run-ahead %s", !ra_cfg ? "off" : r1_ra_phase() ? "on (running)" : "on");

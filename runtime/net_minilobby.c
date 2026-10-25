@@ -737,6 +737,7 @@ static DWORD WINAPI ml_thread_main(LPVOID arg) {
     static uint8_t buf[65536];
     ULONGLONG last_sweep, last_stats, last_open = 0;
     (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);     /* (net4) it relays the room's datagrams: as net_relay.c's client thread */
     last_sweep = last_stats = GetTickCount64();
     while (ml_running) {
         struct sockaddr_in from;
