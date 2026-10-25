@@ -15,7 +15,7 @@
  *   SSBU_RB_NET_LOG=<file> one line per finalized frame: "f <frame> h <checksum>" (compare two games' files)
  *   SSBU_RB_NET_AHEAD=<n>  most frames this game runs ahead of the newest remote pad (default 7 = the ring depth)
  *   SSBU_RB_NET_FIND=0     (R3 net3) no opponent search through the lobby (lobby / LAN mode without a room: the old way)
- *   SSBU_RB_NET_PREDRAIN=1 experimental: apply inputs received during pacing before the next simulation pass (default off)
+ *   SSBU_RB_NET_PREDRAIN=0 apply inputs received during pacing before the next simulation pass: default ON (=0 off)
  *   SSBU_RB_NET_RESEND_MS=<8..50> experimental: retry interval while stalled, milliseconds (default 50)
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
@@ -65,7 +65,7 @@ int rbn_on(void) {
     }
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
-    { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = v && atoi(v) > 0; }
+    { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = !(v && v[0] == '0'); }      /* (net4: on by default after two in-game pair tests, identical; =0 off) */
     { const char *v = getenv("SSBU_RB_NET_RESEND_MS"); char *end; long ms = v ? strtol(v, &end, 10) : 0;
       g_resend_ms = v && end != v && !*end && ms >= 8 && ms <= 50 ? (int)ms : 50; }
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
