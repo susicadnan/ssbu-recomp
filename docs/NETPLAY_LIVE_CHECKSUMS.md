@@ -49,3 +49,22 @@ The timing reports were periodic snapshots covering only 264/317 tick intervals,
 full-run timing distributions or an off/on performance comparison. Remaining comparisons: multiple seeds and rematches,
 jitter/loss, normal game pacing with and without explicit file output, and two-PC internet play. No Slippi comparison
 has been performed. The PR remains in draft for review and further validation.
+
+## Debug-cache regression (2026-10-25)
+
+Two private staged builds exercised the eight-entry debug-table limit. Both builds forced that table full only after
+its first fighter initialization and rollback startup; the fixture changed the host debug table, not game memory or
+RNG initialization. The before build used `e25094e`, and the after build used `f6cd4e9`. This instrumentation is absent
+from production sources and release builds.
+
+Both paired runs used the same fixed seed, bots 7/11, 39 ms outgoing delay per peer, no fighter debug file, and 1,200
+requested fight frames. All four game processes exited 0. Before the fix: no finalized checksum records and zero peer
+comparisons. After the fix: **1,152 matching finalized frame checksums** (1..1152, identical match ID), 261/290 peer
+comparisons in the periodic reports, zero desyncs and zero final-pad differences. The host reached frame 1200 with one
+single-frame rollback and zero stalls. This reproduces and fixes the collection failure when the table is full; it
+is not a natural multi-rematch reproduction.
+
+The installed test setup lacks `fighters/sdk_generated/lua_const.h`. Its fighter entry lookup therefore returned -1
+in both builds, including the original tracked path. The regression proves collection continues for uncached objects;
+successful uncached entry-ID lookup and natural long-session coverage still need validation with that optional header.
+No full-run performance improvement or Slippi comparison is inferred from these runs.
