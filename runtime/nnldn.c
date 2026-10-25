@@ -638,8 +638,20 @@ static void drop_queue(VSock *s) {
     s->count = s->bytes = 0;
 }
 
+/* (net4) a game datagram from a node of the room counts as a sign of life, like its KEEP / ADVERTISE: those always go
+ * through the lobby (port 65511), so a slow or lossy relay plus a stall of a few seconds on one PC ended a room whose
+ * match was still exchanging data (testers 2026-10-25: "ldn: state 5 -> 4" mid-fight, then error 2618-0006). Never
+ * blocks the receive thread: when the lock is busy this datagram is simply not counted. */
+static void heard_from(uint32_t src) {
+    if (!TryAcquireSRWLockExclusive(&L.lock)) return;
+    uint64_t t = ms_now();
+    if (L.state == LS_STA_CONNECTED && src == u32at(L.net + NODE(0))) L.host_heard = t;
+    else if (L.state == LS_AP_CREATED) { int i = node_index(src); if (i > 0) L.heard[i] = t; }
+    ReleaseSRWLockExclusive(&L.lock);
+}
 void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
     if (dport == VNET_LDN_PORT) { if (sport == VNET_LDN_PORT) ldn_receive(src, data, len); return; }
+    if (src != LOOPBACK && src != net_my_ip()) heard_from(src);
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST, got = 0;
     AcquireSRWLockExclusive(&vs_lock);
     for (int i = 0; i < VS_MAX; i++) {
