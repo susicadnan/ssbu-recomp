@@ -90,5 +90,18 @@ rematch with collection continuing; it does not naturally exhaust all eight debu
 
 The network record now reserves its entry field as -1 even when debug metadata resolves a fighter ID. Optional debug
 headers must not change peer checksums for identical gameplay. This also removes repeated constant lookup for actors
-outside the debug table. The fighter-hook translation unit compiles; a private before/after paired-game fixture is
-being prepared to exercise differing debug identities without changing game state.
+outside the debug table. The fighter-hook translation unit compiles; full runtime build/audit at `49636bb` passes.
+
+A private before/after fixture sets only host debug IDs to slot indices and joiner IDs to -1 after initialization.
+Both pairs used the same seed/bots, 39 ms outgoing delay per peer, no fighter file, detailed net logging and 1,200
+requested fight frames. All four games exited 0. With `42898f2`, all 1,152 complete, bounded checksum records differed;
+the host periodic report compared 253 and reported 253 desyncs. Yet all 1,152 detailed frame records matched after
+normalizing only the debug entry labels (pads, status, motion, positions, damage and RNG were equal). With `49636bb`,
+the same fixture produced **1,152 identical complete finalized checksums**, matching detailed records, 290 host peer
+comparisons, zero desyncs and zero final-pad differences. No game/RNG state was changed by the fixture.
+
+The detail-enabled logs contain an incomplete final record because the runtime exit path bypasses C stream cleanup.
+Evidence above explicitly uses the fully written frame range 1..1152, extracted with complete 16-digit hashes and
+line terminators. The current comparator can accept a truncated hash; its raw 1,187-frame success is not credited.
+Shutdown flushing and strict log-format validation are follow-up work. This is a targeted debug-metadata regression,
+not a performance or full-memory determinism claim.
