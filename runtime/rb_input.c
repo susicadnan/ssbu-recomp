@@ -43,7 +43,10 @@ int rb_input_local_get(int frame, RbPad *out) {
 
 void rb_input_remote_put(int p, int frame, RbPad pad) {
     if (p < 0 || p >= g_np || p == g_local || frame < 1) return;
-    if (frame <= g_r[p].latest - RB_RING + 1) return;              /* older than the ring */
+    /* Every frame through latest is already known. A late duplicate of one of those frames may share a slot with
+     * a newer, not-yet-consecutive input; writing it again would erase that input and manufacture a receive gap.
+     * Likewise a frame beyond the next ring window must not evict a still-pending input. The sender repeats it. */
+    if (frame <= g_r[p].latest || (int64_t)frame - g_r[p].latest > RB_RING) return;
     if (g_r[p].frame[frame & M] == frame) return;                  /* a redundant copy */
     pad = rb_pad_rest(pad);
     g_r[p].pad[frame & M] = pad; g_r[p].frame[frame & M] = frame;
