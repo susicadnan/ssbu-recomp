@@ -529,11 +529,41 @@ int hostentry_hook(uint64_t addr, void (*fn)(Ctx *, void *), void *user, uint64_
     return 0;
 }
 
+/* (net4, 2026-10-25) name -> index of the first UNDEFINED symbol of that name in dyn_syms, through a hash built once: the
+ * linear scan with strcmp over the 7,124 symbols cost 0.3 ms of a 10 ms frame (SSBU_RB_SIM_PROF=3: import_lookup's strcmp
+ * was the runtime's second hot spot), since handlers look imports up by name at every call. The same first-match rule. */
+static int *g_imp_hash; static unsigned g_imp_mask;
+static unsigned imp_hash_name(const char *s) { unsigned h = 2166136261u; while (*s) h = (h ^ (unsigned char)*s++) * 16777619u; return h; }
+static int imp_undefined_index(const char *name) {
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT; BOOL pending;
+    InitOnceBeginInitialize(&once, 0, &pending, NULL);
+    if (pending) {
+        unsigned cap = 1024; while (cap < (unsigned)dyn_sym_count * 2u) cap <<= 1;
+        int *t = malloc(cap * sizeof *t);
+        if (t) {
+            for (unsigned i = 0; i < cap; i++) t[i] = -1;
+            for (int i = 0; i < dyn_sym_count; i++) {
+                if (dyn_syms[i].defined || !dyn_syms[i].name[0]) continue;
+                unsigned h = imp_hash_name(dyn_syms[i].name) & (cap - 1);
+                while (t[h] >= 0 && strcmp(dyn_syms[t[h]].name, dyn_syms[i].name) != 0) h = (h + 1) & (cap - 1);
+                if (t[h] < 0) t[h] = i;                   /* (the first of a name wins, as the scan did) */
+            }
+            g_imp_mask = cap - 1; g_imp_hash = t;
+        }
+        InitOnceComplete(&once, 0, NULL);
+    }
+    if (!g_imp_hash) {                                    /* (out of memory: the scan) */
+        for (int i = 0; i < dyn_sym_count; i++) if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0) return i;
+        return -1;
+    }
+    for (unsigned h = imp_hash_name(name) & g_imp_mask; g_imp_hash[h] >= 0; h = (h + 1) & g_imp_mask)
+        if (strcmp(dyn_syms[g_imp_hash[h]].name, name) == 0) return g_imp_hash[h];
+    return -1;
+}
 /* Handler currently registered for an imported function, or NULL (not imported / still a stub). */
 ImportFn import_lookup(const char *name) {
-    for (int i = 0; i < dyn_sym_count; i++)
-        if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0) return g_handlers[i];
-    return NULL;
+    int i = imp_undefined_index(name);
+    return i >= 0 ? g_handlers[i] : NULL;
 }
 
 static uint64_t *g_import_addr;                    /* per-symbol address override, 0 = use the placeholder */
@@ -546,10 +576,8 @@ void import_set_address(const char *name, void *addr) {
 /* Address of the placeholder that stands for a data symbol of another module (IMPORT_SLOT bytes,
  * zero-filled), so the host can give it its real value. NULL if the game does not import it. */
 void *import_data(const char *name) {
-    for (int i = 0; i < dyn_sym_count; i++)
-        if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0)
-            return (void *)(uintptr_t)(IMPORT_BASE + (uint64_t)i * IMPORT_SLOT);
-    return NULL;
+    int i = imp_undefined_index(name);
+    return i >= 0 ? (void *)(uintptr_t)(IMPORT_BASE + (uint64_t)i * IMPORT_SLOT) : NULL;
 }
 
 /* Guest address of a function or object that main itself defines and exports (malloc, free, aligned_alloc ...), 0 if
