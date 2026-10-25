@@ -173,6 +173,17 @@ static uint32_t exe_stamp(void) {
     return n && n < MAX_PATH && !stat(p, &st) ? (uint32_t)st.st_mtime : 0;
 #endif
 }
+/* the other game's exe stamp differs from ours: the log line, and (net4) once per stamp on screen: the two players run
+ * different builds of the game's program, which can desync a rollback match (testers 2026-10-25: one player updated) */
+static void stamp_note(uint32_t theirs) {
+    static uint32_t said;
+    if (theirs == exe_stamp()) return;
+    printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), theirs);
+    if (said == theirs) return;
+    said = theirs;
+    void menu_popup(const char *title, const char *text);
+    menu_popup("Online: different game versions", "The other player runs another build of ssbu_native.exe than you.\nRollback matches can go out of sync: both should use the same exe (build\\work\\ssbu_native.exe).");
+}
 int rbn_handshake_wanted(void) {
     static int w = -1;
     if (w < 0) { const char *e = getenv("SSBU_RB_NET"), *h = getenv("SSBU_RB_NET_HANDSHAKE");
@@ -437,7 +448,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
         if (phase == 0) { /* searching: nothing to send yet */ }
         else if (g_local == 0) {                             /* host: proposal = our choice + the joiner's */
             if (!g_hs_have_prop && g_hs_have_peer && lwr) {      /* (R3 lwr) the room's match: both games built it from the room; only the seed is new */
-                if (g_hs_peer.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_peer.exe_stamp);
+                stamp_note(g_hs_peer.exe_stamp);
                 if (g_hs_peer.m.chara[0] != mine->chara[0] || g_hs_peer.m.rule_kind != mine->rule_kind || g_hs_peer.m.stock != mine->stock) {
                     snprintf(g_hs_why, sizeof g_hs_why, "the room's match differs on the two games (player 1 %016llx here, %016llx there; rule kind %d / %d, stocks %d / %d)", (unsigned long long)mine->chara[0], (unsigned long long)g_hs_peer.m.chara[0], mine->rule_kind, g_hs_peer.m.rule_kind, mine->stock, g_hs_peer.m.stock);
                     g_hs_refused = 1; hs_refuse(g_hs_peer.nonce, g_hs_why);
@@ -447,7 +458,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
                 }
             }
             if (!g_hs_have_prop && g_hs_have_peer && !lwr) {
-                if (g_hs_peer.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_peer.exe_stamp);
+                stamp_note(g_hs_peer.exe_stamp);
                 RbhMatch m = *mine;
                 m.chara[1] = g_hs_peer.m.chara[0]; m.colour[1] = g_hs_peer.m.colour[0];
                 m.has_layout[1] = g_hs_peer.m.has_layout[0]; memcpy(m.layout[1], g_hs_peer.m.layout[0], sizeof m.layout[1]);
@@ -460,7 +471,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
             else if (g_hs_have_prop && now - last_tx >= 100) { last_tx = now; hs_send(&g_hs_prop, sizeof g_hs_prop); }
         } else {                                        /* joiner: our choice until the proposal comes */
             if (g_hs_have_prop) {
-                if (g_hs_prop.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_prop.exe_stamp);
+                stamp_note(g_hs_prop.exe_stamp);
                 *out = g_hs_prop.m; ok = 1;
             } else if (now - last_tx >= 100 && net_rb_ready()) { last_tx = now; RbhMsg c; hs_head(&c, RBH_CHOICE); c.m = *mine; hs_send(&c, sizeof c); }
         }
