@@ -922,6 +922,15 @@ static void restart_game(void) {
     GetCurrentDirectoryW(MAX_PATH, dir);
     swprintf(pid, 16, L"%lu", GetCurrentProcessId());
     SetEnvironmentVariableW(L"SSBU_RESTART_WAIT_PID", pid);
+    {   /* (net4) rollback is switched on by Play SSBU.bat (scripts/run.py: SSBU_RB_NET=net when graphics.ini has rollback = on),
+         * and the new copy inherits this one's environment: "Rollback netcode: ON" + Restart the game now kept rollback OFF
+         * (testers 2026-10-25: "he had it enabled and restarted", the room match used the game's own netcode). The new copy
+         * now gets the variable from the key as run.py would; a value set by hand (not "net") is left as it is. */
+        char v[16]; const char *cur = getenv("SSBU_RB_NET");
+        int on = ini_read("rollback", v, sizeof v) && !off_word(v);
+        if (on && !cur) SetEnvironmentVariableW(L"SSBU_RB_NET", L"net");
+        else if (!on && cur && !strcmp(cur, "net")) SetEnvironmentVariableW(L"SSBU_RB_NET", NULL);
+    }
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof si); si.cb = sizeof si;
