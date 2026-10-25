@@ -5,6 +5,7 @@ matches of one session: a line "m <n> id <match id>" starts match n, whose frame
 on its own (and the match ids too). Exit 0 = enough common frames in every match, with matching hashes and match ids.
 Empty logs never pass. --strict also requires identical, contiguous frame coverage from frame 1. No game content."""
 import argparse
+import re
 import sys
 
 
@@ -13,6 +14,8 @@ def read(path):
     with open(path, errors='replace') as src:
         for line, ln in enumerate(src, 1):
             p = ln.split()
+            if p and p[0] in ('m', 'f') and not ln.endswith('\n'):
+                raise ValueError('%s:%d: unterminated match/frame record' % (path, line))
             if p and p[0] == 'm':
                 if len(p) not in (2, 4) or (len(p) == 4 and p[2] != 'id'):
                     raise ValueError('%s:%d: malformed match record' % (path, line))
@@ -25,12 +28,13 @@ def read(path):
                 if len(p) != 4 or p[2] != 'h':
                     raise ValueError('%s:%d: malformed frame record' % (path, line))
                 frame = int(p[1])
-                if frame < 1 or not 0 <= int(p[3], 16) <= 0xffffffffffffffff:
+                if frame < 1 or not re.fullmatch(r'[0-9a-fA-F]{16}', p[3]):
                     raise ValueError('%s:%d: invalid frame or hash' % (path, line))
+                value = '%016x' % int(p[3], 16)
                 frames = out.setdefault(m, {})
-                if frame in frames and frames[frame] != p[3]:
+                if frame in frames and frames[frame] != value:
                     raise ValueError('%s:%d: conflicting hashes for frame %d' % (path, line, frame))
-                frames[frame] = p[3]
+                frames[frame] = value
     return out, ids
 
 
