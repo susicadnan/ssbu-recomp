@@ -1628,14 +1628,14 @@ void net_start(void) {
  *   delay, rollback_*  0: the game's own Local Wireless netcode is delay based and is not ours to measure (rollback, N1). */
 void net_stats_get(NetStats *o) {
     memset(o, 0, sizeof *o);
-    o->ping_ms = -1;
+    o->ping_ms = -1; o->jitter_ms = -1; o->loss_pct = -1;
     if (g_cfg <= 0) { o->state = NET_OFFLINE; return; }
     if (!g_joined) { o->state = net_lobby_gone() || g_reject[0] ? NET_DISCONNECTED : NET_CONNECTING; return; }
     o->state = NET_CONNECTED;
     {   /* R3: an online rollback match (rb_net.c / rb_rollback.c) fills delay and rollback; its own round trip */
-        int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk);
+        int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk); void rbn_link(int *jitter_ms, int *loss_pct);
         if (rbn_started()) {
-            rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms();
+            rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); rbn_link(&o->jitter_ms, &o->loss_pct);
             static LONG64 seen_d, seen_r; static int last_path;          /* (net4) the path of the messages sent since the last call */
             LONG64 d = g_rb_out_direct, r = g_rb_out_relay;
             if (d != seen_d) last_path = NET_PATH_DIRECT; else if (r != seen_r) last_path = NET_PATH_RELAYED;

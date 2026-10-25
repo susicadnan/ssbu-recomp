@@ -574,12 +574,56 @@ static int32_t g_tsq[TSQ]; static int g_tsq_n;          /* clock-offset samples 
 static int g_lockstep, g_my_lockd, g_peerdelay = -1;
 static volatile LONG g_peer_mode = -1;                 /* the other game's mode byte of this match (-1 = none seen yet) */
 static uint8_t my_mode(void) { return (uint8_t)((g_lockstep ? 0x80 : 0) | (g_my_lockd & 0x7f)); }
+/* (net4, 2026-10-25) every PADS message is sent a second time SSBU_RB_NET_REPEAT_MS later (default 8, half a frame; 0 = off)
+ * unless a newer one went out meanwhile: one lost datagram then delays the other player's input by 8 ms instead of a whole
+ * frame (the next frame's message repeats the pads, but a frame later), which at the auto delay is the difference between
+ * no rollback and one. About 100 bytes more per frame. The repeat goes from its own thread (a high-resolution timer). */
+static SRWLOCK g_rep_lock = SRWLOCK_INIT; static uint8_t g_rep_buf[RB_PADS_HEAD + RB_MAX_PADS_PER_MSG * RB_PAD_WIRE + 2]; static int g_rep_n; static LONG64 g_rep_seq, g_rep_sent;
+static HANDLE g_rep_ev; static int g_rep_ms = -1;
+static DWORD WINAPI repeat_thread(void *u) {
+    (void)u;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+    for (;;) {
+        WaitForSingleObject(g_rep_ev, INFINITE);
+        LONG64 seq = g_rep_seq;
+        if (tm) { LARGE_INTEGER d; d.QuadPart = -(LONGLONG)g_rep_ms * 10000; SetWaitableTimer(tm, &d, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, 100); } else Sleep((DWORD)g_rep_ms);
+        uint8_t b[sizeof g_rep_buf]; int n = 0;
+        AcquireSRWLockShared(&g_rep_lock);
+        if (g_rep_seq == seq && g_rep_n > 0) { n = g_rep_n; memcpy(b, g_rep_buf, (size_t)n); }
+        ReleaseSRWLockShared(&g_rep_lock);
+        if (n && g_started && net_rb_send(b, n)) InterlockedIncrement64(&g_rep_sent);
+    }
+    return 0;
+}
 static void send_msg(const RbMsg *m) {
     uint8_t b[RB_PADS_HEAD + RB_MAX_PADS_PER_MSG * RB_PAD_WIRE + 2];
     size_t n = rb_msg_build(b, sizeof b - 2, m);
     if (!n || g_loop) return;
     if (m->type == RB_MSG_PADS) { b[n++] = pads_tag(); b[n++] = my_mode(); }      /* (hs12) the match these pads belong to: pads of another match are dropped; (hs14) this game's mode byte */
     if (net_rb_send(b, (int)n)) InterlockedIncrement64(&g_tx_pkts); else InterlockedIncrement64(&g_tx_fail);
+    if (m->type == RB_MSG_PADS && m->count > 0) {
+        if (g_rep_ms < 0) { const char *e = getenv("SSBU_RB_NET_REPEAT_MS"); g_rep_ms = e ? atoi(e) : 8; if (g_rep_ms > 0) { g_rep_ev = CreateEventA(NULL, FALSE, FALSE, NULL); HANDLE th = CreateThread(NULL, 0, repeat_thread, NULL, 0, NULL); if (th) { SetThreadPriority(th, THREAD_PRIORITY_HIGHEST); CloseHandle(th); } else g_rep_ms = 0; } }
+        if (g_rep_ms > 0) {
+            AcquireSRWLockExclusive(&g_rep_lock);
+            memcpy(g_rep_buf, b, n); g_rep_n = (int)n; g_rep_seq++;
+            ReleaseSRWLockExclusive(&g_rep_lock);
+            SetEvent(g_rep_ev);
+        }
+    }
+}
+/* (net4) the link as seen from here, for the F2 overlay: jitter = the spread of the last 5 s of round trips (p90 - best, ms),
+ * loss = pings of the last 5 s without an answer (per cent). The pings go every 100 ms from the start. */
+#define LQ_N 64
+static long g_lq_rtt[LQ_N]; static int g_lq_i, g_lq_n; static volatile LONG g_lq_ping_sent, g_lq_pong_got; static uint64_t g_lq_win_t0; static LONG g_lq_sent_prev, g_lq_got_prev;
+static volatile LONG g_lq_loss_pct;
+static int cmp_long(const void *a, const void *b) { long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
+void rbn_link(int *jitter_ms, int *loss_pct) {
+    long v[LQ_N]; int n;
+    AcquireSRWLockExclusive(&g_rq_lock); n = g_lq_n; memcpy(v, g_lq_rtt, sizeof(long) * (size_t)n); ReleaseSRWLockExclusive(&g_rq_lock);
+    if (n < 5) { *jitter_ms = -1; *loss_pct = -1; return; }
+    qsort(v, (size_t)n, sizeof v[0], cmp_long);
+    *jitter_ms = (int)((v[n * 9 / 10] - v[0]) / 1000);
+    *loss_pct = g_lq_loss_pct;
 }
 /* net_relay.c's receive thread: one rollback message from the other player */
 void rbn_rx(const uint8_t *p, int n) {
@@ -601,8 +645,10 @@ void rbn_rx(const uint8_t *p, int n) {
         long rtt = (long)(now_us() - m.echo_us);
         if (rtt <= 0 || rtt >= 5000000) return;
         InterlockedExchange(&g_rtt_us, rtt); if (g_rtt_min_us < 0 || rtt < g_rtt_min_us) InterlockedExchange(&g_rtt_min_us, rtt);
+        InterlockedIncrement(&g_lq_pong_got);
         AcquireSRWLockExclusive(&g_rq_lock);
         g_rtt_sum += rtt; g_rtt_n++;
+        g_lq_rtt[g_lq_i] = rtt; g_lq_i = (g_lq_i + 1) % LQ_N; if (g_lq_n < LQ_N) g_lq_n++;      /* (net4) the last 5 s of round trips */
         if (g_started && m.frame > 0 && g_cur > 0 && g_tsq_n < TSQ) g_tsq[g_tsq_n++] = (int32_t)((g_cur - m.frame) * 16683 - rtt / 2);   /* > 0: this game runs ahead */
         ReleaseSRWLockExclusive(&g_rq_lock);
         return;
@@ -630,6 +676,14 @@ static DWORD WINAPI ping_thread(void *u) {
         if (!net_rb_ready()) continue;
         RbMsg m; memset(&m, 0, sizeof m); m.type = RB_MSG_PING; m.frame = (int32_t)g_cur; m.time_us = now_us();
         send_msg(&m);
+        InterlockedIncrement(&g_lq_ping_sent);
+        {   uint64_t t = GetTickCount64();                 /* (net4) every 5 s: the loss of the pings of that window (the answer to the last one may still be on the way: one less) */
+            if (!g_lq_win_t0) g_lq_win_t0 = t;
+            else if (t - g_lq_win_t0 >= 5000) {
+                LONG sent = g_lq_ping_sent - g_lq_sent_prev, got = g_lq_pong_got - g_lq_got_prev;
+                if (sent > 2) { LONG lost = sent - 1 - got; if (lost < 0) lost = 0; InterlockedExchange(&g_lq_loss_pct, (LONG)(100 * lost / (sent - 1))); }
+                g_lq_sent_prev = g_lq_ping_sent; g_lq_got_prev = g_lq_pong_got; g_lq_win_t0 = t;
+            } }
     }
     return 0;
 }
@@ -975,6 +1029,7 @@ void rbn_report(FILE *o, long long frames) {
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
     fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
+    { int j, l; rbn_link(&j, &l); fprintf(o, "[rbnet] report: pads repeated %d ms after the first send: %lld; link seen here: jitter %d ms, loss %d %%\n", g_rep_ms, (long long)g_rep_sent, j, l); }
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);

@@ -1390,6 +1390,11 @@ static void draw_stats(void) {
         if (ns.path == NET_PATH_DIRECT) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "direct to the other player");      /* (net4) */
         else if (ns.path == NET_PATH_RELAYED) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "through the lobby server (slower)");
         ImGui::Text("rollback %d / %d f", ns.rollback_last, ns.rollback_max);
+        if (ns.jitter_ms >= 0) {                                /* (net4) the link: jitter, loss, and a verdict */
+            const char *v = ns.loss_pct >= 5 ? "losing packets (wired? no downloads?)" : ns.jitter_ms >= 15 ? "jittery (Wi-Fi?)" : ns.jitter_ms >= 6 ? "ok" : "good";
+            ImVec4 c = ns.loss_pct >= 5 || ns.jitter_ms >= 15 ? ImVec4(1, 0.5f, 0.3f, 1) : ImVec4(0.6f, 0.9f, 0.6f, 1);
+            ImGui::TextColored(c, "jitter %d ms  loss %d %%  %s", ns.jitter_ms, ns.loss_pct < 0 ? 0 : ns.loss_pct, v);
+        }
     }
     ImGui::Text("run-ahead %s", !ra_cfg ? "off" : r1_ra_phase() ? "on (running)" : "on");
     ImGui::End();
