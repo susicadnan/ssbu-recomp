@@ -481,6 +481,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
     collect(c);
+    cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
@@ -494,7 +495,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 if (w2 ? g_ns2[pi] : g_ns1[pi]) continue;                    /* not simulation (a host stack) */
                 in[w2 ? g_rg_n1 + pi : pi] = 1;
                 if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING rebase: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
-                memcpy(sh, a, PG); copied++;
+                cp_add(sh, a); copied++;
                 if (!w2) g_dc[pi] = 0;
             } else if (nnx < 8192) {
                 if (nnx && nx[nnx - 1].a + nx[nnx - 1].n == a) nx[nnx - 1].n += PG;
@@ -502,6 +503,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
         }
     }
+    g_cp_cond = 1; cp_run(); g_cp_cond = 0;               /* (net4) compared and copied where they differ, in parallel */
     for (size_t id = 0; id < nwin; id++) {
         if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
         if (in[id]) continue;

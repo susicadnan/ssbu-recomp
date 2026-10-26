@@ -57,7 +57,7 @@ static void rbg_prebase(Ctx *c) {
     double t0 = now_ms(); int ok;
     if (!g_rg_ready) ok = r1_ring_capture(-1, c);
     else ok = r1_ring_rebase(-1, c);
-    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0;
+    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0; g_rbg_basefix = g_rbg_basefix < 0 ? 1 : g_rbg_basefix;
         LOG("r1: RB NET: PRE-BASE: the ring's base made before the fight (set-up %d, %s) in %.1f ms: the ready-go will only capture frame 0\n", setups, g_rg_ready ? "full save" : "rebase", now_ms() - t0); }
     else if (g_rg_nomem) LOG("r1: RB NET: PRE-BASE: not made (no memory): this match goes without the ring\n");
 }      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
@@ -202,7 +202,11 @@ static void rbg_step_body(Ctx *c) {
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
             if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
         if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
-        if (g_rbg_prebased) { if (!r1_ring_capture(i, c)) { LOG("r1: RB NET: the capture of frame %lld after the pre-base was refused: next pass\n", i); return; } LOG("r1: RB NET: frame %lld captured after the pre-base (no full save at the ready-go)\n", i); }      /* (net4) see rbg_prebase */
+        if (g_rbg_prebased) {                           /* (net4) see rbg_prebase: the base refreshed (every page that changed since: the loaders still wrote during the entrance; a plain capture here DESYNCED, p20) */
+            double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
+            if (!r1_ring_rebase(i, c)) { if (!g_rg_nomem) LOG("r1: RB NET: the base refresh at the ready-go was refused: next pass\n"); return; }
+            LOG("r1: RB NET: the base refreshed at the ready-go in %.1f ms (after the pre-base: no full save here)\n", now_ms() - tr);
+        }
         else if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
         else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
         g_rbg_noring = g_rg_nomem != 0;
