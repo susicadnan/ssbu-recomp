@@ -505,7 +505,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     r1_ring_let_go();
     r1_ring_release();
     if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
-    double t1 = now_ms();
+    double t1 = now_ms(); double tpre = t1;
     hs_exclude_all();
     int nmod = 0;
     {   HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -520,6 +520,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
     double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
+    double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
     if (!g_rg_fresh_ranges) collect(c);                   /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
     else live_late_merge();                               /* (net4 live) the join walked everything but the heap and merged the tracked heap commits; the last ones now, held */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
@@ -642,11 +643,11 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 if (k < ncw && !cw[k] && run0 == (size_t)-1) continue;
                 for (size_t pi = p0; pi < p1; pi++) {
                     int drop = cm[pi] && !in[base + pi];
-                    if (drop) { if (run0 == (size_t)-1) run0 = pi; cm[pi] = 0; dropped++; }
-                    else if (run0 != (size_t)-1) { VirtualFree(shb + run0 * PG, (pi - run0) * PG, MEM_DECOMMIT); run0 = (size_t)-1; }
+                    if (drop) { if (run0 == (size_t)-1) run0 = pi; dropped++; }
+                    else if (run0 != (size_t)-1) { memset(shb + run0 * PG, 0, (pi - run0) * PG); run0 = (size_t)-1; }      /* (net4) zeroed, kept committed: = the zero page a decommitted shadow page reads as, without 30000 decommit calls (p42: 45 ms) */
                 }
             }
-            if (run0 != (size_t)-1) VirtualFree(shb + run0 * PG, (np - run0) * PG, MEM_DECOMMIT);
+            if (run0 != (size_t)-1) memset(shb + run0 * PG, 0, (np - run0) * PG);
         }
     }
     free(in);
@@ -673,12 +674,12 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         g_rg_nx = npg;
     }
     double t2 = now_ms(); tq[nq++] = t2;
-    LOG("r1: RING rebase phases (ms): walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
+    LOG("r1: RING rebase phases (ms): stacks+modules+sweep %.0f, walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", tex, tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
-    fibers_save();
-    nvn_r1_cb_save();
-    rg_meta_capture(s, c);
+    double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
+    nvn_r1_cb_save(); double tf2 = now_ms();
+    rg_meta_capture(s, c); double tf3 = now_ms();
     if (g_rg_live_async && getenv("SSBU_R1_LIVE_VERIFY")) {      /* (research) threads still held: the shadow against the memory, every page of the ranges */
         cp_init(); size_t n = 0;
         for (int i = 0; i < g_nr; i++) { Rng *rr = &g_r[i]; for (size_t p = 0; p < rr->n / PG; p++) { uint8_t *a = rr->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || !cm[pi]) continue; if (cm == g_sh2c ? g_ns2[pi] : g_ns1[pi]) continue; cp_add(sh, a); n++; } }
@@ -686,7 +687,9 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL; for (size_t j = 0; j < n; j++) if (diff[j]) { nd++; if (shown < 12) { shown++; LOG("r1: LIVE VERIFY (held): differs: %s%s\n", where((uint8_t *)g_cj[j].s), is_async((uint8_t *)g_cj[j].s) ? " (async)" : ""); } } free(diff); }
         LOG("r1: LIVE VERIFY (held): %zu pages compared, %zu differ from the shadow at the end of the refresh\n", n, nd);
     }
+    double tl0 = now_ms();
     ls_rebase();                                          /* R4: the windows read-only again, the learned set emptied */
+    LOG("r1: RING rebase tail (ms): fibers %.0f, command buffers %.0f, meta %.0f, protection %.0f\n", tf1 - tf0, tf2 - tf1, tf3 - tf2, now_ms() - tl0);
     unpark();
     g_rg_caps++;
     LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f, copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
