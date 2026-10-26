@@ -123,7 +123,7 @@ static void add_range(uint8_t *a, size_t n) {
 }
 static int rw(DWORD p) { return (p & 0xff) == PAGE_READWRITE || (p & 0xff) == PAGE_EXECUTE_READWRITE; }
 /* the committed read-write parts of [lo, hi) */
-static long long g_walk_regions, g_walk_heap_regions; static double g_walk_heap_ms, g_walk_w2_ms;      /* (research) VirtualQuery calls / time of the last collect's walks */
+static long long g_walk_regions, g_walk_heap_regions; static double g_walk_heap_ms, g_walk_w2_ms, g_walk_dll_ms, g_walk_catch_ms, g_walk_ar_ms, g_walk_tls_ms, g_walk_sort_ms;      /* (research) VirtualQuery calls / time of the last collect's walks */
 static void add_span_1(uint8_t *lo, uint8_t *hi, Rng *out, int *n, int cap) {
     MEMORY_BASIC_INFORMATION m;
     for (uint8_t *p = lo; p < hi && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
@@ -249,8 +249,8 @@ static void collect(Ctx *c) {
     for (int i = 0; i < g_nheap; i++) if (!(g_collect_lite && g_win1 && g_heap_base[i] == g_win1)) add_span(g_heap_base[i], g_heap_base[i] + g_heap_span[i]);      /* (p54 timing) the reservation's size is known: add_alloc walked the 62 GB region once more just to find its end */
     double tw1 = now_ms(); rg0 = g_walk_regions;
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
-    g_walk_heap_ms = tw1 - tw0; g_walk_heap_regions = rg0; g_walk_w2_ms = now_ms() - tw1;
-    add_fighter_dlls();
+    g_walk_heap_ms = tw1 - tw0; g_walk_heap_regions = rg0; g_walk_w2_ms = now_ms() - tw1; double tw2 = now_ms();
+    add_fighter_dlls(); double tw3 = now_ms(); g_walk_dll_ms = tw3 - tw2;
     { size_t pmn; uint8_t *pm = ls_pool_meta(&pmn); if (pm && pmn) add_span(pm, pm + pmn); }      /* R4: the presentation pool's bookkeeping (rb_learned.c) */
     if (g_catch_addr && !getenv("SSBU_R1_NO_CATCH")) {     /* nnunwind.c: the catch frames (guest CFA -> host jmp_buf) */
         size_t before = 0, after = 0; for (int i = 0; i < g_nr; i++) before += g_r[i].n;
@@ -259,12 +259,17 @@ static void collect(Ctx *c) {
         for (int i = 0; i < g_nr; i++) after += g_r[i].n;
         static int said; if (!said++ || after - before < 8192 * 16) LOG("r1: the catch table (%u KB) is in the state with %.1f KB%s\n", 8192 * 16 / 1024, (after - before) / 1024.0, after - before < 8192 * 16 ? ": NOT ALL OF IT (pages never written are copy-on-write; hs15)" : "");
     }
-    if (g_ar) add_alloc(g_ar);
+    double tw4 = now_ms(); g_walk_catch_ms = tw4 - tw3;
+    {   int ar_heap = 0; for (int i = 0; i < g_nheap; i++) if (g_heap_base[i] == g_ar) ar_heap = 1;      /* (p57 timing) the arena is one of the >= 16 GB reservations walked above: not walked again */
+        if (g_ar && !ar_heap) add_alloc(g_ar); }
+    double tw5 = now_ms(); g_walk_ar_ms = tw5 - tw4;
     add_alloc((void *)(uintptr_t)c->x[31]);
     add_alloc((void *)(uintptr_t)c->tpidr);
     Ctx *tc; const char *nm; HANDLE h;
     for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) if (tc->tpidr) add_alloc((void *)(uintptr_t)tc->tpidr);
+    double tw6 = now_ms(); g_walk_tls_ms = tw6 - tw5;
     qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
+    g_walk_sort_ms = now_ms() - tw6;
     int o = 0;                                        /* drop duplicates (two threads in one block) */
     for (int i = 0; i < g_nr; i++) {
         if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) continue;
