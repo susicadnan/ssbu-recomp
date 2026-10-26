@@ -1222,7 +1222,7 @@ static int mark_setup_finish(void) {
  * (the full save with the game held, at the ready-go). rb_rollback.c rbg_prebase starts it, rbg_step_body finishes it
  * through r1_ring_live_finish (r1_ring.c). */
 static volatile LONG g_cp_tolerant, g_cp_skipped;         /* (defined with the copy threads below; tentative here) */
-static volatile LONG g_live_stop, g_live_second, g_live_joined; static HANDLE g_live_th; static Ctx g_live_ctx; static double g_live_t0, g_live_copy_ms, g_live_walk_t;
+static volatile LONG g_live_stop, g_live_second, g_live_joined, g_rt_merged; static HANDLE g_live_th; static Ctx g_live_ctx; static double g_live_t0, g_live_copy_ms, g_live_walk_t;
 static int g_live_walks;
 #define RT_N 8192
 static uint8_t *g_rt_a[RT_N]; static size_t g_rt_n_[RT_N]; static uint8_t g_rt_d[RT_N]; static volatile LONG g_rt_n, g_rt_over, g_rt_on;
@@ -1317,13 +1317,21 @@ int r1_live_base_join(void) {
     InterlockedExchange(&g_live_stop, 1);
     double tw = now_ms();
     if (g_live_th) { DWORD w = WaitForSingleObject(g_live_th, 8000); if (w != WAIT_OBJECT_0) { LOG("r1: LIVE BASE: the worker did not finish in 8 s: not used\n"); g_live_joined = -1; return 0; } CloseHandle(g_live_th); g_live_th = NULL; }
-    g_rt_on = 0;
-    if (g_live_state != 3) { g_live_joined = -1; return 0; }
+    if (g_live_state != 3) { g_rt_on = 0; g_live_joined = -1; return 0; }
     int merged = 0, cut = 0;
-    if (g_rt_over) { collect(&g_live_ctx); merged = -1; }
+    if (g_rt_over) { g_rt_on = 0; collect(&g_live_ctx); merged = -1; }
     else {
+        /* (p38 bisect: the worker's list alone crashed, a held collect() at the ready-go did not) everything but window 1 is
+         * walked again now (cheap: window 2, the malloc arena, stacks, TLS, the catch table: what nothing tracks); window 1
+         * (the 62 GB heap: a 200 ms walk) comes from the worker's last walk plus the tracked commits and decommits, which
+         * nnsdk.c reports for that heap. The tracking stays on until the refresh (held) merges the last ones: live_late_merge. */
+        static Rng w1[MAXR]; int nw1 = 0;
+        for (int i = 0; i < g_nr; i++) if (g_win1 && g_r[i].a >= g_win1 && g_r[i].a < g_win1 + g_wn1 && nw1 < MAXR) w1[nw1++] = g_r[i];
+        g_collect_lite = 1; collect(&g_live_ctx); g_collect_lite = 0;
+        for (int i = 0; i < nw1 && g_nr < MAXR; i++) { g_r[g_nr] = w1[i]; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; }
         LONG n = g_rt_n; if (n > RT_N) n = RT_N;
         for (LONG i = 0; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; merged++; }
+        g_rt_merged = n;
         qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
         int o = 0;                                       /* overlaps joined */
         for (int i = 0; i < g_nr; i++) {
@@ -1348,6 +1356,37 @@ int r1_live_base_join(void) {
     LOG("r1: LIVE BASE: joined at the ready-go after %.1f s (copy %.0f ms, %d walks, waited %.0f ms); commits since the last walk: %s, decommits cut %d\n", (now_ms() - g_live_t0) / 1000.0, g_live_copy_ms, g_live_walks, now_ms() - tw, merged < 0 ? "too many: walked again" : "merged", cut);
     g_live_joined = 1;
     return 1;
+}
+/* (held, from r1_ring_rebase with fresh ranges) the commits and decommits tracked since the join merged, the tracking off */
+static void live_late_merge(void) {
+    LONG n = g_rt_n; if (n > RT_N) n = RT_N; LONG from = g_rt_merged; int added = 0, cut = 0;
+    g_rt_on = 0;
+    if (g_rt_over) { collect(&g_live_ctx); LOG("r1: LIVE BASE: late merge: too many tracked commits: walked again (held)\n"); return; }
+    for (LONG i = from; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; added++; }
+    if (added) {
+        qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
+        int o = 0;
+        for (int i = 0; i < g_nr; i++) {
+            if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) { uint8_t *e = g_r[i].a + g_r[i].n; if (e > g_r[o - 1].a + g_r[o - 1].n) g_r[o - 1].n = (size_t)(e - g_r[o - 1].a); continue; }
+            g_r[o++] = g_r[i];
+        }
+        g_nr = o;
+    }
+    for (LONG i = from; i < n; i++) if (g_rt_d[i]) {
+        uint8_t *lo = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *hi = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
+        for (int k = 0; k < g_nr; k++) {
+            Rng *r = &g_r[k]; uint8_t *a = r->a, *b = r->a + r->n;
+            if (hi <= a || lo >= b) continue;
+            cut++;
+            if (lo > a && hi < b && g_nr < MAXR) { memmove(&g_r[k + 2], &g_r[k + 1], (size_t)(g_nr - k - 1) * sizeof g_r[0]); g_nr++; g_r[k + 1].a = hi; g_r[k + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a); }
+            else if (lo <= a && hi >= b) r->n = 0;
+            else if (lo <= a) { r->a = hi; r->n = (size_t)(b - hi); }
+            else r->n = (size_t)(lo - a);
+        }
+    }
+    if (cut) { int o2 = 0; for (int i = 0; i < g_nr; i++) if (g_r[i].n) g_r[o2++] = g_r[i]; g_nr = o2; }
+    g_rt_merged = n;
+    LOG("r1: LIVE BASE: late merge (held): %d commits added, %d decommits cut since the join\n", added, cut);
 }
 void r1_live_base_abort(void) {                         /* the match did not come (or is over): the worker stopped, nothing kept */
     if (g_live_state == 1 || g_live_state == 2) { InterlockedExchange(&g_live_stop, 1); if (g_live_th) { WaitForSingleObject(g_live_th, 8000); CloseHandle(g_live_th); g_live_th = NULL; } }
