@@ -305,7 +305,11 @@ static int g_lwr_mode_set;                                   /* (net4) the melee
 void debug_lwr_mode_back(void) {
     if (!g_lwr_mode_set) return;
     g_lwr_mode_set = 0;
-    { const char *e = getenv("SSBU_RB_NET_ROOM_MODE_BACK"); if (e && e[0] == '0') return; }
+    /* (net4, 2026-10-25 20:44, a real match) with the mode back to 1 AND the other player's OK press forwarded (menu mode) the
+     * result screen went on and the game CRASHED in its own code (f_710134c690 read address 8: the Local Wireless match
+     * objects that this match never made). Default OFF now: the screens stay a local match's, the forwarded OK presses end
+     * them. SSBU_RB_NET_ROOM_MODE_BACK=1: the mode back (test). */
+    { const char *e = getenv("SSBU_RB_NET_ROOM_MODE_BACK"); if (!(e && e[0] == '1')) { printf("[rbnet] room match over: melee mode left at 0 (local): the result screens end by the exchanged OK presses\n"); fflush(stdout); return; } }
     uint8_t was = rd8(MELEE_INFO); wr8(MELEE_INFO, 1);
     uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
     uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t was_fm = impl ? rd8(impl + 0xc0) : 0;
