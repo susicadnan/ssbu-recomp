@@ -629,11 +629,25 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         LOG("r1: RING live async: %zu pages written by host threads during a 30 ms hold (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
     }
     tq[nq++] = now_ms();
-    for (size_t id = 0; id < nwin; id++) {
-        if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
-        if (in[id]) continue;
-        int w2 = id >= g_rg_n1; size_t pi = w2 ? id - g_rg_n1 : id; uint8_t *cm = w2 ? g_sh2c : g_sh1c;
-        if (cm[pi]) { VirtualFree((w2 ? g_sh2 : g_sh1) + pi * PG, PG, MEM_DECOMMIT); cm[pi] = 0; dropped++; }
+    {   /* (net4, p41 timing: this pass took 100 ms as a plain loop over 18 M entries) word-wise: the index is mostly RG_FLAT (0) and
+         * most shadow pages are absent, so zero words are skipped; the shadow pages dropped are decommitted a run at a time */
+        const uint64_t *iw = (const uint64_t *)g_rg_idx; size_t niw = nwin / 2;
+        for (size_t k = 0; k < niw; k++) if (iw[k]) for (size_t id = 2 * k; id < 2 * k + 2; id++) if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
+        if (nwin & 1) { size_t id = nwin - 1; if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; } }
+        for (int w2 = 0; w2 < 2; w2++) {
+            uint8_t *cm = w2 ? g_sh2c : g_sh1c, *shb = w2 ? g_sh2 : g_sh1; size_t np = w2 ? g_rg_n2 : g_rg_n1, base = w2 ? g_rg_n1 : 0;
+            const uint64_t *cw = (const uint64_t *)cm; size_t ncw = np / 8, run0 = (size_t)-1;
+            for (size_t k = 0; k <= ncw; k++) {
+                size_t p0 = k * 8, p1 = k < ncw ? p0 + 8 : np;
+                if (k < ncw && !cw[k] && run0 == (size_t)-1) continue;
+                for (size_t pi = p0; pi < p1; pi++) {
+                    int drop = cm[pi] && !in[base + pi];
+                    if (drop) { if (run0 == (size_t)-1) run0 = pi; cm[pi] = 0; dropped++; }
+                    else if (run0 != (size_t)-1) { VirtualFree(shb + run0 * PG, (pi - run0) * PG, MEM_DECOMMIT); run0 = (size_t)-1; }
+                }
+            }
+            if (run0 != (size_t)-1) VirtualFree(shb + run0 * PG, (np - run0) * PG, MEM_DECOMMIT);
+        }
     }
     free(in);
     if (g_rg_fast_refresh) LOG("r1: RING refresh: %zu window-1 pages written since the pre-base (%.1f MB) and window 2 (%zu pages compared) into the shadow; the extras listed again below\n", ww_pages, ww_pages * (double)PG / 1048576.0, copied - ww_pages);
