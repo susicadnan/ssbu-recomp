@@ -570,6 +570,15 @@ static void rbg_match_report(void) {
         fprintf(f, "OpenSmash match report  %s  (player %d of 2, other player: %s)\n\n", when, rbn_local_player() + 1, net_peer_name());
         fprintf(f, "Link      round trip %.0f ms (best %.0f), jitter %d ms, loss %d %%, %s\n", rtt_mean, rtt_best, jitter < 0 ? 0 : jitter, loss < 0 ? 0 : loss, path == 1 ? "DIRECT between the two PCs" : path == 2 ? "RELAYED through the lobby server" : "path unknown");
         fprintf(f, "Delay     %d frames of input delay (%.0f ms)\n", rbn_delay(), rbn_delay() * 1000.0 / 60.0);
+        {   /* (owner 2026-10-26: "responsiveness and smoothness need separate scores") responsiveness = what netplay adds to the
+             * game's own input-to-screen time (the same offline and online): the delay frames, nothing else (a rollback re-runs
+             * the past, it does not delay the present). Smoothness = how often the picture jumps or stalls. */
+            int d = rbn_delay(); double rbpm = g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0;
+            const char *resp = d <= 1 ? "like offline" : d == 2 ? "very good (one frame more than offline)" : d == 3 ? "good (two frames more than offline)" : d <= 5 ? "noticeable" : "heavy";
+            const char *smooth = rbpm < 3 && over < 60 ? "smooth" : rbpm < 15 && over < 300 ? "mostly smooth (a jump now and then)" : "stuttery";
+            fprintf(f, "Responsiveness  +%.0f ms over offline from the %d delay frames: %s. A lower rollback_delay in graphics.ini trades this for more rollbacks.\n", d * 1000.0 / 60.0, d, resp);
+            fprintf(f, "Smoothness      %.1f rollbacks per minute, %.0f late frames: %s\n", rbpm, over, smooth);
+        }
         fprintf(f, "Rollbacks %lld in %lld frames (%.1f per minute), longest %d frames; waits for the other player %lld (%.0f ms in all)\n", g_rbg_rb, g_rbg_real, g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0, (int)g_rbg_max_k, g_rbg_stalls, g_rbg_stall_ms);
         fprintf(f, "Frames    mean %.2f ms, p90 %.2f, p99 %.2f (16.67 = perfect); frames later than 20 ms: %.0f of %d\n", mean, p90, p99, over, g_rbg_ng);
         fprintf(f, "Packets   sent %lld, received %lld, repeats %lld; desyncs %lld\n", tx, rx, repeats, desyncs);
