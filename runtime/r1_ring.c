@@ -488,8 +488,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
-    if (!g_rg_fast_refresh) collect(c);
-    else { g_collect_lite = 1; collect(c); g_collect_lite = 0; }      /* (net4) everything but the 62 GB heap walk: window 2, the extras (malloc arena, stacks, TLS, fighter DLL data, catch table) listed again (p22 crashed: the pre-base's extras list missed what the match start allocated) */
+    collect(c);                                           /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed); the walk is ~200 ms of the refresh */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
