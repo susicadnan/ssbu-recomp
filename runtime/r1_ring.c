@@ -524,7 +524,24 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     g_rg_ntl = 0;
     double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
     double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
+    static Rng *prev_r; static int prev_nr; static int diff_on = -1;
+    if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
+    if (diff_on && walk_th && prev_r) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list before the walk replaces it */
     if (walk_th) { WaitForSingleObject(walk_th, INFINITE); CloseHandle(walk_th); }      /* (the walk, see above) */
+    if (diff_on && walk_th && prev_r && g_win1) {       /* (research, SSBU_R1_WALK_DIFF) window-1 pages the walk has and the worker's list (last walk + tracked commits) has not */
+        size_t miss = 0, shown = 0; uint8_t *run_a = NULL; size_t run_n = 0;
+        for (int i = 0; i < g_nr; i++) {
+            Rng *r = &g_r[i]; if (r->a < g_win1 || r->a >= g_win1 + g_wn1) continue;
+            for (size_t p = 0; p < r->n / PG; p++) {
+                uint8_t *a = r->a + p * PG; int have = 0;
+                for (int k = 0; k < prev_nr && !have; k++) if (a >= prev_r[k].a && a < prev_r[k].a + prev_r[k].n) have = 1;
+                if (have) { if (run_n) { if (shown++ < 12) LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list\n", where(run_a), run_n); run_n = 0; } continue; }
+                miss++; if (!run_n) run_a = a; run_n++;
+            }
+            if (run_n) { if (shown++ < 12) LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list\n", where(run_a), run_n); run_n = 0; }
+        }
+        LOG("r1: WALK DIFF: %zu window-1 pages the walk found that the worker's list did not have\n", miss);
+    }
     else if (!g_rg_fresh_ranges) collect(c);              /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
     else live_late_merge();                               /* (net4 live) the join walked everything but the heap and merged the tracked heap commits; the last ones now, held */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
@@ -640,20 +657,18 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         const uint64_t *iw = (const uint64_t *)g_rg_idx; size_t niw = nwin / 2;
         for (size_t k = 0; k < niw; k++) if (iw[k]) for (size_t id = 2 * k; id < 2 * k + 2; id++) if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
         if (nwin & 1) { size_t id = nwin - 1; if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; } }
+        static uint8_t zero_page[PG];                    /* (p45 timing) the dropped shadow pages zeroed by the copy threads, a page a job (one memset of ~130 MB took ~35 ms) */
+        cp_init();
         for (int w2 = 0; w2 < 2; w2++) {
             uint8_t *cm = w2 ? g_sh2c : g_sh1c, *shb = w2 ? g_sh2 : g_sh1; size_t np = w2 ? g_rg_n2 : g_rg_n1, base = w2 ? g_rg_n1 : 0;
-            const uint64_t *cw = (const uint64_t *)cm; size_t ncw = np / 8, run0 = (size_t)-1;
+            const uint64_t *cw = (const uint64_t *)cm; size_t ncw = np / 8;
             for (size_t k = 0; k <= ncw; k++) {
                 size_t p0 = k * 8, p1 = k < ncw ? p0 + 8 : np;
-                if (k < ncw && !cw[k] && run0 == (size_t)-1) continue;
-                for (size_t pi = p0; pi < p1; pi++) {
-                    int drop = cm[pi] && !in[base + pi];
-                    if (drop) { if (run0 == (size_t)-1) run0 = pi; dropped++; }
-                    else if (run0 != (size_t)-1) { memset(shb + run0 * PG, 0, (pi - run0) * PG); run0 = (size_t)-1; }      /* (net4) zeroed, kept committed: = the zero page a decommitted shadow page reads as, without 30000 decommit calls (p42: 45 ms) */
-                }
+                if (k < ncw && !cw[k]) continue;
+                for (size_t pi = p0; pi < p1; pi++) if (cm[pi] && !in[base + pi]) { cp_add(shb + pi * PG, zero_page); dropped++; }      /* zeroed, kept committed: = the zero page a decommitted shadow page reads as */
             }
-            if (run0 != (size_t)-1) memset(shb + run0 * PG, 0, (np - run0) * PG);
         }
+        cp_run();
     }
     free(in);
     if (g_rg_fast_refresh) LOG("r1: RING refresh: %zu window-1 pages written since the pre-base (%.1f MB) and window 2 (%zu pages compared) into the shadow; the extras listed again below\n", ww_pages, ww_pages * (double)PG / 1048576.0, copied - ww_pages);
