@@ -446,7 +446,7 @@ static void rbg_match_report_atexit(void) { if (g_rbg_in_match == 1) rbg_match_r
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
-    if (g_rbg_in_match == 1) { rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
+    if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */

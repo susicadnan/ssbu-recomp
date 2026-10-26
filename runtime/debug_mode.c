@@ -279,6 +279,23 @@ static uint64_t hash40(const char *s) {
  * Both games force + 0x454 = 1 with the agreed layout of each player, so a player's own controls are the same on both PCs. */
 #include "rb_hs.h"
 static int g_hs_wanted, g_hs_ok, g_hs_local, g_hs_lwr;      /* (R3 lwr) g_hs_lwr: a Local Wireless room's match played with rollback */
+static int g_lwr_mode_set;                                   /* (net4) the melee mode of the match block was made 0 for this room match */
+/* (net4, 2026-10-25, real players: "when the match is done we can't get out of the lobby, we both wait for the other to confirm")
+ * the room match's melee mode stayed 0 (local) after the fight, so the result screens of both games ran as a local match's and
+ * neither told the other player's game it was done (the room's screens expect mode 1). rb_rollback.c calls this at the fight's
+ * end: the mode is 1 again (match block + 0 and the FighterManager's copy at impl + 0xc0, when the manager is there).
+ * SSBU_RB_NET_ROOM_MODE_BACK=0: not restored (the old way). */
+void debug_lwr_mode_back(void) {
+    if (!g_lwr_mode_set) return;
+    g_lwr_mode_set = 0;
+    { const char *e = getenv("SSBU_RB_NET_ROOM_MODE_BACK"); if (e && e[0] == '0') return; }
+    uint8_t was = rd8(MELEE_INFO); wr8(MELEE_INFO, 1);
+    uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+    uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t was_fm = impl ? rd8(impl + 0xc0) : 0;
+    if (impl) wr8(impl + 0xc0, 1);
+    printf("[rbnet] room match over: melee mode (match block + 0) %u -> 1, FighterManager impl + 0xc0 %u -> %s: the room's result screens again\n", was, was_fm, impl ? "1" : "(no manager)");
+    fflush(stdout);
+}
 static RbhMatch g_hs_m;
 /* (hs12) player 1's panel state as the game's function got it (before any change here): the template of player 2's state
  * when the select screen had NO panel for player 2 (each player picks only his own fighter; the other game's player is
@@ -417,6 +434,7 @@ static void hs_apply(uint64_t st, int idx, uint32_t type_was) {
         }
     }
     if (!g_hs_ok || idx < 0 || idx > 1) return;
+    if (g_hs_lwr) g_lwr_mode_set = 1;
     if (g_hs_lwr) {                                     /* (R3 lwr) the players' fighters, colours, rules are the room's own (the same on both PCs) */
         /* Which controller drives a player: state + 0x210 = the controller slot (the record builder reads the controller object
          * 0x7105338860[state + 0x210]). In the room's records this game's own player has slot 0 (its name tag, + 0x450) and the
