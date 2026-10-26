@@ -460,6 +460,22 @@ int r1_ring_capture(long long frame, Ctx *c) {
  * frame (threads, fibers, command buffers as a capture). 1 = done; 0 = not now (a thread not at a wait: next pass). */
 static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; }
 static DWORD WINAPI rg_walk_thread(void *p) { collect((Ctx *)p); return 0; }
+/* (net4 live, p46 timing) the 30 ms window in which the HOST threads' writes are found (the guest threads are held): a
+ * helper thread sleeps 30 ms from the hold and reads the write watch, while this thread scans; its pages are both copied
+ * (they changed) and left out of the state (async). Reading at the END of the refresh instead (p46) found 5000 pages in
+ * 300+ ms: too many, too slow. */
+static void **g_aw_pages; static ULONG_PTR g_aw_n; static volatile LONG g_aw_fail;
+static DWORD WINAPI rg_async_window_thread(void *p) {
+    (void)p; static const ULONG_PTR cap = 1u << 18;
+    if (!g_aw_pages) g_aw_pages = malloc(cap * sizeof *g_aw_pages);
+    g_aw_n = 0; g_aw_fail = 0;
+    if (!g_aw_pages || !g_win1) { g_aw_fail = 1; return 0; }
+    Sleep(30);
+    ULONG_PTR cnt = cap; DWORD gran = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, g_aw_pages, &cnt, &gran)) { g_aw_fail = 1; return 0; }
+    g_aw_n = cnt;
+    return 0;
+}
 /* (net4) the FAST REFRESH after a pre-base (rb_rollback.c rbg_prebase): the game's region is reserved with MEM_WRITE_WATCH
  * (nnsdk.c), so at the ready-go the OS names every page of window 1 written since the pre-base by ANY thread (the loaders
  * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
@@ -508,6 +524,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
     double t1 = now_ms(); double tpre = t1;
     HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
+    HANDLE aw_th = NULL;
+    if (g_rg_live_async && g_win1) { ResetWriteWatch(g_win1, g_wn1); aw_th = CreateThread(NULL, 0, rg_async_window_thread, NULL, 0, NULL); }      /* (see rg_async_window_thread) */
     if (!g_rg_fresh_ranges) { walk_ctx = *c; walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
     int nmod = 0;
@@ -549,7 +567,14 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
     tq[nq++] = now_ms();
-    int ww_fail = 0; size_t ww_pages = 0;
+    int ww_fail = 0; size_t ww_pages = 0, aw_pages = 0;
+    if (aw_th) { WaitForSingleObject(aw_th, INFINITE); CloseHandle(aw_th); aw_th = NULL;
+        if (!g_aw_fail) for (ULONG_PTR k = 0; k < g_aw_n; k++) {
+            uint8_t *a = g_aw_pages[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+            if (g_dc[pi] || g_ns1[pi]) continue;
+            async_add(a); aw_pages++;
+            uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) cp_add(sh, a);
+        } }
     if (g_rg_fast_refresh) {
         /* (p35 bisect) window 1's shadow pages of pages NOT committed now are dropped (in[] from the ranges, in the loop below), as
          * the slow rebase does: after a live copy over the loading screen, ~30000 shadow pages held old loader buffers whose
@@ -621,23 +646,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
          * (audio, loaders) write while the guest threads are held are not the simulation's: left out of the state (is_async:
          * the sweep and the protection skip them), or a load rolls their data back under those threads (p30 crashed at its
          * first load). Window 1 by the write watch, window 2 by a compare against the shadow just filled. */
-        double ta = now_ms(); size_t n1 = 0, n2 = 0;
-        /* (p44 timing) no pause: the host threads have been writing for the whole held refresh so far (>= 60 ms); what they wrote
-         * since the write-watch read above is theirs (the guest threads are held) */
-        if (g_win1) {
-            static void **wwa; static const ULONG_PTR capa = 1u << 18; if (!wwa) wwa = malloc(capa * sizeof *wwa);
-            for (int round = 0; wwa && round < 64; round++) {
-                ULONG_PTR cnt = capa; DWORD gran = 0;
-                if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, wwa, &cnt, &gran)) break;
-                for (ULONG_PTR k = 0; k < cnt; k++) {
-                    uint8_t *a = wwa[k]; size_t pi = (size_t)(a - g_win1) >> 12;
-                    if (g_ns1[pi] || g_dc[pi]) continue;
-                    async_add(a); n1++;
-                    uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) memcpy(sh, a, PG);
-                }
-                if (cnt < capa) break;
-            }
-        }
+        double ta = now_ms(); size_t n1 = aw_pages, n2 = 0;      /* window 1: the helper's 30 ms window (above); window 2: compared again now */
         cp_init();
         for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31); its own ranges only (p44: the loop over every range cost 35 ms) */
             Rng *r = &g_r[i];
