@@ -519,12 +519,14 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
+    double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
     if (!g_rg_fresh_ranges) collect(c);                   /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
     else live_late_merge();                               /* (net4 live) the join walked everything but the heap and merged the tracked heap commits; the last ones now, held */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
+    tq[nq++] = now_ms();
     int ww_fail = 0; size_t ww_pages = 0;
     if (g_rg_fast_refresh) {
         /* (p35 bisect) window 1's shadow pages of pages NOT committed now are dropped (in[] from the ranges, in the loop below), as
@@ -547,6 +549,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         }
         if (ww_fail) { LOG("r1: RING refresh: GetWriteWatch FAILED (error %lu): the slow rebase instead\n", GetLastError()); g_rg_fast_refresh = 0; g_rg_ntl = 0; collect(c); memset(in, 0, nwin); cp_init(); }
     }
+    tq[nq++] = now_ms();
     for (int i = 0; i < g_nr; i++) {                      /* (fast refresh: g_r holds window 2 and the extras only; window 1 pages of it, if any, are skipped) */
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
@@ -574,6 +577,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
         }
     }
+    tq[nq++] = now_ms();
     if (g_rg_fast_refresh && g_rg_live_async && !g_rt_over) {      /* (p35 bisect) the pages of every commit tracked since the live copy started: copied again where they differ (a page freed and committed again holds zeros the write watch never saw) */
         LONG n = g_rt_n; if (n > RT_N) n = RT_N; size_t again = 0;
         for (LONG i = 0; i < n; i++) if (!g_rt_d[i]) {
@@ -587,7 +591,9 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         }
         LOG("r1: RING refresh: %zu pages of the commits tracked since the live copy compared again\n", again);
     }
+    tq[nq++] = now_ms();
     g_cp_cond = 1; cp_run(); g_cp_cond = 0;               /* (net4) compared and copied where they differ, in parallel */
+    tq[nq++] = now_ms();
     if (g_rg_live_async) {
         /* (net4 live) what the held full save finds in its 30 ms pause and the live copy never did: the pages the HOST threads
          * (audio, loaders) write while the guest threads are held are not the simulation's: left out of the state (is_async:
@@ -622,6 +628,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             else cp_init(); }
         LOG("r1: RING live async: %zu pages written by host threads during a 30 ms hold (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
     }
+    tq[nq++] = now_ms();
     for (size_t id = 0; id < nwin; id++) {
         if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
         if (in[id]) continue;
@@ -651,7 +658,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         }
         g_rg_nx = npg;
     }
-    double t2 = now_ms();
+    double t2 = now_ms(); tq[nq++] = t2;
+    LOG("r1: RING rebase phases (ms): walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     fibers_save();
