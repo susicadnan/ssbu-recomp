@@ -1065,7 +1065,7 @@ static void mark_undo(void) {
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
 static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
 static int mark_setup(void) {
-    size_t big = 0; uint8_t *base = NULL;
+    size_t big = 0; uint8_t *base = NULL; double ms0 = now_ms(), ms_commit = 0, ms_copy = 0, ms_drop = 0, ms_x;
     for (int i = 0; i < g_nheap; i++) {
         MEMORY_BASIC_INFORMATION m; uint8_t *p = g_heap_base[i];
         while (VirtualQuery(p, &m, sizeof m) && m.AllocationBase == g_heap_base[i]) p = (uint8_t *)m.BaseAddress + m.RegionSize;
@@ -1080,7 +1080,7 @@ static int mark_setup(void) {
     if (!g_sh1 || !g_sh1c || !g_dc || !g_ns1 || !g_ns2 || !g_sh2 || !g_sh2c) { LOG("r1: MARK setup: allocation of the shadow / its maps FAILED: marks OFF\n"); mark_undo(); return 0; }
     hs_exclude_all();
     g_nx = 0; g_xbytes = 0;
-    size_t shb = 0;
+    size_t shb = 0; ms_x = now_ms();
     for (int i = 0; i < g_nr; i++) {                    /* the extras: the runs of pages outside both windows */
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
@@ -1102,9 +1102,10 @@ static int mark_setup(void) {
             Rng *r = &g_r[i]; size_t np = r->n / PG;
             {   /* (net4) the shadow of this range committed in one call (it was 64 KB at a time); per page again if that fails */
                 uint8_t *cm0; size_t pi0; uint8_t *sh0 = in_shadow(r->a, &cm0, &pi0);
-                if (sh0 && np && rb_test_nomem() != 4) { size_t k = 0; while (k < np && cm0[pi0 + k]) k++;          /* (the first pages may be committed already) */
-                    if (k < np && VirtualAlloc(sh0 + k * PG, (np - k) * PG, MEM_COMMIT, PAGE_READWRITE)) memset(cm0 + pi0 + k, 1, np - k); }
+                if (sh0 && np && rb_test_nomem() != 4) { size_t k = 0; double tc = now_ms(); while (k < np && cm0[pi0 + k]) k++;          /* (the first pages may be committed already) */
+                    if (k < np && VirtualAlloc(sh0 + k * PG, (np - k) * PG, MEM_COMMIT, PAGE_READWRITE)) memset(cm0 + pi0 + k, 1, np - k); ms_commit += now_ms() - tc; }
             }
+            double tcp = now_ms();
             for (size_t p = 0; p < np; p++) {
                 uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
                 if (sh) {
@@ -1115,9 +1116,11 @@ static int mark_setup(void) {
                     if (cx < g_nx && g_x[cx].a + xo == a) { memcpy(g_x[cx].b + xo, r->s + p * PG, PG); xo += PG; }
                 }
             }
-            cp_run();
+            cp_run(); ms_copy += now_ms() - tcp; tcp = now_ms();
             if (g_rs_drop) { VirtualFree(r->s, np * PG, MEM_DECOMMIT); dropped += (long long)np; }      /* the copy given back, this range's at a time */
+            ms_drop += now_ms() - tcp;
         }
+        LOG("r1: MARK setup timing: windows + maps %.1f ms, extras listed %.1f ms, shadow: commit %.1f ms, copy %.1f ms, the copy given back %.1f ms (%d ranges, %.1f MB)\n", ms_x - ms0, now_ms() - ms_x - ms_commit - ms_copy - ms_drop, ms_commit, ms_copy, ms_drop, g_nr, shb / 1048576.0);
         if (g_rs_drop) LOG("r1: MARK setup: the copy of the full save given back while the shadow took it (%.1f MB): peak commit ~one copy\n", dropped * (double)PG / 1048576.0);
     }
     uint8_t *m1 = VirtualAlloc(NULL, g_wn1 >> 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
