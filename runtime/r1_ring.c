@@ -459,6 +459,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
  * (their count may change), host stacks made since are left out, modules loaded since get the mark maps. Then slot 0 = this
  * frame (threads, fibers, command buffers as a capture). 1 = done; 0 = not now (a thread not at a wait: next pass). */
 static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; }
+static double g_walk_made;
 static DWORD WINAPI rg_walk_thread(void *p) { collect((Ctx *)p); return 0; }
 /* (net4 live, p46 timing) the 30 ms window in which the HOST threads' writes are found (the guest threads are held): a
  * helper thread sleeps 30 ms from the hold and reads the write watch, while this thread scans; its pages are both copied
@@ -528,7 +529,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     static Rng *prev_r; static int prev_nr; static int diff_on = -1;
     if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
     if (diff_on && prev_r && !g_rg_fresh_ranges) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list BEFORE the walk thread replaces it (p47 copied it after: a race, its 483776 "missing" pages were the half-built new list) */
-    if (!g_rg_fresh_ranges) { walk_ctx = *c; walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
+    if (!g_rg_fresh_ranges) { walk_ctx = *c; g_walk_made = now_ms(); walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
     double ths = now_ms();
     int nmod = 0;
@@ -743,7 +744,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         g_rg_nx = npg;
     }
     double t2 = now_ms(); tq[nq++] = t2;
-    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (%lld regions: heap %lld in %.0f ms, window 2 %.0f, dlls %.0f, catch %.0f, arena %.0f, tls %.0f, sort %.0f), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_regions, g_walk_heap_regions, g_walk_heap_ms, g_walk_w2_ms, g_walk_dll_ms, g_walk_catch_ms, g_walk_ar_ms, g_walk_tls_ms, g_walk_sort_ms, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
+    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (thread start %.0f, prelude %.0f, total %.0f; %lld regions: heap %lld in %.0f ms, window 2 %.0f, dlls %.0f, catch %.0f, arena %.0f, tls %.0f, sort %.0f), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_t0 - g_walk_made, g_walk_pre_ms, g_walk_t1 - g_walk_t0, g_walk_regions, g_walk_heap_regions, g_walk_heap_ms, g_walk_w2_ms, g_walk_dll_ms, g_walk_catch_ms, g_walk_ar_ms, g_walk_tls_ms, g_walk_sort_ms, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
