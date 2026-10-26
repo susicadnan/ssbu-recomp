@@ -1221,6 +1221,7 @@ static int mark_setup_finish(void) {
  * from the second match on every committed page is copied into the existing shadow. Anything failing -> the old way
  * (the full save with the game held, at the ready-go). rb_rollback.c rbg_prebase starts it, rbg_step_body finishes it
  * through r1_ring_live_finish (r1_ring.c). */
+static volatile LONG g_cp_tolerant, g_cp_skipped;         /* (defined with the copy threads below; tentative here) */
 static volatile LONG g_live_stop, g_live_second, g_live_joined; static HANDLE g_live_th; static Ctx g_live_ctx; static double g_live_t0, g_live_copy_ms, g_live_walk_t;
 static int g_live_walks;
 #define RT_N 8192
@@ -1246,6 +1247,7 @@ static DWORD WINAPI live_base_thread(void *arg) {
     if (g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { LOG("r1: LIVE BASE: list allocation FAILED\n"); g_live_state = -1; return 0; } }
     cp_init();
     int ok = 1; size_t pages = 0;
+    InterlockedExchange(&g_cp_tolerant, 1); InterlockedExchange(&g_cp_skipped, 0);
     if (!g_live_second) {
         g_ctx_save = g_live_ctx; g_rs_drop = 1; ok = mark_setup_fill(1); g_rs_drop = 0;      /* the shadow made and filled straight from the game's memory (the write watch starts inside, once the windows are known) */
     } else {
@@ -1262,8 +1264,10 @@ static DWORD WINAPI live_base_thread(void *arg) {
             cp_run();
         }
     }
+    InterlockedExchange(&g_cp_tolerant, 0);
     if (!ok) { g_live_state = -1; return 0; }
     g_live_copy_ms = now_ms() - t0;
+    if (g_cp_skipped) LOG("r1: LIVE BASE: %ld pages were gone when read (decommitted meanwhile): skipped\n", (long)g_cp_skipped);
     LOG("r1: LIVE BASE: %s copied in %.0f ms with the game running (%s); the ranges walked again every 1.5 s until the ready-go\n", g_live_second ? "every committed page" : "the shadow made and filled", g_live_copy_ms, g_live_second ? "into the existing shadow" : "match 1");
     InterlockedExchange(&g_live_state, 2);
     while (!g_live_stop) {
@@ -1398,7 +1402,16 @@ static void cp_page(uint8_t *d, const uint8_t *s) {
         }
     } else memcpy(d, s, PG);
 }
+/* (net4 live) the live pre-base copies with the game running: a page of the list may be decommitted by the time it is
+ * read (p29 crashed so, reading a heap page the loader had freed). With g_cp_tolerant set, a page that faults is skipped
+ * and counted; the refresh at the ready-go copies every page written since anyway, and a decommitted page is not loaded. */
+static volatile LONG g_cp_tolerant, g_cp_skipped;
+static void cp_page_try(uint8_t *d, const uint8_t *s) {
+    __try { cp_page(d, s); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { InterlockedIncrement(&g_cp_skipped); }
+}
 static void cp_part(int k) { size_t a = g_ncj * (size_t)k / (size_t)(g_ncp + 1), b = g_ncj * (size_t)(k + 1) / (size_t)(g_ncp + 1);
+    if (g_cp_tolerant) { for (size_t i = a; i < b; i++) cp_page_try(g_cj[i].d, g_cj[i].s); if (g_cp_nt_now) _mm_sfence(); return; }
     if (g_cp_cmp) {
         for (size_t i = a; i < b; i++) {
             int diff = memcmp(g_cj[i].d, g_cj[i].s, PG) != 0; g_cp_cmp[i] = (uint8_t)diff;
