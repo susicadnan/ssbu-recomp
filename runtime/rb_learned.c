@@ -131,16 +131,37 @@ static void ls_protect_run(size_t a, size_t b) {         /* ids [a, b): read-onl
     if (VirtualProtect(ls_addr(a), (b - a) * PG, PAGE_READONLY, &old)) { for (size_t i = a; i < b; i++) g_ls_st[i] = 1; g_ls_prot_pages += (long long)(b - a); return; }
     for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_addr(i), PG, PAGE_READONLY, &old)) { g_ls_st[i] = 1; g_ls_prot_pages++; } else g_ls_protfail++; }
 }
+/* (net4, p44 timing: 72 ms at the ready-go) the protection of the ranges by 4 threads, each its share of the ranges (disjoint
+ * pages: the per-page state bytes are theirs alone; the counters summed after). SSBU_LS_PROT_THREADS=<n> (1 = as before). */
+typedef struct { int t, nt; long long pages, fails; } LsProtJob;
+static void ls_protect_run_j(size_t a, size_t b, LsProtJob *j) {
+    if (a >= b) return;
+    DWORD old;
+    if (VirtualProtect(ls_addr(a), (b - a) * PG, PAGE_READONLY, &old)) { for (size_t i = a; i < b; i++) g_ls_st[i] = 1; j->pages += (long long)(b - a); return; }
+    for (size_t i = a; i < b; i++) { if (VirtualProtect(ls_addr(i), PG, PAGE_READONLY, &old)) { g_ls_st[i] = 1; j->pages++; } else j->fails++; }
+}
+static DWORD WINAPI ls_protect_thread(void *p) {
+    LsProtJob *j = p;
+    for (int i = j->t; i < g_nr; i += j->nt) {
+        size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
+        if (!np || !ls_id(a, &id0) || !ls_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;      /* not (wholly) in one window */
+        size_t run = id0;
+        for (size_t id = id0; id < id0 + np; id++) if (ls_ns(id)) { ls_protect_run_j(run, id, j); run = id + 1; }
+        ls_protect_run_j(run, id0 + np, j);
+    }
+    return 0;
+}
 static void ls_protect_all(void) {                       /* threads held: every committed RW simulation page of the windows (g_r = r1's ranges) */
     double t0 = now_ms(); long long before = g_ls_prot_pages;
     memset((void *)g_ls_st, 0, g_ls_np); g_ls_n = 0; g_ls_over = 0;
     if (g_ls_pin) memset((void *)g_ls_pin, 0, g_ls_np);      /* (fast1) a new base: no page pinned or decayed yet */
-    for (int i = 0; i < g_nr; i++) {
-        size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
-        if (!ls_id(a, &id0) || !ls_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;      /* not (wholly) in one window */
-        size_t run = id0;
-        for (size_t id = id0; id < id0 + np; id++) if (ls_ns(id)) { ls_protect_run(run, id); run = id + 1; }
-        ls_protect_run(run, id0 + np);
+    {   static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_LS_PROT_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : 4; if (nt > 8) nt = 8; }
+        LsProtJob jobs[8]; HANDLE th[8]; int made = 0;
+        for (int t = 0; t < nt; t++) { jobs[t].t = t; jobs[t].nt = nt; jobs[t].pages = 0; jobs[t].fails = 0; th[t] = t ? CreateThread(NULL, 65536, ls_protect_thread, &jobs[t], 0, NULL) : NULL; if (th[t]) made++; }
+        ls_protect_thread(&jobs[0]);                      /* this thread's share */
+        for (int t = 1; t < nt; t++) if (th[t]) { WaitForSingleObject(th[t], INFINITE); CloseHandle(th[t]); } else ls_protect_thread(&jobs[t]);      /* (no thread: its share here) */
+        for (int t = 0; t < nt; t++) { g_ls_prot_pages += jobs[t].pages; g_ls_protfail += jobs[t].fails; }
+        (void)made;
     }
     g_ls_prot_ms += now_ms() - t0; g_ls_bases++; g_ls_active = 1; g_ls_off_done = 0;
     LOG("r1: LS: %lld pages (%.1f MB) made read-only in %.1f ms; learned set emptied\n", g_ls_prot_pages - before, (g_ls_prot_pages - before) * (double)PG / 1048576.0, now_ms() - t0);
