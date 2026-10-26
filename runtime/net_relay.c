@@ -85,7 +85,7 @@ enum { T_RB_DIRECT = 22 };                            /* (net4) a rollback messa
 #define LOBBY_TIMEOUT_MS 10000
 #define GONE_AFTER_MS 5000
 #define PUNCH_FOR_MS 5000          /* hellos every 200 ms this long; no answer -> relayed (hello every 5 s in case it opens) */
-#define FRESH_MS 1200              /* a direct path is used while its last answer is younger than this */
+#define FRESH_MS 4000              /* a direct path is used while its last ANSWER to our hello is younger than this (net4: was 1200; the other player's own packets do not count, see heard_direct) */
 #define NET_BUILD_DEFAULT "ssbu-recomp-ldn1"
 #define NET_PUBLIC_LOBBY "opensmash-lobby.duckdns.org:39500"     /* the project's public lobby (menu.cpp ONLINE_DEFAULT_LOBBY): the default without online_mode / online_server */
 
@@ -381,7 +381,7 @@ typedef struct {
 typedef struct {
     uint32_t ip;
     char name[NAME_LEN + 1];
-    uint64_t secret, since, last_ack, next_hello, acks_window;
+    uint64_t secret, since, last_ack, last_heard, next_hello, acks_window;
     int state, via, ncand, acks, rtt;
     Cand cand[2];                                     /* through its router (as the lobby sees it), then on its own LAN */
 } Peer;
@@ -641,7 +641,11 @@ static Peer *peer_at(uint64_t secret, const struct sockaddr_in *from, int *cand)
 /* (net4, peers lock held exclusive) a game datagram or rollback message of q arrived on its direct path: the path is alive.
  * Only the answers to hellos kept it fresh before, so three hellos lost in a row (Wi-Fi) sent every datagram through the
  * lobby for a while although the path carried the game's traffic all along: a burst of lag in the middle of a fight. */
-static void heard_direct(Peer *q, int c, uint64_t t) { if (q->state == PS_DIRECT && c == q->via) q->last_ack = t; }
+/* (net4, 2026-10-25 late: a player on a phone hotspot could not join the room: his packets reached this PC on the direct
+ * path, this PC's did not reach him, and because his data refreshed last_ack the path counted as fresh for ever, so the
+ * game's room data went out on it and was lost) a packet of his only notes that he is heard; a direct path stays fresh
+ * only by his ANSWERS to this PC's hellos (every 400 ms), which prove this PC's packets reach him too. */
+static void heard_direct(Peer *q, int c, uint64_t t) { if (q->state == PS_DIRECT && c == q->via) q->last_heard = t; }
 
 static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from) {
     uint64_t t = ms_now();
