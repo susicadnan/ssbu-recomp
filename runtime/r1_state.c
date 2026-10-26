@@ -195,24 +195,36 @@ static int cmp_rng(const void *x, const void *y) { const Rng *a = x, *b = y; ret
 /* host DLLs that run fighter code (fighters_bin\*.dll, track S): their writable sections are simulation state too */
 #include <tlhelp32.h>
 static void add_fighter_dlls(void) {
-    HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (sn == INVALID_HANDLE_VALUE) return;
-    MODULEENTRY32 me; me.dwSize = sizeof me;
-    int nmod = 0; size_t bytes = 0;
-    for (BOOL ok = Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-        if (!strstr(me.szExePath, "fighters_bin") || getenv("SSBU_R1_NO_DLLS")) continue;
-        uint8_t *b = me.modBaseAddr;
-        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
-        IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);
-        for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
-            if (sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
-                size_t n = (sh[i].Misc.VirtualSize + PG - 1) & ~(size_t)(PG - 1);
-                add_span(b + sh[i].VirtualAddress, b + sh[i].VirtualAddress + n); bytes += n;
-            }
-        nmod++;
+    /* (p55 timing) the sections found once and kept (a module snapshot per collect was ~60 ms of the walk at the ready-go);
+     * found again only when the module count changes (K32EnumProcessModules: cheap) */
+    typedef struct { uint8_t *a; size_t n; } FdSec;
+    static FdSec secs[512]; static int nsecs = -1; static DWORD last_count; static int nmod_seen;
+    typedef BOOL (WINAPI *EpmFn)(HANDLE, HMODULE *, DWORD, LPDWORD); static EpmFn epm; static int epm_tried;
+    if (!epm_tried) { epm_tried = 1; epm = (EpmFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules"); }
+    DWORD need = 0; static HMODULE hs[1024]; int count = -1;
+    if (epm && epm(GetCurrentProcess(), hs, sizeof hs, &need)) count = (int)(need / sizeof(HMODULE));
+    if (nsecs < 0 || count < 0 || (DWORD)count != last_count) {
+        HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (sn == INVALID_HANDLE_VALUE) return;
+        nsecs = 0; last_count = count < 0 ? 0 : (DWORD)count; nmod_seen = 0;
+        MODULEENTRY32 me; me.dwSize = sizeof me;
+        for (BOOL ok = Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
+            if (!strstr(me.szExePath, "fighters_bin") || getenv("SSBU_R1_NO_DLLS")) continue;
+            uint8_t *b = me.modBaseAddr;
+            IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+            IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);
+            for (int i = 0; i < nt->FileHeader.NumberOfSections && nsecs < 512; i++)
+                if (sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+                    size_t n = (sh[i].Misc.VirtualSize + PG - 1) & ~(size_t)(PG - 1);
+                    secs[nsecs].a = b + sh[i].VirtualAddress; secs[nsecs].n = n; nsecs++;
+                }
+            nmod_seen++;
+        }
+        CloseHandle(sn);
     }
-    CloseHandle(sn);
-    if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod, bytes / 1024.0);
+    size_t bytes = 0;
+    for (int i = 0; i < nsecs; i++) { add_span(secs[i].a, secs[i].a + secs[i].n); bytes += secs[i].n; }
+    if (g_cycle == 0 && g_phase == 0) LOG("r1: fighter DLLs: %d, writable sections %.1f KB\n", nmod_seen, bytes / 1024.0);
 }
 /* (R3 hs13, tw1j) the full save's copy of every range (r->s, ~1.9 GB in a match) is page memory of its own, not CRT heap: the
  * first save of the ring / run-ahead gives it back (decommits it) range by range while mark_setup moves it into the shadow,
@@ -1944,10 +1956,12 @@ static void ra_quiet_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, voi
 static int ra_fibers_quiet(void) { g_ra_busy_fibers = 0; os_r1_fibers(ra_quiet_cb); return g_ra_busy_fibers == 0; }
 static long long g_ra_fiber_waits, g_ra_fiber_skips; static double g_ra_fiber_wait_ms;
 /* hold the threads at a quiet moment: retry until `limit` ms */
+static double g_hq_susp_ms, g_hq_wait_ms; static int g_hq_tries;      /* (research) the last ra_hold_quiet: the suspend(s), the wait for quiet fibers, tries */
 static int ra_hold_quiet(double limit) {
-    double t0 = now_ms(); int tries = 0;
+    double t0 = now_ms(); int tries = 0; g_hq_susp_ms = 0; g_hq_tries = 0;
     for (;;) {
-        if (ra_hold_save()) {
+        double ts = now_ms(); int held = ra_hold_save(); g_hq_susp_ms += now_ms() - ts; g_hq_tries = tries + 1; g_hq_wait_ms = now_ms() - t0 - g_hq_susp_ms;
+        if (held) {
             double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
             if (fq) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
             for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]);
