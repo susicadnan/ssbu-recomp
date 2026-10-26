@@ -492,16 +492,6 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
     g_rg_fresh_ranges = 1; g_rg_live_async = 1;
     int r = r1_ring_refresh(frame, c);
     g_rg_fresh_ranges = 0; g_rg_live_async = 0;
-    if (r && getenv("SSBU_R1_LIVE_VERIFY")) {           /* (research) the shadow against the memory, every page of the ranges: must differ only in the async pages */
-        if (ra_hold_quiet(500)) {
-            cp_init(); size_t n = 0;
-            for (int i = 0; i < g_nr; i++) { Rng *rr = &g_r[i]; for (size_t p = 0; p < rr->n / PG; p++) { uint8_t *a = rr->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || !cm[pi]) continue; if (cm == g_sh2c ? g_ns2[pi] : g_ns1[pi]) continue; cp_add(sh, a); n++; } }
-            uint8_t *diff = calloc(n ? n : 1, 1); size_t nd = 0, shown = 0;
-            if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL; for (size_t j = 0; j < n; j++) if (diff[j]) { nd++; if (shown < 12) { shown++; LOG("r1: LIVE VERIFY: differs: %s%s\n", where((uint8_t *)g_cj[j].s), is_async((uint8_t *)g_cj[j].s) ? " (async)" : ""); } } free(diff); }
-            LOG("r1: LIVE VERIFY: %zu pages compared, %zu differ from the shadow after the refresh\n", n, nd);
-            unpark();
-        }
-    }
     return r;
 }
 int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
@@ -648,6 +638,13 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     fibers_save();
     nvn_r1_cb_save();
     rg_meta_capture(s, c);
+    if (g_rg_live_async && getenv("SSBU_R1_LIVE_VERIFY")) {      /* (research) threads still held: the shadow against the memory, every page of the ranges */
+        cp_init(); size_t n = 0;
+        for (int i = 0; i < g_nr; i++) { Rng *rr = &g_r[i]; for (size_t p = 0; p < rr->n / PG; p++) { uint8_t *a = rr->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || !cm[pi]) continue; if (cm == g_sh2c ? g_ns2[pi] : g_ns1[pi]) continue; cp_add(sh, a); n++; } }
+        uint8_t *diff = calloc(n ? n : 1, 1); size_t nd = 0, shown = 0;
+        if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL; for (size_t j = 0; j < n; j++) if (diff[j]) { nd++; if (shown < 12) { shown++; LOG("r1: LIVE VERIFY (held): differs: %s%s\n", where((uint8_t *)g_cj[j].s), is_async((uint8_t *)g_cj[j].s) ? " (async)" : ""); } } free(diff); }
+        LOG("r1: LIVE VERIFY (held): %zu pages compared, %zu differ from the shadow at the end of the refresh\n", n, nd);
+    }
     ls_rebase();                                          /* R4: the windows read-only again, the learned set emptied */
     unpark();
     g_rg_caps++;
