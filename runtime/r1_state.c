@@ -1276,6 +1276,8 @@ static DWORD WINAPI live_base_thread(void *arg) {
         Sleep(20);
         if (!g_live_stop && now_ms() - g_live_walk_t > 1500) {
             collect(&g_live_ctx); g_live_walks++; g_live_walk_t = now_ms();
+            {   int w1n = 0; for (int i = 0; i < g_nr; i++) if (g_win1 && g_r[i].a >= g_win1 && g_r[i].a < g_win1 + g_wn1) w1n++;      /* (research) */
+                LOG("r1: LIVE BASE: walk %d: %d ranges, %d of window 1 (g_win1 %p)" "\n", g_live_walks, g_nr, w1n, (void *)g_win1); }
             if (ww && g_win1 && g_dc) {                   /* the pages written since the last time, copied again (tolerant): the ready-go keeps only the last 1.5 s of writes */
                 InterlockedExchange(&g_cp_tolerant, 1);
                 for (int round = 0; round < 64 && !g_live_stop; round++) {
@@ -1327,6 +1329,7 @@ int r1_live_base_join(void) {
          * nnsdk.c reports for that heap. The tracking stays on until the refresh (held) merges the last ones: live_late_merge. */
         static Rng w1[MAXR]; int nw1 = 0;
         for (int i = 0; i < g_nr; i++) if (g_win1 && g_r[i].a >= g_win1 && g_r[i].a < g_win1 + g_wn1 && nw1 < MAXR) w1[nw1++] = g_r[i];
+        LOG("r1: LIVE BASE: join: the worker's list had %d ranges, %d of window 1 (g_win1 %p)" "\n", g_nr, nw1, (void *)g_win1);      /* (research) */
         g_collect_lite = 1; collect(&g_live_ctx); g_collect_lite = 0;
         for (int i = 0; i < nw1 && g_nr < MAXR; i++) { g_r[g_nr] = w1[i]; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; }
         LONG n = g_rt_n; if (n > RT_N) n = RT_N;
