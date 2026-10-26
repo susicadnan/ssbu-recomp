@@ -205,7 +205,8 @@ static void rbg_step_body(Ctx *c) {
             int r1_ring_live_finish(long long frame, Ctx *c); int st = r1_live_base_state();
             int rr = (st == 1 || st == 2 || st == 3) ? r1_ring_live_finish(i, c) : 0;
             if (rr) { done = 1; nvn_ww_hold(0); LOG("r1: RB NET: the ready-go after the LIVE pre-base: held for %.1f ms in all (no full save)\n", now_ms() - tr); }
-            else if (st == 1 || st == 2 || st == 3) { if (r1_live_base_state() > 0 && !g_rg_nomem && now_ms() - tr < 300) { LOG("r1: RB NET: the live base is not ready yet: next pass\n"); return; } }
+            else if (g_rg_ready && !g_rg_nomem) { static int tries; if (++tries <= 20 || tries % 60 == 0) LOG("r1: RB NET: the refresh after the live base was refused (try %d): next pass\n", tries); return; }      /* (p30: falling back with the base already made corrupted the match) */
+            else if (st > 0 && !g_rg_nomem && now_ms() - tr < 300) { LOG("r1: RB NET: the live base is not ready yet: next pass\n"); return; }
             if (!done) { r1_live_base_abort(); nvn_ww_hold(0); g_rbg_prebased = 0; LOG("r1: RB NET: the live pre-base could not be used (state %d): the base the old way\n", st); }
         }
         if (!done && g_rbg_prebased == 1) {             /* (net4) the held pre-base of p28 (SSBU_RB_NET_PREBASE_HELD=1): the base refreshed */

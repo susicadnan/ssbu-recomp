@@ -464,7 +464,7 @@ static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; 
  * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
  * extras copied whole; nothing listed again (no 200 ms walk) and no shadow page dropped. r1_ring_ww_reset: the watch starts
  * at the pre-base. */
-static int g_rg_fast_refresh, g_rg_fresh_ranges;
+static int g_rg_fast_refresh, g_rg_fresh_ranges, g_rg_live_async;
 void r1_ring_ww_reset(void) { if (g_win1 && g_wn1) ResetWriteWatch(g_win1, g_wn1); }
 int r1_live_base_join(void); int r1_live_base_state(void); void r1_live_base_abort(void);
 /* (net4 live) the ready-go after a live pre-base: the worker joined (ranges complete), then match 1: the mark maps on and the
@@ -476,7 +476,8 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
     if (!g_rg_ready) {
         if (!ra_hold_quiet(200)) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
         g_ctx_save = *c;
-        if (!mark_setup_finish()) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
+        g_ls_no_protect = 1; int mf = mark_setup_finish(); g_ls_no_protect = 0;      /* the protection comes with the refresh below (under its hold): protecting here made the next hold take 185 ms of faults */
+        if (!mf) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
         g_ra_ready = 1; g_cycle = 1;
         if (g_mark <= 0) { unpark(); g_ra_off = 1; LOG("r1: RING: no marks (the game DLL with marks is not loaded): OFF\n"); return 0; }
         if (!rg_init()) { unpark(); g_rg_nomem = 2; LOG("r1: RING: its own allocations FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
@@ -488,9 +489,9 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
         unpark();
         LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (held)\n", now_ms() - t0);
     }
-    g_rg_fresh_ranges = 1;
+    g_rg_fresh_ranges = 1; g_rg_live_async = 1;
     int r = r1_ring_refresh(frame, c);
-    g_rg_fresh_ranges = 0;
+    g_rg_fresh_ranges = 0; g_rg_live_async = 0;
     return r;
 }
 int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
@@ -568,6 +569,37 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         }
     }
     g_cp_cond = 1; cp_run(); g_cp_cond = 0;               /* (net4) compared and copied where they differ, in parallel */
+    if (g_rg_live_async) {
+        /* (net4 live) what the held full save finds in its 30 ms pause and the live copy never did: the pages the HOST threads
+         * (audio, loaders) write while the guest threads are held are not the simulation's: left out of the state (is_async:
+         * the sweep and the protection skip them), or a load rolls their data back under those threads (p30 crashed at its
+         * first load). Window 1 by the write watch, window 2 by a compare against the shadow just filled. */
+        double ta = now_ms(); size_t n1 = 0, n2 = 0;
+        if (g_win1) ResetWriteWatch(g_win1, g_wn1);
+        Sleep(30);
+        if (g_win1) {
+            static void **wwa; static const ULONG_PTR capa = 1u << 18; if (!wwa) wwa = malloc(capa * sizeof *wwa);
+            for (int round = 0; wwa && round < 64; round++) {
+                ULONG_PTR cnt = capa; DWORD gran = 0;
+                if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, wwa, &cnt, &gran)) break;
+                for (ULONG_PTR k = 0; k < cnt; k++) {
+                    uint8_t *a = wwa[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                    if (g_ns1[pi] || g_dc[pi]) continue;
+                    async_add(a); n1++;
+                    uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) memcpy(sh, a, PG);
+                }
+                if (cnt < capa) break;
+            }
+        }
+        cp_init();
+        for (size_t pi = 0; pi < (WN2 >> 12); pi++) if (g_sh2c[pi] && !g_ns2[pi]) cp_add(g_sh2 + pi * PG, (uint8_t *)(uintptr_t)WIN2 + pi * PG);
+        {   size_t nj = g_ncj; uint8_t *diff = calloc(nj ? nj : 1, 1);
+            if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL;
+                for (size_t j = 0; j < nj; j++) if (diff[j]) { async_add((uint8_t *)g_cj[j].s); memcpy(g_cj[j].d, g_cj[j].s, PG); n2++; }
+                free(diff); }
+            else cp_init(); }
+        LOG("r1: RING live async: %zu pages written by host threads during a 30 ms hold (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
+    }
     for (size_t id = 0; id < nwin; id++) {
         if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
         if (in[id]) continue;

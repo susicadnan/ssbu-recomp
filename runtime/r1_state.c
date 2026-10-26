@@ -1270,10 +1270,32 @@ static DWORD WINAPI live_base_thread(void *arg) {
     if (g_cp_skipped) LOG("r1: LIVE BASE: %ld pages were gone when read (decommitted meanwhile): skipped\n", (long)g_cp_skipped);
     LOG("r1: LIVE BASE: %s copied in %.0f ms with the game running (%s); the ranges walked again every 1.5 s until the ready-go\n", g_live_second ? "every committed page" : "the shadow made and filled", g_live_copy_ms, g_live_second ? "into the existing shadow" : "match 1");
     InterlockedExchange(&g_live_state, 2);
+    static void **ww; static const ULONG_PTR cap = 1u << 20; if (!ww) ww = malloc(cap * sizeof *ww);
+    size_t refreshed = 0; int rounds = 0;
     while (!g_live_stop) {
         Sleep(20);
-        if (!g_live_stop && now_ms() - g_live_walk_t > 1500) { collect(&g_live_ctx); g_live_walks++; g_live_walk_t = now_ms(); }
+        if (!g_live_stop && now_ms() - g_live_walk_t > 1500) {
+            collect(&g_live_ctx); g_live_walks++; g_live_walk_t = now_ms();
+            if (ww && g_win1 && g_dc) {                   /* the pages written since the last time, copied again (tolerant): the ready-go keeps only the last 1.5 s of writes */
+                InterlockedExchange(&g_cp_tolerant, 1);
+                for (int round = 0; round < 64 && !g_live_stop; round++) {
+                    ULONG_PTR cnt = cap; DWORD gran = 0;
+                    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, ww, &cnt, &gran)) break;
+                    for (ULONG_PTR k = 0; k < cnt; k++) {
+                        uint8_t *a = ww[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                        if (g_ns1[pi]) continue;
+                        uint8_t *sh = g_sh1 + pi * PG;
+                        if (!sh_commit(sh, g_sh1c, pi)) break;
+                        cp_add(sh, a); refreshed++;
+                    }
+                    cp_run();
+                    if (cnt < cap) break;
+                }
+                InterlockedExchange(&g_cp_tolerant, 0); rounds++;
+            }
+        }
     }
+    LOG("r1: LIVE BASE: %zu written pages copied again in %d rounds while the game ran (%ld gone when read)\n", refreshed, rounds, (long)g_cp_skipped);
     InterlockedExchange(&g_live_state, 3);
     return 0;
 }

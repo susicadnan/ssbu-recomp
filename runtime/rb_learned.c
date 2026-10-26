@@ -145,6 +145,7 @@ static void ls_protect_all(void) {                       /* threads held: every 
     g_ls_prot_ms += now_ms() - t0; g_ls_bases++; g_ls_active = 1; g_ls_off_done = 0;
     LOG("r1: LS: %lld pages (%.1f MB) made read-only in %.1f ms; learned set emptied\n", g_ls_prot_pages - before, (g_ls_prot_pages - before) * (double)PG / 1048576.0, now_ms() - t0);
 }
+static int g_ls_no_protect;                              /* (net4 live) set: ls_after_setup allocates but does not protect (the refresh's ls_rebase will, under its own hold) */
 static void ls_after_setup(void) {                       /* mark_setup done, threads still held: the base is in the shadow */
     if (!ls_on() || pm1 != &r1_m1) return;               /* (a marked game DLL is loaded: the marks are used) */
     g_ls_n1 = (size_t)(g_wn1 >> 12); g_ls_np = g_ls_n1 + (size_t)(WN2 >> 12);
@@ -162,6 +163,7 @@ static void ls_after_setup(void) {                       /* mark_setup done, thr
             for (int i = 0; i < 5 && !g_ls_mod_game; i++) if (names[i] && names[i][0]) g_ls_mod_game = GetModuleHandleA(names[i]); }
         AddVectoredExceptionHandler(1, ls_veh);
     }
+    if (g_ls_no_protect) return;
     ls_protect_all();
 }
 static void ls_each(void (*fn)(uint32_t id, int w, size_t j)) {   /* threads held: every page of the learned set */
