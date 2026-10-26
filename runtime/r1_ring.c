@@ -459,6 +459,7 @@ int r1_ring_capture(long long frame, Ctx *c) {
  * (their count may change), host stacks made since are left out, modules loaded since get the mark maps. Then slot 0 = this
  * frame (threads, fibers, command buffers as a capture). 1 = done; 0 = not now (a thread not at a wait: next pass). */
 static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; }
+static DWORD WINAPI rg_walk_thread(void *p) { collect((Ctx *)p); return 0; }
 /* (net4) the FAST REFRESH after a pre-base (rb_rollback.c rbg_prebase): the game's region is reserved with MEM_WRITE_WATCH
  * (nnsdk.c), so at the ready-go the OS names every page of window 1 written since the pre-base by ANY thread (the loaders
  * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
@@ -506,6 +507,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     r1_ring_release();
     if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
     double t1 = now_ms(); double tpre = t1;
+    HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
+    if (!g_rg_fresh_ranges) { walk_ctx = *c; walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
     int nmod = 0;
     {   HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -521,7 +524,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     g_rg_ntl = 0;
     double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
     double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
-    if (!g_rg_fresh_ranges) collect(c);                   /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
+    if (walk_th) { WaitForSingleObject(walk_th, INFINITE); CloseHandle(walk_th); }      /* (the walk, see above) */
+    else if (!g_rg_fresh_ranges) collect(c);              /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
     else live_late_merge();                               /* (net4 live) the join walked everything but the heap and merged the tracked heap commits; the last ones now, held */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
@@ -601,8 +605,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
          * the sweep and the protection skip them), or a load rolls their data back under those threads (p30 crashed at its
          * first load). Window 1 by the write watch, window 2 by a compare against the shadow just filled. */
         double ta = now_ms(); size_t n1 = 0, n2 = 0;
-        if (g_win1) ResetWriteWatch(g_win1, g_wn1);
-        Sleep(30);
+        /* (p44 timing) no pause: the host threads have been writing for the whole held refresh so far (>= 60 ms); what they wrote
+         * since the write-watch read above is theirs (the guest threads are held) */
         if (g_win1) {
             static void **wwa; static const ULONG_PTR capa = 1u << 18; if (!wwa) wwa = malloc(capa * sizeof *wwa);
             for (int round = 0; wwa && round < 64; round++) {
@@ -618,8 +622,9 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
         }
         cp_init();
-        for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31) */
+        for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31); its own ranges only (p44: the loop over every range cost 35 ms) */
             Rng *r = &g_r[i];
+            if ((uintptr_t)r->a < WIN2 || (uintptr_t)r->a >= WIN2 + WN2) continue;
             for (size_t p = 0; p < r->n / PG; p++) { uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || cm != g_sh2c || g_ns2[pi] || !g_sh2c[pi]) continue; cp_add(sh, a); }
         }
         {   size_t nj = g_ncj; uint8_t *diff = calloc(nj ? nj : 1, 1);
