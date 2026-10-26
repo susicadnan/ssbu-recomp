@@ -36,7 +36,31 @@ void input_mark(const char *what);                      /* nnhid.c: the input se
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
 static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
 static int g_rbg_mr_done;                                 /* (net4) this match's report written (once: at the fight's end, or at the exit during a fight) */
-static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu_other_a; static RbPad g_rbg_menu_own;      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
+static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu_other_a; static RbPad g_rbg_menu_own;
+/* (net4, 2026-10-25 night, owner: "hide it in the character loading screen where it's static anyways") THE PRE-BASE: the full
+ * save that makes the ring's base (0.75-0.85 s on the owner's PC, 1.8 s before this evening) is made BEFORE the fight, at the
+ * first safe point after the match's set-up at which the stage is drawing (the loading is over; the entrance runs) and the
+ * game is quiet enough to hold. The first safe point with the fight on (the ready-go) then captures frame 0 as every other
+ * frame (a few ms). The base's own frame number is -1: no rollback ever goes there; the state at the ready-go is the same
+ * on both games as before (the loading frames do not touch the simulation: the base at the ready-go never desynced).
+ * From the second match on the same, with the ring's rebase (a copy of every page) instead of the full save.
+ * SSBU_RB_NET_PREBASE=0: the old way (the full save at the ready-go). */
+static int g_rbg_prebased, g_rbg_prebase_setup; static long long g_rbg_prebase_tries;
+int debug_match_setups(void); int debug_hs_ok(void); int debug_fm_scene(void); long input_frame_draws_seen(void);
+static void rbg_prebase(Ctx *c) {
+    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }
+    if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted()) return;
+    int setups = debug_match_setups();
+    if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is made */
+    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene() || input_frame_draws_seen() < 100) return;      /* the match agreed, the scene set up, the stage drawing */
+    if (++g_rbg_prebase_tries % 5) return;                   /* a try every 5th frame: a try that finds the loaders busy holds main up to 200 ms */
+    double t0 = now_ms(); int ok;
+    if (!g_rg_ready) ok = r1_ring_capture(-1, c);
+    else ok = r1_ring_rebase(-1, c);
+    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0;
+        LOG("r1: RB NET: PRE-BASE: the ring's base made before the fight (set-up %d, %s) in %.1f ms: the ready-go will only capture frame 0\n", setups, g_rg_ready ? "full save" : "rebase", now_ms() - t0); }
+    else if (g_rg_nomem) LOG("r1: RB NET: PRE-BASE: not made (no memory): this match goes without the ring\n");
+}      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
 void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
 static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
@@ -178,7 +202,8 @@ static void rbg_step_body(Ctx *c) {
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
             if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
         if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
-        if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
+        if (g_rbg_prebased) { if (!r1_ring_capture(i, c)) { LOG("r1: RB NET: the capture of frame %lld after the pre-base was refused: next pass\n", i); return; } LOG("r1: RB NET: frame %lld captured after the pre-base (no full save at the ready-go)\n", i); }      /* (net4) see rbg_prebase */
+        else if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
         else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
         g_rbg_noring = g_rg_nomem != 0;
         rbn_set_lockstep(g_rbg_noring);
@@ -473,6 +498,7 @@ static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
     if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
+    g_rbg_prebased = 0;                                 /* (net4) the next match's pre-base is its own */
     if (g_rbg_in_match == 1 && rbn_room_rollback() && !rbn_loop()) {      /* (net4) a room match: the result screen's pads exchanged until the next fight (at most 3 min) */
         static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_MENU_PADS"); want = !(e && e[0] == '0'); }
         if (want) { g_rbg_menu = 1; g_rbg_menu_t0 = now_ms(); g_rbg_menu_own_a = g_rbg_menu_other_a = 0; memset(&g_rbg_menu_own, 0, sizeof g_rbg_menu_own);

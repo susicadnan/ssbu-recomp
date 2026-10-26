@@ -300,6 +300,14 @@ static uint64_t hash40(const char *s) {
  * Both games force + 0x454 = 1 with the agreed layout of each player, so a player's own controls are the same on both PCs. */
 #include "rb_hs.h"
 static int g_hs_wanted, g_hs_ok, g_hs_local, g_hs_lwr;      /* (R3 lwr) g_hs_lwr: a Local Wireless room's match played with rollback */
+static int g_dm_setup_n;                                     /* (net4) match set-ups seen (player 1's record built) */
+int debug_match_setups(void) { return g_dm_setup_n; }
+int debug_hs_ok(void) { return g_hs_ok; }                    /* (net4) the last set-up's match agreed with the other game */
+int debug_fm_scene(void) {                                   /* (net4) the FighterManager's fight scene is set up (impl + 0xb4, from SSBU_DEBUG_FMWATCH: 0 -> 1 at the set-up, before the loading) */
+    uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+    uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t v = 0;
+    return impl && safe_read(impl + 0xb4, &v, 1) && v == 1;
+}
 static int g_lwr_mode_set;                                   /* (net4) the melee mode of the match block was made 0 for this room match */
 /* (net4, 2026-10-25, real players: "when the match is done we can't get out of the lobby, we both wait for the other to confirm")
  * the room match's melee mode stayed 0 (local) after the fight, so the result screens of both games ran as a local match's and
@@ -562,7 +570,7 @@ static void match_player_hook(Ctx *c, void *user) {
         if (g_dm_hazards >= 0) wr8(GA(0x7105309985ULL), (uint8_t)g_dm_hazards);
         if (g_dm.items >= 0) wr32(MELEE_INFO + 0x54, g_dm.items ? 2u : 0u);
     }
-    if (idx == 0) { void nnhid_lwr_styles(int on, int gc0, int gc1); nnhid_lwr_styles(0, 0, 0); }      /* (R3 lwr) a new set-up: the ports in their own kinds again */
+    if (idx == 0) { void nnhid_lwr_styles(int on, int gc0, int gc1); nnhid_lwr_styles(0, 0, 0); g_dm_setup_n++; }      /* (R3 lwr) a new set-up: the ports in their own kinds again */
     if (idx == 0) { void rbn_set_setup_waiting(int waiting); rbn_set_setup_waiting(c->x[30] == GA(0x71017911dcULL)); }      /* (R3 lwr) a Local Wireless room's waiting-stage fight: built from its own set-up (runs lwres2 / lwres3: return address 0x71017911dc; the room's match and the select screens: 0x710178f498) */
     if (g_hs_wanted) hs_apply(st, idx, type_was);       /* R3: the match both online games agreed (rb_net.c handshake) */
     if (idx == 1) g_dm_state1_ok = safe_read(st, g_dm_state1, sizeof g_dm_state1);
