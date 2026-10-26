@@ -526,6 +526,9 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
     HANDLE aw_th = NULL;
     if (g_rg_live_async && g_win1) { ResetWriteWatch(g_win1, g_wn1); aw_th = CreateThread(NULL, 0, rg_async_window_thread, NULL, 0, NULL); }      /* (see rg_async_window_thread) */
+    static Rng *prev_r; static int prev_nr; static int diff_on = -1;
+    if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
+    if (diff_on && prev_r && !g_rg_fresh_ranges) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list BEFORE the walk thread replaces it (p47 copied it after: a race, its 483776 "missing" pages were the half-built new list) */
     if (!g_rg_fresh_ranges) { walk_ctx = *c; walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
     int nmod = 0;
@@ -542,9 +545,6 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     g_rg_ntl = 0;
     double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
     double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
-    static Rng *prev_r; static int prev_nr; static int diff_on = -1;
-    if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
-    if (diff_on && walk_th && prev_r) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list before the walk replaces it */
     if (walk_th) { WaitForSingleObject(walk_th, INFINITE); CloseHandle(walk_th); }      /* (the walk, see above) */
     if (diff_on && walk_th && prev_r && g_win1) {       /* (research, SSBU_R1_WALK_DIFF) window-1 pages the walk has and the worker's list (last walk + tracked commits) has not */
         size_t miss = 0, shown = 0; uint8_t *run_a = NULL; size_t run_n = 0;
