@@ -2452,7 +2452,9 @@ static const char *cm_find(uint8_t *a, char *b, size_t bn) {
     for (LONG k = 0; k < lim; k++) { CmRec *r = &g_cm[k]; if (a >= r->a && a < r->a + r->n) { if (!r->dec && r->t > best) { best = r->t; bn_ = r->n; } if (r->dec && r->t > bestd) { bestd = r->t; bdn = r->n; } } }
     int o = 0;
     if (best < 0) o += snprintf(b + o, bn - o, "never reported committed"); else o += snprintf(b + o, bn - o, "committed %.0f ms ago (%zu KB)", now_ms() - best, bn_ / 1024);
-    if (bestd >= 0 && o < (int)bn) snprintf(b + o, bn - o, ", decommitted %.0f ms ago (%zu KB)", now_ms() - bestd, bdn / 1024);
+    if (bestd >= 0 && o < (int)bn) o += snprintf(b + o, bn - o, ", decommitted %.0f ms ago (%zu KB)", now_ms() - bestd, bdn / 1024);
+    {   MEMORY_BASIC_INFORMATION m; size_t id; int lst = -1; if (ls_id(a, &id)) lst = g_ls_st ? g_ls_st[id] : -2;
+        if (VirtualQuery(a, &m, sizeof m) && o < (int)bn) snprintf(b + o, bn - o, "; now state %lx protect %lx, LS state %d (active %d)", (unsigned long)m.State, (unsigned long)m.Protect, lst, g_ls_active); }
     return b;
 }
 void r1_on_commit(void *p, size_t n) {
