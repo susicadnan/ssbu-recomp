@@ -123,7 +123,7 @@ static void add_range(uint8_t *a, size_t n) {
 }
 static int rw(DWORD p) { return (p & 0xff) == PAGE_READWRITE || (p & 0xff) == PAGE_EXECUTE_READWRITE; }
 /* the committed read-write parts of [lo, hi) */
-static long long g_walk_regions;                        /* (research) VirtualQuery calls of the last collect */
+static long long g_walk_regions, g_walk_heap_regions; static double g_walk_heap_ms, g_walk_w2_ms;      /* (research) VirtualQuery calls / time of the last collect's walks */
 static void add_span_1(uint8_t *lo, uint8_t *hi, Rng *out, int *n, int cap) {
     MEMORY_BASIC_INFORMATION m;
     for (uint8_t *p = lo; p < hi && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
@@ -233,8 +233,11 @@ static void collect(Ctx *c) {
     for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
     g_nr = 0; g_walk_regions = 0;
     if (!g_nheap) find_heaps();
-    for (int i = 0; i < g_nheap; i++) if (!(g_collect_lite && g_win1 && g_heap_base[i] == g_win1)) add_alloc(g_heap_base[i]);
+    double tw0 = now_ms(); long long rg0;
+    for (int i = 0; i < g_nheap; i++) if (!(g_collect_lite && g_win1 && g_heap_base[i] == g_win1)) add_span(g_heap_base[i], g_heap_base[i] + g_heap_span[i]);      /* (p54 timing) the reservation's size is known: add_alloc walked the 62 GB region once more just to find its end */
+    double tw1 = now_ms(); rg0 = g_walk_regions;
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
+    g_walk_heap_ms = tw1 - tw0; g_walk_heap_regions = rg0; g_walk_w2_ms = now_ms() - tw1;
     add_fighter_dlls();
     { size_t pmn; uint8_t *pm = ls_pool_meta(&pmn); if (pm && pmn) add_span(pm, pm + pmn); }      /* R4: the presentation pool's bookkeeping (rb_learned.c) */
     if (g_catch_addr && !getenv("SSBU_R1_NO_CATCH")) {     /* nnunwind.c: the catch frames (guest CFA -> host jmp_buf) */

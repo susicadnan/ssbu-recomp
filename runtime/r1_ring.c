@@ -743,7 +743,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         g_rg_nx = npg;
     }
     double t2 = now_ms(); tq[nq++] = t2;
-    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (%lld regions), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_regions, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
+    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (%lld regions: heap %lld in %.0f ms, window 2 %.0f ms), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_regions, g_walk_heap_regions, g_walk_heap_ms, g_walk_w2_ms, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
