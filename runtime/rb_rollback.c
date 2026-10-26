@@ -57,7 +57,7 @@ static void rbg_prebase(Ctx *c) {
     double t0 = now_ms(); int ok;
     if (!g_rg_ready) ok = r1_ring_capture(-1, c);
     else ok = r1_ring_rebase(-1, c);
-    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0; g_rbg_basefix = g_rbg_basefix < 0 ? 1 : g_rbg_basefix;
+    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0;
         LOG("r1: RB NET: PRE-BASE: the ring's base made before the fight (set-up %d, %s) in %.1f ms: the ready-go will only capture frame 0\n", setups, g_rg_ready ? "full save" : "rebase", now_ms() - t0); }
     else if (g_rg_nomem) LOG("r1: RB NET: PRE-BASE: not made (no memory): this match goes without the ring\n");
 }      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
