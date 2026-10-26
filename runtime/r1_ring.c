@@ -493,7 +493,8 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
     const char *ls = getenv("SSBU_R1_LIVE_SLOW");
     if (ls && ls[0] == '2') { g_rg_fresh_ranges = 1; g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }      /* (research) the slow page loop (every committed page compared / copied) on the worker's fresh ranges */
     else if (ls) { g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_live_async = 0; }      /* (research) the slow rebase at the ready-go (collect + every page copied) on the live-made shadow */
-    else { g_rg_fresh_ranges = 1; g_rg_live_async = 1; r = r1_ring_refresh(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }
+    else { static int walk = -1; if (walk < 0) { const char *e = getenv("SSBU_R1_LIVE_WALK"); walk = !(e && e[0] == '0'); }      /* default: the full walk at the ready-go (200 ms; the tracked heap list alone crashed: p38 / p39); =0 the tracked list */
+           g_rg_fresh_ranges = !walk; g_rg_live_async = 1; r = r1_ring_refresh(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }
     return r;
 }
 int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
