@@ -411,6 +411,12 @@ static void lph_ms(Ctx *c, void *u) {                    /* malloc_size(p) */
 static void ls_init(void) {                              /* r1_init */
     const char *fn = getenv("SSBU_LS_ROUTE");
     if (!ls_on() || (fn && (!*fn || !strcmp(fn, "0")))) return;
+    if (!fn) {                                           /* (net4, the purple / green fighters) graphics.ini rollback_pool = on | off, default OFF since p24: the pool is a
+                                                          * suspect for a tint a rollback left behind (a block outside the state keeps the old colour). SSBU_LS_ROUTE set: as it says */
+        int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
+        int on = net_ini_value("rollback_pool", v, sizeof v) && (!strcmp(v, "1") || !_stricmp(v, "on") || !_stricmp(v, "yes") || !_stricmp(v, "true"));
+        if (!on) { LOG("r1: LS: presentation pool OFF (graphics.ini rollback_pool = on turns it on)\n"); return; }
+    }
     if (fn) {                                            /* (test) a site file instead of the built-in list */
         FILE *f = fopen(fn, "r"); if (!f) { LOG("r1: LS: presentation pool: site file %s NOT found\n", fn); return; }
         char ln[256]; unsigned long long a, b;
