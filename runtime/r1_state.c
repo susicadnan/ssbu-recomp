@@ -123,16 +123,45 @@ static void add_range(uint8_t *a, size_t n) {
 }
 static int rw(DWORD p) { return (p & 0xff) == PAGE_READWRITE || (p & 0xff) == PAGE_EXECUTE_READWRITE; }
 /* the committed read-write parts of [lo, hi) */
-static void add_span(uint8_t *lo, uint8_t *hi) {
+static void add_span_1(uint8_t *lo, uint8_t *hi, Rng *out, int *n, int cap) {
     MEMORY_BASIC_INFORMATION m;
     for (uint8_t *p = lo; p < hi && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
         if (m.State == MEM_COMMIT && rw(m.Protect) && !(m.Protect & PAGE_GUARD)) {
             uint8_t *a = (uint8_t *)m.BaseAddress, *b = a + m.RegionSize;
             if (a < lo) a = lo;
             if (b > hi) b = hi;
-            add_range(a, (size_t)(b - a));
+            if (*n >= cap) return;
+            if (*n && out[*n - 1].a + out[*n - 1].n == a) { out[*n - 1].n += (size_t)(b - a); continue; }
+            out[*n].a = a; out[*n].n = (size_t)(b - a); (*n)++;
         }
     }
+}
+/* (net4, 2026-10-25 evening) the walk of the game's 62 GB region took 170-200 ms of the first save's freeze (one VirtualQuery
+ * per region, tens of thousands of them). A span over 1 GB is walked in 8 parts by 8 threads, each with its own list,
+ * joined in address order (a range cut at a part's edge is joined again by add_range). SSBU_R1_SPAN_THREADS=1: one thread. */
+#define SPAN_T 8
+typedef struct { uint8_t *lo, *hi; Rng *out; int n; } SpanJob;
+static DWORD WINAPI span_thread(void *arg) { SpanJob *j = arg; add_span_1(j->lo, j->hi, j->out, &j->n, MAXR); return 0; }
+static void add_span(uint8_t *lo, uint8_t *hi) {
+    static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_R1_SPAN_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : SPAN_T; if (nt > SPAN_T) nt = SPAN_T; }
+    if ((size_t)(hi - lo) < (1ull << 30) || nt < 2) {
+        add_span_1(lo, hi, g_r, &g_nr, MAXR);
+        return;
+    }
+    static Rng *bufs[SPAN_T];
+    SpanJob jobs[SPAN_T]; HANDLE th[SPAN_T]; int made = 0;
+    size_t part = ((size_t)(hi - lo) / nt + 0xffff) & ~(size_t)0xffff;
+    for (int i = 0; i < nt; i++) {
+        if (!bufs[i]) bufs[i] = malloc(MAXR * sizeof(Rng));
+        jobs[i].lo = lo + part * i; jobs[i].hi = i == nt - 1 ? hi : lo + part * (i + 1); if (jobs[i].hi > hi) jobs[i].hi = hi;
+        jobs[i].out = bufs[i]; jobs[i].n = 0;
+        th[i] = bufs[i] && jobs[i].lo < jobs[i].hi ? CreateThread(NULL, 65536, span_thread, &jobs[i], 0, NULL) : NULL;
+        if (!th[i] && bufs[i] && jobs[i].lo < jobs[i].hi) add_span_1(jobs[i].lo, jobs[i].hi, bufs[i], &jobs[i].n, MAXR);      /* (no thread: this one walks it) */
+        if (th[i]) made++;
+    }
+    for (int i = 0; i < nt; i++) if (th[i]) { WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]); }
+    for (int i = 0; i < nt; i++) if (bufs[i]) for (int k = 0; k < jobs[i].n; k++) add_range(jobs[i].out[k].a, jobs[i].out[k].n);
+    (void)made;
 }
 static void add_alloc(void *inside) {
     MEMORY_BASIC_INFORMATION m;
