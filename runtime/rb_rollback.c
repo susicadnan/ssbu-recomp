@@ -193,6 +193,7 @@ static void rbg_step_body(Ctx *c) {
         rbn_start(i);
         rbn_pass_hash(0);                               /* (hs12) the checksum of frame 1 starts here (run tw8: frame-line lines from before the base, a different number on the two games, made frame 1 of match 2 differ) */
         { char mk[24]; snprintf(mk, sizeof mk, "match%don", rbn_match_number()); input_mark(mk); }
+        input_mark("fight");                            /* (net4) the fight-frame count of SSBU_SHOT_FIGHT (nnhid.c) starts at the match start on every game */
         if (g_rbg_wdfix) g_ra_wd_base = 2;              /* from now on the hold watchdog has the long limit (H2 sets it back to this) */
         g_rbg_wd_before = g_ra_wd_fired;                /* (releases before the match, e.g. at its slow first passes, are harmless: no state in the ring yet) */
         g_rgs_next = i + 1;
