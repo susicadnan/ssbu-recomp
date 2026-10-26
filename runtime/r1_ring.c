@@ -550,7 +550,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             uint8_t *sh = in_shadow(a, &cm, &pi);
             if (sh && g_rg_fast_refresh) {               /* (net4) window 2 in the fast refresh: compared and copied where it differs; a page new since the pre-base committed into the shadow */
                 int w2 = cm == g_sh2c;
-                if (!w2) { in[pi] = 1; continue; }        /* window 1: committed now, kept (the write watch copies what was written) */
+                if (!w2) { in[pi] = 1; g_dc[pi] = 0; continue; }        /* window 1: committed now, kept (the write watch copies what was written); the decommit map cleared as the slow rebase does (a page freed and committed again by a path that is not tracked stayed "decommitted": the ring then never restored it: the p36 crashes at the first load) */
                 if (g_ns2[pi]) continue;
                 in[g_rg_n1 + pi] = 1;
                 if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
