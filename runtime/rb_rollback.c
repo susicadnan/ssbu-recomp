@@ -49,7 +49,7 @@ static int g_rbg_prebased, g_rbg_prebase_setup; static long long g_rbg_prebase_t
 int r1_ring_refresh(long long frame, Ctx *c); void r1_ring_ww_reset(void); void nvn_ww_hold(int on);
 int debug_match_setups(void); int debug_hs_ok(void); int debug_fm_scene(void); long input_frame_draws_seen(void);
 static void rbg_prebase(Ctx *c) {
-    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = e && e[0] == '1'; }      /* (2026-10-26 01:04, a real match: a rollback 4 s in crashed on a fiber the fast refresh had not recorded; p22 withdrawn) default OFF until that is fixed: SSBU_RB_NET_PREBASE=1 turns it on */
+    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }      /* (2026-10-26: p22 crashed real matches because the fast refresh reused the pre-base's extras list; fixed in r1_ring_rebase, g_collect_lite) default ON again: SSBU_RB_NET_PREBASE=0 turns it off */
     if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted()) return;
     int setups = debug_match_setups();
     if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is made */
