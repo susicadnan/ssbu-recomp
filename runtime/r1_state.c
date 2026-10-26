@@ -143,7 +143,7 @@ static void add_span_1(uint8_t *lo, uint8_t *hi, Rng *out, int *n, int cap) {
 typedef struct { uint8_t *lo, *hi; Rng *out; int n; } SpanJob;
 static DWORD WINAPI span_thread(void *arg) { SpanJob *j = arg; add_span_1(j->lo, j->hi, j->out, &j->n, MAXR); return 0; }
 static void add_span(uint8_t *lo, uint8_t *hi) {
-    static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_R1_SPAN_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : SPAN_T; if (nt > SPAN_T) nt = SPAN_T; }
+    static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_R1_SPAN_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : 1; if (nt > SPAN_T) nt = SPAN_T; }      /* (measured: 8 threads 229 ms vs 191 ms alone: VirtualQuery serialises on the address-space lock; default 1) */
     if ((size_t)(hi - lo) < (1ull << 30) || nt < 2) {
         add_span_1(lo, hi, g_r, &g_nr, MAXR);
         return;
