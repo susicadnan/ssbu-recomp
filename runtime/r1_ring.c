@@ -571,10 +571,10 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             for (size_t p = 0; p < r->n / PG; p++) {
                 uint8_t *a = r->a + p * PG; int have = 0;
                 for (int k = 0; k < prev_nr && !have; k++) if (a >= prev_r[k].a && a < prev_r[k].a + prev_r[k].n) have = 1;
-                if (have) { if (run_n) { if (shown++ < 12) LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list\n", where(run_a), run_n); run_n = 0; } continue; }
+                if (have) { if (run_n) { if (shown++ < 12) { char cb[80]; LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list (%s)\n", where(run_a), run_n, cm_find(run_a, cb, sizeof cb)); } run_n = 0; } continue; }
                 miss++; if (!run_n) run_a = a; run_n++;
             }
-            if (run_n) { if (shown++ < 12) LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list\n", where(run_a), run_n); run_n = 0; }
+            if (run_n) { if (shown++ < 12) { char cb[80]; LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list (%s)\n", where(run_a), run_n, cm_find(run_a, cb, sizeof cb)); } run_n = 0; }
         }
         LOG("r1: WALK DIFF: %zu window-1 pages the walk found that the worker's list did not have\n", miss);
     }

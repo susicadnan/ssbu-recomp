@@ -1954,12 +1954,19 @@ static void ra_quiet_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, voi
     if (!c || !c->in_import || strstr(c->in_import, "SwitchToFiber") || !waiting_import(c->in_import)) g_ra_busy_fibers++;
 }
 static int ra_fibers_quiet(void) { g_ra_busy_fibers = 0; os_r1_fibers(ra_quiet_cb); return g_ra_busy_fibers == 0; }
+int os_r1_fibers_quiet_hint(int (*busy)(uint64_t key, Ctx *c));
+static int ra_fiber_busy_hint(uint64_t key, Ctx *c) { if (!os_r1_fiber_tid(key)) return 0; const char *imp = c ? c->in_import : NULL; return !c || !imp || strstr(imp, "SwitchToFiber") || !waiting_import(imp); }
 static long long g_ra_fiber_waits, g_ra_fiber_skips; static double g_ra_fiber_wait_ms;
 /* hold the threads at a quiet moment: retry until `limit` ms */
 static double g_hq_susp_ms, g_hq_wait_ms; static int g_hq_tries;      /* (research) the last ra_hold_quiet: the suspend(s), the wait for quiet fibers, tries */
 static int ra_hold_quiet(double limit) {
     double t0 = now_ms(); int tries = 0; g_hq_susp_ms = 0; g_hq_tries = 0;
+    static int hint_on = -1; if (hint_on < 0) { const char *e = getenv("SSBU_RB_HOLD_HINT"); hint_on = !(e && e[0] == '0'); }
     for (;;) {
+        if (tries && hint_on && !os_r1_fibers_quiet_hint(ra_fiber_busy_hint)) {      /* (p56 timing: 28 tries x 3 ms of suspend + resume at the ready-go) the fibers still look busy: wait without the suspend */
+            g_hq_tries = tries + 1; g_hq_wait_ms = now_ms() - t0 - g_hq_susp_ms;
+            tries++; if (now_ms() - t0 > limit) return 0; SwitchToThread(); continue;
+        }
         double ts = now_ms(); int held = ra_hold_save(); g_hq_susp_ms += now_ms() - ts; g_hq_tries = tries + 1; g_hq_wait_ms = now_ms() - t0 - g_hq_susp_ms;
         if (held) {
             double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
@@ -2423,7 +2430,17 @@ static void dc_set(void *p, size_t n, int v) {
 }
 void r1_on_decommit(void *p, size_t n) { live_track(p, n, 1); r1_mark_range((uint64_t)(uintptr_t)p, n); ls_range((uint64_t)(uintptr_t)p, n, 1); dc_set(p, n, 1); }
 static void live_track(void *p, size_t n, int decommit);  /* (net4 live) below */
+typedef struct { uint8_t *a; size_t n; double t; } CmRec;      /* (research) the tracked commits, newest over the oldest */
+static CmRec g_cm[65536]; static volatile LONG g_cm_n;
+static void cm_note(void *p, size_t n) { LONG i = (InterlockedIncrement(&g_cm_n) - 1) & 65535; g_cm[i].a = p; g_cm[i].n = n; g_cm[i].t = now_ms(); }
+static const char *cm_find(uint8_t *a, char *b, size_t bn) {
+    LONG n = g_cm_n, lim = n < 65536 ? n : 65536; double best = -1;
+    for (LONG k = 0; k < lim; k++) { CmRec *r = &g_cm[k]; if (a >= r->a && a < r->a + r->n && r->t > best) best = r->t; }
+    if (best < 0) snprintf(b, bn, "never reported as committed"); else snprintf(b, bn, "reported committed %.0f ms ago", now_ms() - best);
+    return b;
+}
 void r1_on_commit(void *p, size_t n) {
+    cm_note(p, n);
     live_track(p, n, 0);
     dc_set(p, n, 0);
     ls_range((uint64_t)(uintptr_t)p, n, 2);              /* R4: new pages of a fight read-only (their first write faults) */

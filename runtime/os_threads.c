@@ -358,6 +358,13 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
     }
     for (int i = 0; i < g_fib_cn; i++) { Obj *o = g_fib_c[i]; if (o->fiber) cb(o->key, o->fctx, o->stack, o->stack_size, o->fiber); }
 }
+/* (p56 timing) a hint, read WITHOUT the hold: do the job fibers look quiet? Only the cached list is read, and only when it is
+ * current (no fiber made or gone since); a fiber's import field is read racily. 1 = quiet or unknown: go and hold. */
+int os_r1_fibers_quiet_hint(int (*busy)(uint64_t key, Ctx *c)) {
+    if (g_fib_cgen != g_fib_gen) return 1;
+    for (int i = 0; i < g_fib_cn; i++) { Obj *o = g_fib_c[i]; if (o->fiber && busy(o->key, o->fctx)) return 0; }
+    return 1;
+}
 void os_thread_report(FILE *out) {
     if (!g_oslog_n) return;
     fprintf(out, "nn::os threads of this run (priority 0 highest .. 31 lowest; cores 0..2 exist on the console):\n%.*s", (int)g_oslog_n, g_oslog);
