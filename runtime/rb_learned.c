@@ -155,7 +155,7 @@ static void ls_protect_all(void) {                       /* threads held: every 
     double t0 = now_ms(); long long before = g_ls_prot_pages;
     memset((void *)g_ls_st, 0, g_ls_np); g_ls_n = 0; g_ls_over = 0;
     if (g_ls_pin) memset((void *)g_ls_pin, 0, g_ls_np);      /* (fast1) a new base: no page pinned or decayed yet */
-    {   static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_LS_PROT_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : 4; if (nt > 8) nt = 8; }
+    {   static int nt = -1; if (nt < 0) { const char *e = getenv("SSBU_LS_PROT_THREADS"); nt = e && atoi(e) > 0 ? atoi(e) : 1; if (nt > 8) nt = 8; }      /* (p49: 4 threads gave nothing, VirtualProtect serialises) */
         LsProtJob jobs[8]; HANDLE th[8]; int made = 0;
         for (int t = 0; t < nt; t++) { jobs[t].t = t; jobs[t].nt = nt; jobs[t].pages = 0; jobs[t].fails = 0; th[t] = t ? CreateThread(NULL, 65536, ls_protect_thread, &jobs[t], 0, NULL) : NULL; if (th[t]) made++; }
         ls_protect_thread(&jobs[0]);                      /* this thread's share */

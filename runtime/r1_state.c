@@ -123,9 +123,11 @@ static void add_range(uint8_t *a, size_t n) {
 }
 static int rw(DWORD p) { return (p & 0xff) == PAGE_READWRITE || (p & 0xff) == PAGE_EXECUTE_READWRITE; }
 /* the committed read-write parts of [lo, hi) */
+static long long g_walk_regions;                        /* (research) VirtualQuery calls of the last collect */
 static void add_span_1(uint8_t *lo, uint8_t *hi, Rng *out, int *n, int cap) {
     MEMORY_BASIC_INFORMATION m;
     for (uint8_t *p = lo; p < hi && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
+        g_walk_regions++;
         if (m.State == MEM_COMMIT && rw(m.Protect) && !(m.Protect & PAGE_GUARD)) {
             uint8_t *a = (uint8_t *)m.BaseAddress, *b = a + m.RegionSize;
             if (a < lo) a = lo;
@@ -229,7 +231,7 @@ static uint8_t *g_win1;                                 /* (defined with the sha
 static int g_collect_lite;                              /* (net4) set: the game's big heap (window 1) is not walked: the ring's fast refresh covers it by the write watch */
 static void collect(Ctx *c) {
     for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
-    g_nr = 0;
+    g_nr = 0; g_walk_regions = 0;
     if (!g_nheap) find_heaps();
     for (int i = 0; i < g_nheap; i++) if (!(g_collect_lite && g_win1 && g_heap_base[i] == g_win1)) add_alloc(g_heap_base[i]);
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
@@ -889,6 +891,14 @@ static void async_add(uint8_t *a) {
     if (g_nasync >= g_async_cap) { g_async_cap = g_async_cap ? g_async_cap * 2 : 4096; g_async = realloc(g_async, g_async_cap * sizeof *g_async); }   /* (threads are not held here: after unpark) */
     g_async[g_nasync++] = a;
     qsort(g_async, g_nasync, sizeof *g_async, cmp_ptr);
+}
+static void async_add_bulk(uint8_t **pages, size_t n) {    /* (net4) many at once: appended, sorted once, duplicates dropped (async_add sorts per page: 5000 pages took ~300 ms) */
+    if (!n) return;
+    if (g_nasync + n > g_async_cap) { g_async_cap = g_nasync + n + 4096; g_async = realloc(g_async, g_async_cap * sizeof *g_async); }
+    memcpy(g_async + g_nasync, pages, n * sizeof *pages); g_nasync += n;
+    qsort(g_async, g_nasync, sizeof *g_async, cmp_ptr);
+    size_t o = 0; for (size_t i = 0; i < g_nasync; i++) if (!o || g_async[o - 1] != g_async[i]) g_async[o++] = g_async[i];
+    g_nasync = o;
 }
 static int is_async(uint8_t *a) { if (g_use_async < 0) g_use_async = getenv("SSBU_R1_FAST_ASYNC") != NULL || g_audio_free; return g_use_async && g_nasync && bsearch(&a, g_async, g_nasync, sizeof *g_async, cmp_ptr) != NULL; }
 static void async_learn(void) {               /* main held 30 ms, the others running: what do they write? (ranges collected, buffers allocated) */

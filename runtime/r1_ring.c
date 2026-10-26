@@ -524,8 +524,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
     double t1 = now_ms(); double tpre = t1;
     HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
-    HANDLE aw_th = NULL;
-    if (g_rg_live_async && g_win1) { ResetWriteWatch(g_win1, g_wn1); aw_th = CreateThread(NULL, 0, rg_async_window_thread, NULL, 0, NULL); }      /* (see rg_async_window_thread) */
+    HANDLE aw_th = NULL;                                  /* (p48: a 30 ms window found nothing and the audio thread crashed at a load; the whole held time is the window again, read at the end, see below) */
     static Rng *prev_r; static int prev_nr; static int diff_on = -1;
     if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
     if (diff_on && prev_r && !g_rg_fresh_ranges) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list BEFORE the walk thread replaces it (p47 copied it after: a race, its 483776 "missing" pages were the half-built new list) */
@@ -586,14 +585,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
     tq[nq++] = now_ms();
-    int ww_fail = 0; size_t ww_pages = 0, aw_pages = 0;
-    if (aw_th) { WaitForSingleObject(aw_th, INFINITE); CloseHandle(aw_th); aw_th = NULL;
-        if (!g_aw_fail) for (ULONG_PTR k = 0; k < g_aw_n; k++) {
-            uint8_t *a = g_aw_pages[k]; size_t pi = (size_t)(a - g_win1) >> 12;
-            if (g_dc[pi] || g_ns1[pi]) continue;
-            async_add(a); aw_pages++;
-            uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) cp_add(sh, a);
-        } }
+    int ww_fail = 0; size_t ww_pages = 0, aw_pages = 0; (void)aw_th;
     if (g_rg_fast_refresh) {
         /* (p35 bisect) window 1's shadow pages of pages NOT committed now are dropped (in[] from the ranges, in the loop below), as
          * the slow rebase does: after a live copy over the loading screen, ~30000 shadow pages held old loader buffers whose
@@ -669,7 +661,24 @@ int r1_ring_rebase(long long frame, Ctx *c) {
          * (audio, loaders) write while the guest threads are held are not the simulation's: left out of the state (is_async:
          * the sweep and the protection skip them), or a load rolls their data back under those threads (p30 crashed at its
          * first load). Window 1 by the write watch, window 2 by a compare against the shadow just filled. */
-        double ta = now_ms(); size_t n1 = aw_pages, n2 = 0;      /* window 1: the helper's 30 ms window (above); window 2: compared again now */
+        double ta = now_ms(); size_t n1 = aw_pages, n2 = 0;
+        if (g_win1) {                                     /* window 1: what the host threads wrote since the write-watch read above (the guest threads are held): the whole held refresh so far is the window */
+            static void **wwa; static const ULONG_PTR capa = 1u << 18; if (!wwa) wwa = malloc(capa * sizeof *wwa);
+            static uint8_t **al; static size_t alcap; size_t aln = 0;
+            for (int round = 0; wwa && round < 64; round++) {
+                ULONG_PTR cnt = capa; DWORD gran = 0;
+                if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, wwa, &cnt, &gran)) break;
+                for (ULONG_PTR k = 0; k < cnt; k++) {
+                    uint8_t *a = wwa[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                    if (g_ns1[pi] || g_dc[pi]) continue;
+                    if (aln >= alcap) { alcap = alcap ? alcap * 2 : 8192; al = realloc(al, alcap * sizeof *al); }
+                    al[aln++] = a; n1++;
+                    uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) memcpy(sh, a, PG);
+                }
+                if (cnt < capa) break;
+            }
+            async_add_bulk(al, aln);
+        }
         cp_init();
         for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31); its own ranges only (p44: the loop over every range cost 35 ms) */
             Rng *r = &g_r[i];
@@ -681,7 +690,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 for (size_t j = 0; j < nj; j++) if (diff[j]) { async_add((uint8_t *)g_cj[j].s); memcpy(g_cj[j].d, g_cj[j].s, PG); n2++; }
                 free(diff); }
             else cp_init(); }
-        LOG("r1: RING live async: %zu pages written by host threads during a 30 ms hold (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
+        LOG("r1: RING live async: %zu pages written by host threads during the held refresh (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
     }
     tq[nq++] = now_ms();
     {   /* (net4, p41 timing: this pass took 100 ms as a plain loop over 18 M entries) word-wise: the index is mostly RG_FLAT (0) and
@@ -734,7 +743,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         g_rg_nx = npg;
     }
     double t2 = now_ms(); tq[nq++] = t2;
-    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
+    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (%lld regions), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_regions, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
