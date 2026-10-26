@@ -1070,8 +1070,26 @@ static void hs_exclude_all(void) {
     if (!g_hs_on) return;
     typedef LONG (WINAPI *QitFn)(HANDLE, int, void *, ULONG, ULONG *);
     QitFn qit = (QitFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    typedef LONG (WINAPI *NgtFn)(HANDLE, HANDLE, DWORD, ULONG, ULONG, HANDLE *);
+    static NgtFn ngt; static int ngt_tried;
+    if (!ngt_tried) { ngt_tried = 1; ngt = (NgtFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtGetNextThread"); if (getenv("SSBU_R1_HS_SNAPSHOT")) ngt = NULL; }
+    int nth = 0;
+    if (qit && ngt) {                                     /* (net4, p44 timing) this process's threads only, no system-wide snapshot (the snapshot was most of a 90 ms phase at the ready-go) */
+        HANDLE h = NULL, next = NULL;
+        while (ngt(GetCurrentProcess(), h, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &next) >= 0) {
+            if (h) CloseHandle(h);
+            h = next;
+            HsTbi tb; memset(&tb, 0, sizeof tb);
+            if (qit(h, 0, &tb, sizeof tb, NULL) >= 0 && tb.teb) {
+                uint8_t *teb = tb.teb; char nm[48]; snprintf(nm, sizeof nm, "thread %lu stack", (unsigned long)GetThreadId(h));
+                hs_exclude(*(uint64_t *)(teb + 0x1478), *(uint64_t *)(teb + 0x08), nm);    /* DeallocationStack .. StackBase (the whole reservation) */
+                nth++;
+            }
+        }
+        if (h) CloseHandle(h);
+    } else {
     HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    THREADENTRY32 te; te.dwSize = sizeof te; DWORD pid = GetCurrentProcessId(); int nth = 0;
+    THREADENTRY32 te; te.dwSize = sizeof te; DWORD pid = GetCurrentProcessId();
     for (BOOL ok = qit && sn != INVALID_HANDLE_VALUE && Thread32First(sn, &te); ok; ok = Thread32Next(sn, &te)) {
         if (te.th32OwnerProcessID != pid) continue;
         HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID); if (!h) continue;
@@ -1084,6 +1102,7 @@ static void hs_exclude_all(void) {
         CloseHandle(h);
     }
     if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
+    }
     os_r1_fibers(hs_fiber_cb);
     for (int i = 0; i < g_hs_nnote; i++) hs_exclude(g_hs_note[i][0], g_hs_note[i][1], "host stack (noted)");
     g_r1_fiber_born = hs_fiber_born;

@@ -531,17 +531,36 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     if (diff_on && prev_r && !g_rg_fresh_ranges) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list BEFORE the walk thread replaces it (p47 copied it after: a race, its 483776 "missing" pages were the half-built new list) */
     if (!g_rg_fresh_ranges) { walk_ctx = *c; walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
+    double ths = now_ms();
     int nmod = 0;
-    {   HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-        MODULEENTRY32 me; me.dwSize = sizeof me;
-        for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-            uint8_t **a1 = (uint8_t **)GetProcAddress(me.hModule, "r1_m1"), **a2 = (uint8_t **)GetProcAddress(me.hModule, "r1_m2");
-            uint64_t *l1 = (uint64_t *)GetProcAddress(me.hModule, "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(me.hModule, "r1_n1"), *n2 = (uint64_t *)GetProcAddress(me.hModule, "r1_n2");
-            if (!a1 || !a2 || !l1 || !n1 || !n2) continue;
-            if (*a1 != *pm1) { *a1 = *pm1; *a2 = *pm2; *l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *n2 = WN2; *n1 = g_wn1; nmod++; LOG("r1: RING rebase: mark maps set in %s (loaded after the first save)\n", me.szModule); }
+    {   /* (net4, p44 timing) the modules with mark maps, found once and kept (a module snapshot each time was part of a 90 ms phase);
+         * found again only when the module count changes (K32EnumProcessModules: cheap) */
+        typedef struct { HMODULE h; uint8_t **a1, **a2; uint64_t *l1, *n1, *n2; char name[64]; } RgMod;
+        static RgMod mods[256]; static int nmods = -1; static DWORD last_count;
+        typedef BOOL (WINAPI *EpmFn)(HANDLE, HMODULE *, DWORD, LPDWORD); static EpmFn epm; static int epm_tried;
+        if (!epm_tried) { epm_tried = 1; epm = (EpmFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules"); }
+        DWORD need = 0; static HMODULE hs[1024]; int count = -1;
+        if (epm && epm(GetCurrentProcess(), hs, sizeof hs, &need)) count = (int)(need / sizeof(HMODULE));
+        if (nmods < 0 || count < 0 || (DWORD)count != last_count) {
+            nmods = 0; last_count = count < 0 ? 0 : (DWORD)count;
+            HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+            MODULEENTRY32 me; me.dwSize = sizeof me;
+            for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok && nmods < 256; ok = Module32Next(sn, &me)) {
+                uint8_t **a1 = (uint8_t **)GetProcAddress(me.hModule, "r1_m1"), **a2 = (uint8_t **)GetProcAddress(me.hModule, "r1_m2");
+                uint64_t *l1 = (uint64_t *)GetProcAddress(me.hModule, "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(me.hModule, "r1_n1"), *n2 = (uint64_t *)GetProcAddress(me.hModule, "r1_n2");
+                if (!a1 || !a2 || !l1 || !n1 || !n2) continue;
+                mods[nmods].h = me.hModule; mods[nmods].a1 = a1; mods[nmods].a2 = a2; mods[nmods].l1 = l1; mods[nmods].n1 = n1; mods[nmods].n2 = n2; snprintf(mods[nmods].name, sizeof mods[nmods].name, "%s", me.szModule); nmods++;
+            }
+            if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
         }
-        if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
+        for (int i = 0; i < nmods; i++) {
+            RgMod *m = &mods[i];
+            if (*m->a1 != *pm1) { *m->a1 = *pm1; *m->a2 = *pm2; *m->l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *m->n2 = WN2; *m->n1 = g_wn1; nmod++; LOG("r1: RING rebase: mark maps set in %s (loaded after the first save)\n", m->name); }
+        }
+    }
+    double tmo = now_ms();
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
+    double tsw = now_ms();
     g_rg_ntl = 0;
     double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
     double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
@@ -582,9 +601,12 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         static void **ww; static const ULONG_PTR cap = 1u << 22;
         if (!ww) ww = malloc(cap * sizeof *ww);
         if (!ww) ww_fail = 1;
-        for (int round = 0; !ww_fail && round < 64; round++) {
-            ULONG_PTR cnt = cap; DWORD gran = 0;
-            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, ww, &cnt, &gran)) { ww_fail = 1; break; }
+        static int ww_ranges = -1; if (ww_ranges < 0) { const char *e = getenv("SSBU_R1_WW_RANGES"); ww_ranges = e && e[0] == '1'; }
+        int ri = -1;                                      /* (option) the watch read per committed range of window 1 instead of over the whole 62 GB reservation */
+        for (int round = 0; !ww_fail && round < 100000; round++) {
+            ULONG_PTR cnt = cap; DWORD gran = 0; uint8_t *qa = g_win1; size_t qn = g_wn1;
+            if (ww_ranges) { do ri++; while (ri < g_nr && !(g_r[ri].a >= g_win1 && g_r[ri].a < g_win1 + g_wn1)); if (ri >= g_nr) break; qa = g_r[ri].a; qn = g_r[ri].n; }
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, qa, qn, ww, &cnt, &gran)) { ww_fail = 1; break; }
             for (ULONG_PTR k = 0; k < cnt; k++) {
                 uint8_t *a = ww[k]; size_t pi = (size_t)(a - g_win1) >> 12;
                 if (g_dc[pi] || g_ns1[pi]) continue;      /* not committed now / not simulation (a host stack) */
@@ -592,7 +614,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 if (!sh_commit(sh, g_sh1c, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
                 cp_add(sh, a); copied++; ww_pages++; g_dc[pi] = 0;
             }
-            if (cnt < cap) break;
+            if (!ww_ranges && cnt < cap) break;
+            if (ww_ranges && cnt == cap) ri--;            /* (more in this range: asked again) */
         }
         if (ww_fail) { LOG("r1: RING refresh: GetWriteWatch FAILED (error %lu): the slow rebase instead\n", GetLastError()); g_rg_fast_refresh = 0; g_rg_ntl = 0; collect(c); memset(in, 0, nwin); cp_init(); }
     }
@@ -711,7 +734,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         g_rg_nx = npg;
     }
     double t2 = now_ms(); tq[nq++] = t2;
-    LOG("r1: RING rebase phases (ms): stacks+modules+sweep %.0f, walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", tex, tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
+    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f, write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
     double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
