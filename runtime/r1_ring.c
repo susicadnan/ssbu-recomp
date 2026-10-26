@@ -53,7 +53,7 @@ typedef struct {
 static int g_rg_nomem;
 static int rbg_on(void);
 static RgSlot *g_rg; static int g_rg_cap, g_rg_head, g_rg_count, g_rg_ready, g_rg_depth = 7;
-static uint32_t *g_rg_idx; static uint8_t *g_rg_touch; static uint32_t *g_rg_tl; static size_t g_rg_ntl, g_rg_tlcap;
+static uint32_t *g_rg_idx; static uint8_t *g_rg_touch; static uint32_t *g_rg_tl; static size_t g_rg_ntl, g_rg_tlcap, g_rg_idx_cap;
 static size_t g_rg_n1, g_rg_n2, g_rg_nx;               /* page counts: window 1, window 2, extras */
 static uint8_t **g_rg_xa, **g_rg_xb;                   /* extras page e: its address, its flat (first save) bytes */
 static uint8_t *g_rg_pool; static uint32_t g_rg_bump, g_rg_pcom, *g_rg_free, g_rg_nfree;
@@ -313,7 +313,7 @@ static int rg_init(void) {
     size_t tot = g_rg_n1 + g_rg_n2 + g_rg_nx;
     { const char *e = getenv("SSBU_RB_DEPTH"); if (e) g_rg_depth = atoi(e); if (g_rg_depth < 1) g_rg_depth = 1; if (g_rg_depth > RG_MAXSLOT - 1) g_rg_depth = RG_MAXSLOT - 1; }
     g_rg_cap = g_rg_depth + 1;
-    g_rg_idx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    g_rg_idx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); g_rg_idx_cap = tot;
     g_rg_touch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_rg_tlcap = 8u << 20; g_rg_tl = VirtualAlloc(NULL, g_rg_tlcap * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_rg_pool = rg_vres((size_t)RG_POOL_MAX * PG);
@@ -656,14 +656,22 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         size_t npg = 0; for (int i = 0; i < nnx; i++) npg += nx[i].n / PG;
         size_t tot = nwin + npg;
         for (size_t e = 0; e < g_rg_nx; e++) rg_pool_put(g_rg_idx[nwin + e]);
-        uint32_t *nidx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        uint8_t *ntouch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         uint8_t **nxa = malloc((npg + 1) * sizeof *nxa), **nxb = malloc((npg + 1) * sizeof *nxb);
-        if (!nidx || !ntouch || !nxa || !nxb) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
-        memcpy(nidx, g_rg_idx, nwin * 4);
-        VirtualFree(g_rg_idx, 0, MEM_RELEASE); VirtualFree(g_rg_touch, 0, MEM_RELEASE); free(g_rg_xa); free(g_rg_xb);
+        if (!nxa || !nxb) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
+        if (tot <= g_rg_idx_cap) {                        /* (net4, p43 timing) the index and the touch map kept when they are big enough (a new 72 MB index and its copy cost ~100 ms); the extras' entries flat, the touch map cleared */
+            for (size_t e = 0; e < npg; e++) g_rg_idx[nwin + e] = RG_FLAT;
+            memset(g_rg_touch, 0, tot);
+        } else {
+            uint32_t *nidx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            uint8_t *ntouch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!nidx || !ntouch) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
+            memcpy(nidx, g_rg_idx, nwin * 4);
+            VirtualFree(g_rg_idx, 0, MEM_RELEASE); VirtualFree(g_rg_touch, 0, MEM_RELEASE);
+            g_rg_idx = nidx; g_rg_touch = ntouch; g_rg_idx_cap = tot;
+        }
+        free(g_rg_xa); free(g_rg_xb);
         for (int i = 0; i < g_nx; i++) free(g_x[i].b);
-        g_rg_idx = nidx; g_rg_touch = ntouch; g_rg_xa = nxa; g_rg_xb = nxb;
+        g_rg_xa = nxa; g_rg_xb = nxb;
         g_nx = nnx; g_xbytes = 0; size_t e = 0;
         for (int i = 0; i < nnx; i++) {
             g_x[i] = nx[i]; g_x[i].b = malloc(g_x[i].n);
