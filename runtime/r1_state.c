@@ -618,6 +618,12 @@ static int g_mark; static int mark_setup(void); static void blk1_init(void);
 static int g_ra, g_save_failed; static int ra_hold_quiet(double limit); static const char *g_ra_busy_first_save(void);      /* (R3 lwr) the thread that kept the first save from being made */
 size_t nvn_r1_cb_save(void); void nvn_r1_cb_restore(void); static size_t g_ra_cb_bytes;      /* nvn_gl.c */
 static size_t g_saved_bytes;
+/* (net4, 2026-10-25 evening) THE FIRST SAVE OF A MATCH took 1.8 s in a real match (1.9 GB copied by main alone, compared
+ * page by page after the pause, then copied again into the shadow 64 KB at a time): a freeze for both players at every
+ * match start. Now the copy threads do the copies and the compare (as in every capture), and the shadow is committed one
+ * range at a time. The result is the same bytes. */
+static void cp_init(void); static void cp_add(uint8_t *d, const uint8_t *s); static void cp_add_range(uint8_t *d, const uint8_t *s, size_t n); static void cp_run(void);
+static uint8_t *g_cp_cmp;
 static void save(Ctx *c) {
     double t0 = now_ms();
     collect(c);
@@ -651,7 +657,9 @@ static void save(Ctx *c) {
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now (busy: %s)\n", g_ra_busy_first_save()); g_save_failed = 1; return; } } else park_quiet(0);
     fibers_save();
     double t1b = now_ms();
-    for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
+    cp_init();
+    for (int i = 0; i < g_nr; i++) { cp_add_range(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
+    cp_run();
     double t2 = now_ms();
     {   /* pages the OTHER threads write while main is held here (audio, vsync counter, loaders, render threads): they are
          * not the simulation's; they are left out of restore and verify. SSBU_R1_PAUSE=<ms> (default 50, 0 = none) */
@@ -659,15 +667,23 @@ static void save(Ctx *c) {
         size_t np = 0; int shown = 0;
         if (pause > 0) {
             Sleep((DWORD)pause);
+            size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n / PG;
+            uint8_t *diff = calloc(tot ? tot : 1, 1);
+            if (diff) {                                   /* the compare by the copy threads (nothing copied); then only the pages that differ */
+                for (int i = 0; i < g_nr; i++) cp_add_range(g_r[i].a, g_r[i].s, g_r[i].n);
+                g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL;
+            }
+            size_t q = 0;
             for (int i = 0; i < g_nr; i++) {
                 Rng *r = &g_r[i];
-                for (size_t p = 0; p < r->n / PG; p++)
-                    if (memcmp(r->a + p * PG, r->s + p * PG, PG)) {
+                for (size_t p = 0; p < r->n / PG; p++, q++)
+                    if (diff ? diff[q] : memcmp(r->a + p * PG, r->s + p * PG, PG) != 0) {
                         r->async[p] = 1; np++; if (g_audio_free) async_add(r->a + p * PG);
                         memcpy(r->s + p * PG, r->a + p * PG, PG);
                         if (g_cycle == 0 && shown < 40) g_e[shown++].a = r->a + p * PG;
                     }
             }
+            free(diff);
         }
         int mfail = 0;
         if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
@@ -1083,18 +1099,24 @@ static int mark_setup(void) {
     {   /* the bytes of the save point into the shadow and the extras; with g_rs_drop the copy of the full save is given back 1 MB at a time behind */
         int cx = 0; size_t xo = 0; long long dropped = 0;
         for (int i = 0; i < g_nr; i++) {
-            Rng *r = &g_r[i]; size_t np = r->n / PG, d0 = 0;
+            Rng *r = &g_r[i]; size_t np = r->n / PG;
+            {   /* (net4) the shadow of this range committed in one call (it was 64 KB at a time); per page again if that fails */
+                uint8_t *cm0; size_t pi0; uint8_t *sh0 = in_shadow(r->a, &cm0, &pi0);
+                if (sh0 && np && rb_test_nomem() != 4) { size_t k = 0; while (k < np && cm0[pi0 + k]) k++;          /* (the first pages may be committed already) */
+                    if (k < np && VirtualAlloc(sh0 + k * PG, (np - k) * PG, MEM_COMMIT, PAGE_READWRITE)) memset(cm0 + pi0 + k, 1, np - k); }
+            }
             for (size_t p = 0; p < np; p++) {
                 uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
                 if (sh) {
                     if (!sh_commit(sh, cm, pi)) { LOG("r1: MARK setup: commit of the shadow FAILED after %.1f MB%s: marks OFF\n", shb / 1048576.0, rb_test_nomem() == 4 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=4)" : ""); mark_undo(); return 0; }
-                    memcpy(sh, r->s + p * PG, PG); shb += PG;
+                    cp_add(sh, r->s + p * PG); shb += PG;   /* (net4) copied by the copy threads, per range */
                 } else {
                     if (cx < g_nx && xo == g_x[cx].n) { cx++; xo = 0; }
                     if (cx < g_nx && g_x[cx].a + xo == a) { memcpy(g_x[cx].b + xo, r->s + p * PG, PG); xo += PG; }
                 }
-                if (g_rs_drop && (p + 1 - d0 == 256 || p + 1 == np)) { VirtualFree(r->s + d0 * PG, (p + 1 - d0) * PG, MEM_DECOMMIT); dropped += (long long)(p + 1 - d0); d0 = p + 1; }
             }
+            cp_run();
+            if (g_rs_drop) { VirtualFree(r->s, np * PG, MEM_DECOMMIT); dropped += (long long)np; }      /* the copy given back, this range's at a time */
         }
         if (g_rs_drop) LOG("r1: MARK setup: the copy of the full save given back while the shadow took it (%.1f MB): peak commit ~one copy\n", dropped * (double)PG / 1048576.0);
     }
@@ -1170,7 +1192,7 @@ static int g_ncp = -1;
 static HANDLE g_cp_go[8], g_cp_done[8];
 static void cp_add(uint8_t *d, const uint8_t *s) { if (g_ncj >= g_cjcap) { g_cjcap = g_cjcap ? g_cjcap * 2 : 65536; g_cj = realloc(g_cj, g_cjcap * sizeof *g_cj); } g_cj[g_ncj].d = d; g_cj[g_ncj].s = s; g_ncj++; }
 static void cp_add_range(uint8_t *d, const uint8_t *s, size_t n) { for (size_t o = 0; o < n; o += PG) cp_add(d + o, s + o); }
-static uint8_t *g_cp_cmp;                             /* (R2 round 3) set: the queued jobs are COMPARED (g_cp_cmp[i] = 1 if they differ), not copied */
+/* g_cp_cmp (declared above save): (R2 round 3) set: the queued jobs are COMPARED (g_cp_cmp[i] = 1 if they differ), not copied */
 /* (R3 net3) g_cp_cond set: each queued page is copied only if it differs from its source (a ring load: most learned pages
  * already hold the value being loaded; reading both is cheaper than writing the page); g_cp_wrote[k] counts the copies */
 static int g_cp_cond; static volatile long long g_cp_wrote[9];
