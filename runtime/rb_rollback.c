@@ -197,7 +197,7 @@ static void rbg_step_body(Ctx *c) {
         g_rbg_wd_before = g_ra_wd_fired;                /* (releases before the match, e.g. at its slow first passes, are harmless: no state in the ring yet) */
         g_rgs_next = i + 1;
         if (g_rbg_pace < 0) { const char *e = getenv("SSBU_RB_NET_PACE"); g_rbg_pace = !e || atoi(e) != 0; }
-        { const char *e = getenv("SSBU_RB_NET_LASTLITE"); g_rgs_lastlite = !e || atoi(e) != 0; }      /* default on here: proven exact (rl4L, rl4K); =0 runs the last re-run pass fully */
+        { const char *e = getenv("SSBU_RB_NET_LASTLITE"); g_rgs_lastlite = e && atoi(e) != 0; }      /* (2026-10-25 evening) default OFF: the last re-run pass runs everything. With it on, that pass skipped the lighting and effect work, and real players saw both fighters flash green / purple for a moment after a rollback (the state was exact: the picture was not). Costs ~1-2 ms per rollback. =1: the old way */
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
         if (!g_rbg_work) { g_rbg_work = calloc(RBG_NT, sizeof *g_rbg_work); g_rbg_gap = calloc(RBG_NT, sizeof *g_rbg_gap); g_rbg_wcyc = calloc(RBG_NT, sizeof *g_rbg_wcyc); g_rbg_wk = calloc(RBG_NT, 1); }

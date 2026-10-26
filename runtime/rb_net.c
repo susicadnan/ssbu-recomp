@@ -732,9 +732,13 @@ static int auto_delay(void) {
      * steady link changes nothing (78 ms: mean 78.9, best 78.1); a jittery one gets the frame its late packets need.
      * Measured, two games, 78 ms + 0..10 ms jitter + 2 % loss: delay 3 -> 20-28 rollbacks, tick p99 34-44 ms; delay 4 ->
      * 0 rollbacks, p99 21.5 ms, identical. SSBU_RB_NET_JITTER=0: the best round trip alone (the old way). */
+    /* (2026-10-25 evening, a real match: delay 6 at a 19 ms link) the all-time mean held the pings from before the direct
+     * path was up (through the lobby, 100 ms and more), so the jitter term made the delay huge. Now only the LAST 5 s of
+     * round trips count (the ring rbn_link uses): rtt = their p90 + half of (p90 - min). */
     {   static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
-        double mean = 0; AcquireSRWLockExclusive(&g_rq_lock); if (g_rtt_n >= 10) mean = g_rtt_sum / g_rtt_n; ReleaseSRWLockExclusive(&g_rq_lock);
-        if (jit && g_rtt_min_us > 0 && mean > g_rtt_min_us) rtt = (int)(g_rtt_min_us + 1.5 * (mean - g_rtt_min_us)); }
+        long v[LQ_N]; int n;
+        AcquireSRWLockExclusive(&g_rq_lock); n = g_lq_n; memcpy(v, g_lq_rtt, sizeof(long) * (size_t)n); ReleaseSRWLockExclusive(&g_rq_lock);
+        if (jit && n >= 5) { qsort(v, (size_t)n, sizeof v[0], cmp_long); long p90 = v[n * 9 / 10], mn = v[0]; rtt = (int)(p90 + (p90 - mn) / 2); } }
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
     /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
      * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
