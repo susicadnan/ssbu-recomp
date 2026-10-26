@@ -490,7 +490,9 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
         LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (held)\n", now_ms() - t0);
     }
     int r;
-    if (getenv("SSBU_R1_LIVE_SLOW")) { g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_live_async = 0; }      /* (research) the slow rebase at the ready-go (collect + every page copied) on the live-made shadow */
+    const char *ls = getenv("SSBU_R1_LIVE_SLOW");
+    if (ls && ls[0] == '2') { g_rg_fresh_ranges = 1; g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }      /* (research) the slow page loop (every committed page compared / copied) on the worker's fresh ranges */
+    else if (ls) { g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_live_async = 0; }      /* (research) the slow rebase at the ready-go (collect + every page copied) on the live-made shadow */
     else { g_rg_fresh_ranges = 1; g_rg_live_async = 1; r = r1_ring_refresh(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }
     return r;
 }
