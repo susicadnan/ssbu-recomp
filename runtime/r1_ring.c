@@ -761,8 +761,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     LOG("r1: RING rebase tail (ms): fibers %.0f, command buffers %.0f, meta %.0f, protection %.0f\n", tf1 - tf0, tf2 - tf1, tf3 - tf2, now_ms() - tl0);
     unpark();
     g_rg_caps++;
-    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f = suspend %.0f + quiet wait %.0f over %d tries, copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
-        frame, now_ms() - t0, t1 - t0, g_hq_susp_ms, g_hq_wait_ms, g_hq_tries, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
+    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f = suspend %.0f + quiet wait %.0f over %d tries [hint stale %d, wrong %d], copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
+        frame, now_ms() - t0, t1 - t0, g_hq_susp_ms, g_hq_wait_ms, g_hq_tries, g_hq_hint_stale, g_hq_hint_wrong, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
     return 1;
 }
 /* (R3 hs13: tl4 / nmr / le3a / lg2a / lh4, c00000ff in ntdll's unwinder at a lua2cpp L2CExceptionShutdown throw, about 1 loop

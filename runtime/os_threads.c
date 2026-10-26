@@ -361,7 +361,7 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
 /* (p56 timing) a hint, read WITHOUT the hold: do the job fibers look quiet? Only the cached list is read, and only when it is
  * current (no fiber made or gone since); a fiber's import field is read racily. 1 = quiet or unknown: go and hold. */
 int os_r1_fibers_quiet_hint(int (*busy)(uint64_t key, Ctx *c)) {
-    if (g_fib_cgen != g_fib_gen) return 1;
+    if (g_fib_cgen != g_fib_gen) return 2;                /* 2 = unknown (the cached list is stale) */
     for (int i = 0; i < g_fib_cn; i++) { Obj *o = g_fib_c[i]; if (o->fiber && busy(o->key, o->fctx)) return 0; }
     return 1;
 }
