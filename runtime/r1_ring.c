@@ -492,19 +492,19 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
     if (!r1_live_base_join()) return 0;
     if (!g_rg_ready) {
         if (!ra_hold_quiet(200)) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
-        g_ctx_save = *c;
-        g_ls_no_protect = 1; int mf = mark_setup_finish(); g_ls_no_protect = 0;      /* the protection comes with the refresh below (under its hold): protecting here made the next hold take 185 ms of faults */
+        g_ctx_save = *c; double tfh = now_ms();
+        g_ls_no_protect = 1; int mf = mark_setup_finish(); g_ls_no_protect = 0; double tfm = now_ms();      /* the protection comes with the refresh below (under its hold): protecting here made the next hold take 185 ms of faults */
         if (!mf) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
         g_ra_ready = 1; g_cycle = 1;
         if (g_mark <= 0) { unpark(); g_ra_off = 1; LOG("r1: RING: no marks (the game DLL with marks is not loaded): OFF\n"); return 0; }
         if (!rg_init()) { unpark(); g_rg_nomem = 2; LOG("r1: RING: its own allocations FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
-        g_rg_ready = 1;
+        double tfi = now_ms(); g_rg_ready = 1;
         RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
         s->frame = -1; s->nent = 0;
         fibers_save(); nvn_r1_cb_save();
         rg_meta_capture(s, &g_ctx_save);
         unpark();
-        LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (held)\n", now_ms() - t0);
+        LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (join + hold %.0f, mark maps %.0f, ring %.0f, meta %.0f)\n", now_ms() - t0, tfh - t0, tfm - tfh, tfi - tfm, now_ms() - tfi);
     }
     int r;
     const char *ls = getenv("SSBU_R1_LIVE_SLOW");

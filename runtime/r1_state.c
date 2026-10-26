@@ -1234,16 +1234,19 @@ static int mark_setup_finish(void) {
     *pm1 = m1; *pm2 = m2; *plo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *pn2 = WN2; *pn1 = g_wn1;
     r1_m1 = m1; r1_m2 = m2; r1_lo1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); r1_n2 = WN2; r1_n1 = g_wn1;
     {   int nmod = 0; char names[1500]; int o = 0;
-        HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-        MODULEENTRY32 me; me.dwSize = sizeof me;
-        for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-            uint8_t **a1 = (uint8_t **)GetProcAddress(me.hModule, "r1_m1"), **a2 = (uint8_t **)GetProcAddress(me.hModule, "r1_m2");
-            uint64_t *l1 = (uint64_t *)GetProcAddress(me.hModule, "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(me.hModule, "r1_n1"), *n2 = (uint64_t *)GetProcAddress(me.hModule, "r1_n2");
+        /* (p56 timing) the loaded modules from K32EnumProcessModules, no toolhelp snapshot (a snapshot copies every module's record: tens of ms held) */
+        typedef BOOL (WINAPI *EpmFn)(HANDLE, HMODULE *, DWORD, LPDWORD); static EpmFn epm; static int epm_tried;
+        if (!epm_tried) { epm_tried = 1; epm = (EpmFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules"); }
+        static HMODULE hs[1024]; DWORD need = 0; int count = 0;
+        if (epm && epm(GetCurrentProcess(), hs, sizeof hs, &need)) count = (int)(need / sizeof(HMODULE)); if (count > 1024) count = 1024;
+        for (int i = 0; i < count; i++) {
+            uint8_t **a1 = (uint8_t **)GetProcAddress(hs[i], "r1_m1"), **a2 = (uint8_t **)GetProcAddress(hs[i], "r1_m2");
+            uint64_t *l1 = (uint64_t *)GetProcAddress(hs[i], "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(hs[i], "r1_n1"), *n2 = (uint64_t *)GetProcAddress(hs[i], "r1_n2");
             if (!a1 || !a2 || !l1 || !n1 || !n2) continue;
             *a1 = m1; *a2 = m2; *l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *n2 = WN2; *n1 = g_wn1;
-            nmod++; if (o < 1400) o += snprintf(names + o, sizeof names - o, " %s", me.szModule);
+            char path[MAX_PATH]; const char *nm = GetModuleFileNameA(hs[i], path, sizeof path) ? strrchr(path, '\\') : NULL; nm = nm ? nm + 1 : path;
+            nmod++; if (o < 1400) o += snprintf(names + o, sizeof names - o, " %s", nm);
         }
-        if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
         names[o] = 0;
         LOG("r1: MARK maps set in the exe and %d modules:%s\n", nmod, names);
     }
