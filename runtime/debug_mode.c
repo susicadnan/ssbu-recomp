@@ -88,8 +88,8 @@ void debug_mode_frame(long long frame) {
             uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t cur[0x40];
             if (impl && safe_read(impl + 0xa0, cur, sizeof cur)) {
                 if (!had || memcmp(cur, prev, sizeof cur)) {
-                    char line[600]; int o = 0;
-                    for (int i = 0; i < 0x40; i++) if (!had || cur[i] != prev[i]) o += snprintf(line + o, sizeof line - (size_t)o, " +%x:%02x->%02x", 0xa0 + i, had ? prev[i] : 0, cur[i]);
+                    char line[1200]; int o = 0;
+                    for (int i = 0; i < 0x40 && o < (int)sizeof line - 24; i++) if (!had || cur[i] != prev[i]) o += snprintf(line + o, sizeof line - (size_t)o, " +%x:%02x->%02x", 0xa0 + i, had ? prev[i] : 0, cur[i]);
                     printf("debug fmwatch: presented frame %lld: impl %llx%s:%s\n", frame, (unsigned long long)impl, had ? "" : " (first seen)", line); fflush(stdout);
                     memcpy(prev, cur, sizeof cur); had = 1;
                 }
