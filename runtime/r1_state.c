@@ -1163,6 +1163,7 @@ static void mark_undo(void) {
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
 static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
 static void ls_early_protect(void);                    /* (p64, rb_learned.c) the live worker's early protection */
+static void ls_early_undo(void);
 /* (net4, 2026-10-25 evening) the first save of a match froze both players for 1.3-1.8 s. Part of it was the shadow set-up:
  * the game's memory copied to r->s (1.9 GB), compared, copied AGAIN into the shadow, r->s given back. Now (direct) the save
  * copies the game's memory straight into the shadow and the extras, the compare after the pause reads them, and r->s is
@@ -1460,6 +1461,7 @@ static void live_late_merge(void) {
 }
 void r1_live_base_abort(void) {                         /* the match did not come (or is over): the worker stopped, nothing kept */
     if (g_live_state == 1 || g_live_state == 2) { InterlockedExchange(&g_live_stop, 1); if (g_live_th) { WaitForSingleObject(g_live_th, 8000); CloseHandle(g_live_th); g_live_th = NULL; } }
+    ls_early_undo();
     g_rt_on = 0; InterlockedExchange(&g_live_state, 0); g_live_joined = 0;
 }
 /* every marked page: dir 0 memory -> shadow (save), 1 shadow -> memory (restore); marks cleared. Returns pages. */

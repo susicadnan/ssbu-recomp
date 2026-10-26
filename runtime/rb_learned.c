@@ -101,10 +101,16 @@ static void ls_note_writer(EXCEPTION_POINTERS *e) {      /* who faulted: 0 game 
     if (i < 64) g_ls_w[i].n++;
     ReleaseSRWLockExclusive(&g_ls_wlock);
 }
+static long long g_ls_stray;                             /* (p65) pages read-only with state 0 (the early protection's, outside the ranges at the ready-go): made writable, not tracked (not in the state) */
 static int ls_open(size_t id, EXCEPTION_POINTERS *e) {   /* the page writable for good, in the learned set; 0 = not ours */
     for (;;) {
         uint8_t s = g_ls_st[id];
-        if (s == 0) return 0;
+        if (s == 0) {
+            if (!e) return 0;
+            MEMORY_BASIC_INFORMATION m; DWORD old;
+            if (VirtualQuery(ls_addr(id), &m, sizeof m) && m.State == MEM_COMMIT && (m.Protect & 0xff) == PAGE_READONLY && VirtualProtect(ls_addr(id), PG, PAGE_READWRITE, &old)) { InterlockedIncrement64(&g_ls_stray); return 1; }
+            return 0;
+        }
         if (s == 2) { DWORD old; InterlockedIncrement64(&g_ls_refault); return VirtualProtect(ls_addr(id), PG, PAGE_READWRITE, &old) ? 1 : 0; }
         if (s == 3) { InterlockedIncrement64(&g_ls_spin); YieldProcessor(); continue; }
         if (__sync_bool_compare_and_swap(&g_ls_st[id], (uint8_t)1, (uint8_t)3)) {
@@ -229,6 +235,11 @@ static void ls_early_protect(void) {                     /* the live worker thre
     g_ls_early_done = 1;
     LOG("r1: LS: EARLY: %lld pages (%.1f MB) made read-only in %.1f ms with the game running (%lld failed)\n", pages, pages * (double)PG / 1048576.0, now_ms() - t0, fails);
 }
+static void ls_fight_off(void);
+static void ls_early_undo(void) {                        /* r1_live_base_abort: no ready-go came; everything writable again */
+    if (!g_ls_early_done) return;
+    g_ls_early_done = 0; g_ls_off_done = 0; ls_fight_off();
+}
 static void ls_reprotect(void) {                         /* threads held, the new base in the shadow: only what opened or came since the early protection */
     static uint8_t *old; if (!old) old = VirtualAlloc(NULL, g_ls_np, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!old) { ls_protect_all(); return; }
@@ -250,7 +261,7 @@ static void ls_reprotect(void) {                         /* threads held, the ne
     }
     g_ls_prot_pages += again; g_ls_protfail += fails;
     g_ls_prot_ms += now_ms() - t0; g_ls_bases++; g_ls_active = 1; g_ls_off_done = 0;
-    LOG("r1: LS: EARLY kept for %lld pages, %lld made read-only again in %.1f ms (%lld failed); learned set emptied\n", kept, again, now_ms() - t0, fails);
+    LOG("r1: LS: EARLY kept for %lld pages, %lld made read-only again in %.1f ms (%lld failed, %lld stray pages opened so far); learned set emptied\n", kept, again, now_ms() - t0, fails, (long long)g_ls_stray);
 }
 static void ls_each(void (*fn)(uint32_t id, int w, size_t j)) {   /* threads held: every page of the learned set */
     LONG n = g_ls_n; if (n > g_ls_cap) n = g_ls_cap;
@@ -325,7 +336,7 @@ static void ls_rebase(void) {                            /* r1_ring_rebase, thre
 }
 static void ls_fight_off(void) {                         /* the fight is over: every page still read-only writable again */
     if (!g_ls_st || g_ls_off_done) return;
-    g_ls_early_done = 0;
+    if (g_ls_early_done) return;                          /* (p65) the early protection is up for the coming ready-go (ls_rebase takes it over, or ls_early_undo drops it) */
     g_ls_active = 0; g_ls_off_done = 1;
     double t0 = now_ms(); long long n = 0;
     for (size_t a = 0; a < g_ls_np;) {
