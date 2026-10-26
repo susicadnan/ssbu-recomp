@@ -592,7 +592,10 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
         }
         cp_init();
-        for (size_t pi = 0; pi < (WN2 >> 12); pi++) if (g_sh2c[pi] && !g_ns2[pi]) cp_add(g_sh2 + pi * PG, (uint8_t *)(uintptr_t)WIN2 + pi * PG);
+        for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31) */
+            Rng *r = &g_r[i];
+            for (size_t p = 0; p < r->n / PG; p++) { uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || cm != g_sh2c || g_ns2[pi] || !g_sh2c[pi]) continue; cp_add(sh, a); }
+        }
         {   size_t nj = g_ncj; uint8_t *diff = calloc(nj ? nj : 1, 1);
             if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL;
                 for (size_t j = 0; j < nj; j++) if (diff[j]) { async_add((uint8_t *)g_cj[j].s); memcpy(g_cj[j].d, g_cj[j].s, PG); n2++; }
