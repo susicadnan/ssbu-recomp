@@ -167,14 +167,13 @@ static void ls_protect_all(void) {                       /* threads held: every 
     LOG("r1: LS: %lld pages (%.1f MB) made read-only in %.1f ms; learned set emptied\n", g_ls_prot_pages - before, (g_ls_prot_pages - before) * (double)PG / 1048576.0, now_ms() - t0);
 }
 static int g_ls_no_protect;                              /* (net4 live) set: ls_after_setup allocates but does not protect (the refresh's ls_rebase will, under its own hold) */
-static void ls_after_setup(void) {                       /* mark_setup done, threads still held: the base is in the shadow */
-    if (!ls_on() || pm1 != &r1_m1) return;               /* (a marked game DLL is loaded: the marks are used) */
+static int ls_alloc(void) {                              /* the tables and the fault handler, once; 1 = the learned set is usable */
     g_ls_n1 = (size_t)(g_wn1 >> 12); g_ls_np = g_ls_n1 + (size_t)(WN2 >> 12);
     if (!g_ls_st) {
         g_ls_st = VirtualAlloc(NULL, g_ls_np, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         g_ls_list = VirtualAlloc(NULL, (size_t)g_ls_cap * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         g_ls_lc = VirtualAlloc(NULL, (size_t)g_ls_cap * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!g_ls_st || !g_ls_list || !g_ls_lc) { LOG("r1: LS: allocation FAILED: off\n"); g_ls_st = NULL; g_ls_on = 0; return; }
+        if (!g_ls_st || !g_ls_list || !g_ls_lc) { LOG("r1: LS: allocation FAILED: off\n"); g_ls_st = NULL; g_ls_on = 0; return 0; }
         g_ls_cmp = !(getenv("SSBU_LS_CMP") && getenv("SSBU_LS_CMP")[0] == '0');      /* (R3 net3) default ON: the same tick time, a quarter of the ring memory (SSBU_LS_CMP=0: every learned page copied) */
         {   const char *d = getenv("SSBU_LS_DECAY"); g_ls_decay = d ? atoi(d) : g_ls_cmp ? 8 : 0; if (g_ls_decay > 0) g_ls_cmp = 1;      /* (fast1) default: every 8 captures, with the churn guard */
             g_ls_pin = g_ls_decay > 0 ? VirtualAlloc(NULL, g_ls_np, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : NULL;
@@ -184,8 +183,74 @@ static void ls_after_setup(void) {                       /* mark_setup done, thr
             for (int i = 0; i < 5 && !g_ls_mod_game; i++) if (names[i] && names[i][0]) g_ls_mod_game = GetModuleHandleA(names[i]); }
         AddVectoredExceptionHandler(1, ls_veh);
     }
+    return g_ls_st != NULL;
+}
+static void ls_after_setup(void) {                       /* mark_setup done, threads still held: the base is in the shadow */
+    if (!ls_on() || pm1 != &r1_m1) return;               /* (a marked game DLL is loaded: the marks are used) */
+    if (!ls_alloc()) return;
     if (g_ls_no_protect) return;
     ls_protect_all();
+}
+/* (p64, "as seamless as possible") EARLY PROTECTION: the live worker makes the windows read-only seconds BEFORE the ready-go,
+ * with the game running (SSBU_LS_EARLY=1). A page the game writes after that faults and opens as in a fight (ls_open); the
+ * writes before the ready-go do not matter (the refresh copies every written page into the base through the write watch).
+ * At the ready-go, ls_rebase re-protects only the pages that opened or came since (thousands, not the whole 490k: the
+ * 70 ms VirtualProtect pass of the hold) and empties the learned set. A run's state bytes are set BEFORE its
+ * VirtualProtect: a fault in between cannot happen (the pages are still writable), and a fault after it finds its page
+ * known and opens it as usual (a page the handler does not know would be a crash). A page opened by a fault WHILE the
+ * worker protects its run is made read-only again by the run (its state byte 1 again): the next write faults and opens
+ * it again; the pushed id goes with the list at the ready-go. A fault in flight (state 3) ends with state 2 on a
+ * read-only page: the next write takes the state-2 path (writable again). */
+static int g_ls_early_done;
+static void ls_early_protect(void) {                     /* the live worker thread, the game running; g_r = the worker's ranges */
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_LS_EARLY"); on = e && e[0] == '1'; }
+    if (!on || g_ls_early_done || !ls_on() || pm1 != &r1_m1 || !g_win1) return;
+    if (!ls_alloc()) return;
+    double t0 = now_ms(); long long pages = 0, fails = 0;
+    memset((void *)g_ls_st, 0, g_ls_np); g_ls_n = 0; g_ls_over = 0;
+    if (g_ls_pin) memset((void *)g_ls_pin, 0, g_ls_np);
+    g_ls_active = 1;                                      /* (g_ls_off_done stays: ls_fight_off runs every pass while the fight is off and must keep returning early) */
+    for (int i = 0; i < g_nr; i++) {
+        size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
+        if (!np || !ls_id(a, &id0) || !ls_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;
+        size_t run = id0;
+        for (size_t id = id0; id <= id0 + np; id++) {
+            if (id < id0 + np && !ls_ns(id)) continue;
+            if (run < id) {
+                for (size_t k = run; k < id; k++) g_ls_st[k] = 1;      /* known first (see above) */
+                DWORD old;
+                if (VirtualProtect(ls_addr(run), (id - run) * PG, PAGE_READONLY, &old)) pages += (long long)(id - run);
+                else for (size_t k = run; k < id; k++) { if (VirtualProtect(ls_addr(k), PG, PAGE_READONLY, &old)) pages++; else { g_ls_st[k] = 0; fails++; } }
+            }
+            run = id + 1;
+        }
+    }
+    g_ls_prot_pages += pages; g_ls_protfail += fails;
+    g_ls_early_done = 1;
+    LOG("r1: LS: EARLY: %lld pages (%.1f MB) made read-only in %.1f ms with the game running (%lld failed)\n", pages, pages * (double)PG / 1048576.0, now_ms() - t0, fails);
+}
+static void ls_reprotect(void) {                         /* threads held, the new base in the shadow: only what opened or came since the early protection */
+    static uint8_t *old; if (!old) old = VirtualAlloc(NULL, g_ls_np, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!old) { ls_protect_all(); return; }
+    double t0 = now_ms(); long long kept = 0, again = 0, fails = 0;
+    memcpy(old, (const void *)g_ls_st, g_ls_np);
+    memset((void *)g_ls_st, 0, g_ls_np); g_ls_n = 0; g_ls_over = 0;
+    if (g_ls_pin) memset((void *)g_ls_pin, 0, g_ls_np);
+    for (int i = 0; i < g_nr; i++) {
+        size_t id0, idn; uint8_t *a = g_r[i].a; size_t np = g_r[i].n / PG;
+        if (!np || !ls_id(a, &id0) || !ls_id(a + (np - 1) * PG, &idn) || idn != id0 + np - 1) continue;
+        size_t run = id0;
+        for (size_t id = id0; id <= id0 + np; id++) {
+            int cut = id == id0 + np || ls_ns(id) || old[id] == 1;
+            if (!cut) continue;
+            if (run < id) { LsProtJob j = {0, 1, 0, 0}; ls_protect_run_j(run, id, &j); again += j.pages; fails += j.fails; }
+            if (id < id0 + np && !ls_ns(id)) { g_ls_st[id] = 1; kept++; }      /* read-only since the early protection: kept */
+            run = id + 1;
+        }
+    }
+    g_ls_prot_pages += again; g_ls_protfail += fails;
+    g_ls_prot_ms += now_ms() - t0; g_ls_bases++; g_ls_active = 1; g_ls_off_done = 0;
+    LOG("r1: LS: EARLY kept for %lld pages, %lld made read-only again in %.1f ms (%lld failed); learned set emptied\n", kept, again, now_ms() - t0, fails);
 }
 static void ls_each(void (*fn)(uint32_t id, int w, size_t j)) {   /* threads held: every page of the learned set */
     LONG n = g_ls_n; if (n > g_ls_cap) n = g_ls_cap;
@@ -256,10 +321,11 @@ static void ls_capture_end(void) {                       /* r1_ring_capture, aft
 }
 static void ls_rebase(void) {                            /* r1_ring_rebase, threads held, the new base in the shadow: protection again */
     if (!g_ls_st) return;
-    ls_protect_all();
+    if (g_ls_early_done) { g_ls_early_done = 0; ls_reprotect(); } else ls_protect_all();
 }
 static void ls_fight_off(void) {                         /* the fight is over: every page still read-only writable again */
     if (!g_ls_st || g_ls_off_done) return;
+    g_ls_early_done = 0;
     g_ls_active = 0; g_ls_off_done = 1;
     double t0 = now_ms(); long long n = 0;
     for (size_t a = 0; a < g_ls_np;) {

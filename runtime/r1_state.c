@@ -1162,6 +1162,7 @@ static void mark_undo(void) {
 }
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
 static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
+static void ls_early_protect(void);                    /* (p64, rb_learned.c) the live worker's early protection */
 /* (net4, 2026-10-25 evening) the first save of a match froze both players for 1.3-1.8 s. Part of it was the shadow set-up:
  * the game's memory copied to r->s (1.9 GB), compared, copied AGAIN into the shadow, r->s given back. Now (direct) the save
  * copies the game's memory straight into the shadow and the extras, the compare after the pause reads them, and r->s is
@@ -1331,6 +1332,7 @@ static DWORD WINAPI live_base_thread(void *arg) {
         Sleep(20);
         if (!g_live_stop && now_ms() - g_live_walk_t > 1500) {
             collect(&g_live_ctx); g_live_walks++; g_live_walk_t = now_ms();
+            if (g_live_walks == 3 && !g_live_stop) ls_early_protect();      /* (p64) ~3 s into the set-up: the loaders are mostly done */
             {   int w1n = 0; for (int i = 0; i < g_nr; i++) if (g_win1 && g_r[i].a >= g_win1 && g_r[i].a < g_win1 + g_wn1) w1n++;      /* (research) */
                 LOG("r1: LIVE BASE: walk %d: %d ranges, %d of window 1 (g_win1 %p)" "\n", g_live_walks, g_nr, w1n, (void *)g_win1); }
             if (ww && g_win1 && g_dc) {                   /* the pages written since the last time, copied again (tolerant): the ready-go keeps only the last 1.5 s of writes */
