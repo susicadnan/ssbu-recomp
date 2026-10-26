@@ -1274,6 +1274,7 @@ static int mark_setup_finish(void) {
  * (the full save with the game held, at the ready-go). rb_rollback.c rbg_prebase starts it, rbg_step_body finishes it
  * through r1_ring_live_finish (r1_ring.c). */
 static volatile LONG g_cp_tolerant, g_cp_skipped;         /* (defined with the copy threads below; tentative here) */
+static void live_apply_tracked(LONG from, LONG n, int *added, int *cut);      /* (net4 live) below */
 static volatile LONG g_live_stop, g_live_second, g_live_joined, g_rt_merged; static HANDLE g_live_th; static Ctx g_live_ctx; static double g_live_t0, g_live_copy_ms, g_live_walk_t;
 static int g_live_walks;
 #define RT_N 8192
@@ -1385,7 +1386,8 @@ int r1_live_base_join(void) {
         g_collect_lite = 1; collect(&g_live_ctx); g_collect_lite = 0;
         for (int i = 0; i < nw1 && g_nr < MAXR; i++) { g_r[g_nr] = w1[i]; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; }
         LONG n = g_rt_n; if (n > RT_N) n = RT_N;
-        for (LONG i = 0; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; merged++; }
+        { int ad = 0; live_apply_tracked(0, n, &ad, &cut); merged = ad; }
+        if (0) for (LONG i = 0; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; merged++; }
         g_rt_merged = n;
         qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
         int o = 0;                                       /* overlaps joined */
@@ -1394,7 +1396,7 @@ int r1_live_base_join(void) {
             g_r[o++] = g_r[i];
         }
         g_nr = o;
-        for (LONG i = 0; i < n; i++) if (g_rt_d[i]) {     /* the decommits cut out of every range */
+        if (0) for (LONG i = 0; i < n; i++) if (g_rt_d[i]) {     /* (old: the decommits cut out of every range, after every commit was added: see live_apply_tracked) */
             uint8_t *lo = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *hi = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
             for (int k = 0; k < g_nr; k++) {
                 Rng *r = &g_r[k]; uint8_t *a = r->a, *b = r->a + r->n;
@@ -1413,33 +1415,42 @@ int r1_live_base_join(void) {
     return 1;
 }
 /* (held, from r1_ring_rebase with fresh ranges) the commits and decommits tracked since the join merged, the tracking off */
-static void live_late_merge(void) {
-    LONG n = g_rt_n; if (n > RT_N) n = RT_N; LONG from = g_rt_merged; int added = 0, cut = 0;
-    g_rt_on = 0;
-    if (g_rt_over) { collect(&g_live_ctx); LOG("r1: LIVE BASE: late merge: too many tracked commits: walked again (held)\n"); return; }
-    for (LONG i = from; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; added++; }
-    if (added) {
-        qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
-        int o = 0;
-        for (int i = 0; i < g_nr; i++) {
-            if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) { uint8_t *e = g_r[i].a + g_r[i].n; if (e > g_r[o - 1].a + g_r[o - 1].n) g_r[o - 1].n = (size_t)(e - g_r[o - 1].a); continue; }
-            g_r[o++] = g_r[i];
-        }
-        g_nr = o;
-    }
-    for (LONG i = from; i < n; i++) if (g_rt_d[i]) {
+/* (p57 / p60 audit) the tracked commits and decommits applied to the list IN THEIR ORDER. Before, every commit was added and
+ * THEN every decommit cut, whatever their order: a chunk freed and allocated again (the usual thing in a loading screen)
+ * was cut after it was added, so the live list lost it (7-15k window-1 pages at the ready-go, and the crashes of p38 / p39 /
+ * p43 when the list was used without the walk). Records [from, n) of g_rt_*. */
+static void live_apply_tracked(LONG from, LONG n, int *added, int *cut) {
+    for (LONG i = from; i < n; i++) {
         uint8_t *lo = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *hi = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
+        if (hi <= lo) continue;
+        if (!g_rt_d[i]) {
+            if (g_nr < MAXR) { g_r[g_nr].a = lo; g_r[g_nr].n = (size_t)(hi - lo); g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; (*added)++; }
+            continue;
+        }
         for (int k = 0; k < g_nr; k++) {
             Rng *r = &g_r[k]; uint8_t *a = r->a, *b = r->a + r->n;
-            if (hi <= a || lo >= b) continue;
-            cut++;
-            if (lo > a && hi < b && g_nr < MAXR) { memmove(&g_r[k + 2], &g_r[k + 1], (size_t)(g_nr - k - 1) * sizeof g_r[0]); g_nr++; g_r[k + 1].a = hi; g_r[k + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a); }
+            if (!r->n || hi <= a || lo >= b) continue;
+            (*cut)++;
+            if (lo > a && hi < b && g_nr < MAXR) { memmove(&g_r[k + 2], &g_r[k + 1], (size_t)(g_nr - k - 1) * sizeof g_r[0]); g_nr++; g_r[k + 1] = *r; g_r[k + 1].a = hi; g_r[k + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a); }
             else if (lo <= a && hi >= b) r->n = 0;
             else if (lo <= a) { r->a = hi; r->n = (size_t)(b - hi); }
             else r->n = (size_t)(lo - a);
         }
     }
-    if (cut) { int o2 = 0; for (int i = 0; i < g_nr; i++) if (g_r[i].n) g_r[o2++] = g_r[i]; g_nr = o2; }
+    {   int o = 0; for (int i = 0; i < g_nr; i++) if (g_r[i].n) g_r[o++] = g_r[i]; g_nr = o; }      /* the empty ones out */
+    qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
+    {   int o = 0;                                       /* overlaps joined */
+        for (int i = 0; i < g_nr; i++) {
+            if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) { uint8_t *e = g_r[i].a + g_r[i].n; if (e > g_r[o - 1].a + g_r[o - 1].n) g_r[o - 1].n = (size_t)(e - g_r[o - 1].a); continue; }
+            g_r[o++] = g_r[i];
+        }
+        g_nr = o; }
+}
+static void live_late_merge(void) {
+    LONG n = g_rt_n; if (n > RT_N) n = RT_N; LONG from = g_rt_merged; int added = 0, cut = 0;
+    g_rt_on = 0;
+    if (g_rt_over) { collect(&g_live_ctx); LOG("r1: LIVE BASE: late merge: too many tracked commits: walked again (held)\n"); return; }
+    live_apply_tracked(from, n, &added, &cut);
     g_rt_merged = n;
     LOG("r1: LIVE BASE: late merge (held): %d commits added, %d decommits cut since the join\n", added, cut);
 }
