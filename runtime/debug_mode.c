@@ -79,6 +79,23 @@ int oe_exit_request(void);                             /* nnmisc.c */
 static volatile LONG64 g_end_limit, g_end_fight_frames, g_end_fired;
 static volatile LONG64 g_end_first_frame;
 void debug_mode_frame(long long frame) {
+    {   /* (net4, research) SSBU_DEBUG_FMWATCH=1: the FighterManager impl's bytes + 0xa0 .. + 0xe0 every presented frame, the
+         * changes printed (which byte says "the fight scene is up / the entrance runs" before the ready-go at + 0xd2) */
+        static int on = -1; if (on < 0) { const char *e = getenv("SSBU_DEBUG_FMWATCH"); on = e && e[0] == '1'; }
+        if (on) {
+            static uint8_t prev[0x40]; static int had;
+            uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+            uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t cur[0x40];
+            if (impl && safe_read(impl + 0xa0, cur, sizeof cur)) {
+                if (!had || memcmp(cur, prev, sizeof cur)) {
+                    char line[600]; int o = 0;
+                    for (int i = 0; i < 0x40; i++) if (!had || cur[i] != prev[i]) o += snprintf(line + o, sizeof line - (size_t)o, " +%x:%02x->%02x", 0xa0 + i, had ? prev[i] : 0, cur[i]);
+                    printf("debug fmwatch: presented frame %lld: impl %llx%s:%s\n", frame, (unsigned long long)impl, had ? "" : " (first seen)", line); fflush(stdout);
+                    memcpy(prev, cur, sizeof cur); had = 1;
+                }
+            } else if (had) { printf("debug fmwatch: presented frame %lld: no FighterManager impl\n", frame); fflush(stdout); had = 0; }
+        }
+    }
     if (!g_end_limit && !g_dm.text[0]) return;
     uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
     uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0;
