@@ -523,7 +523,9 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     static Extra nx[8192]; int nnx = 0;
     int ww_fail = 0; size_t ww_pages = 0;
     if (g_rg_fast_refresh) {
-        memset(in, 1, g_rg_n1);                           /* window 1: every shadow page kept (the write watch below); window 2: by the walk (in[] set in the loop below) */
+        /* (p35 bisect) window 1's shadow pages of pages NOT committed now are dropped (in[] from the ranges, in the loop below), as
+         * the slow rebase does: after a live copy over the loading screen, ~30000 shadow pages held old loader buffers whose
+         * pages were freed and given to new allocations, unwritten yet (zero) at the ready-go: a load put the old bytes back. */
         static void **ww; static const ULONG_PTR cap = 1u << 22;
         if (!ww) ww = malloc(cap * sizeof *ww);
         if (!ww) ww_fail = 1;
@@ -548,7 +550,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             uint8_t *sh = in_shadow(a, &cm, &pi);
             if (sh && g_rg_fast_refresh) {               /* (net4) window 2 in the fast refresh: compared and copied where it differs; a page new since the pre-base committed into the shadow */
                 int w2 = cm == g_sh2c;
-                if (!w2) continue;
+                if (!w2) { in[pi] = 1; continue; }        /* window 1: committed now, kept (the write watch copies what was written) */
                 if (g_ns2[pi]) continue;
                 in[g_rg_n1 + pi] = 1;
                 if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
@@ -567,6 +569,19 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 else { nx[nnx].a = a; nx[nnx].n = PG; nx[nnx].b = NULL; nnx++; }
             }
         }
+    }
+    if (g_rg_fast_refresh && g_rg_live_async && !g_rt_over) {      /* (p35 bisect) the pages of every commit tracked since the live copy started: copied again where they differ (a page freed and committed again holds zeros the write watch never saw) */
+        LONG n = g_rt_n; if (n > RT_N) n = RT_N; size_t again = 0;
+        for (LONG i = 0; i < n; i++) if (!g_rt_d[i]) {
+            uint8_t *a0 = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *a1 = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
+            for (uint8_t *a = a0; a < a1; a += PG) {
+                uint8_t *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+                if (!sh || cm != g_sh1c || g_dc[pi] || g_ns1[pi] || !in[pi]) continue;
+                if (!sh_commit(sh, cm, pi)) continue;
+                cp_add(sh, a); again++;
+            }
+        }
+        LOG("r1: RING refresh: %zu pages of the commits tracked since the live copy compared again\n", again);
     }
     g_cp_cond = 1; cp_run(); g_cp_cond = 0;               /* (net4) compared and copied where they differ, in parallel */
     if (g_rg_live_async) {
