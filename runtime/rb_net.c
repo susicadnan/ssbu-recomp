@@ -1074,3 +1074,13 @@ void rbn_report(FILE *o, long long frames) {
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);
 }
+/* report_and_exit uses ExitProcess, which does not run atexit handlers or C stream cleanup. Do not drain input or
+ * finalize new frames at shutdown: report the last completed session state and flush only records already written. */
+void rbn_exit_report(FILE *o) {
+    static volatile LONG done;
+    if (g_on <= 0 || InterlockedExchange(&done, 1)) return;
+    if (g_started) {
+        fprintf(o, "[rbnet] final report at process exit\n");
+        rbn_report(o, (long long)g_cur);
+    } else if (g_hlog) fflush(g_hlog);
+}

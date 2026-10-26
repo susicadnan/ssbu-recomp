@@ -725,6 +725,7 @@ void audio_report(FILE *out);                /* nnaudio.c: underruns of the run 
 void hid_report(FILE *out);                  /* nnhid.c: synthetic XInput pad (SSBU_XINPUT_SYNTH) */
 void os_thread_report(FILE *out);            /* os_threads.c: every thread the game created, with its nn::os arguments */
 void module_coverage_report(FILE *out);      /* nnro.c: script module functions that ran (SSBU_MODCOV=1) */
+void rbn_exit_report(FILE *out);             /* rb_net.c: final active-session counters and buffered checksum records */
 
 void (*g_exit_report_hook)(FILE *);          /* a test's own last line (nnsdk2.c eh_main_test) */
 void (*g_plugin_report_hook)(void);          /* skyline.c: how often the plugins' hooks ran */
@@ -741,6 +742,7 @@ void report_and_exit(int code) {
     hid_report(stdout);
     os_thread_report(stdout);
     module_coverage_report(stdout);
+    rbn_exit_report(stdout);
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }
     fflush(stdout);
     ExitProcess((UINT)code);
