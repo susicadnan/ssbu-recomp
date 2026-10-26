@@ -881,11 +881,12 @@ static void l1_done(int fight, LONG64 shown) {
 static void lat_release(void) {
     static HANDLE timer;
     LARGE_INTEGER now;
-    latency_mode();
-    if (g_lat_mode > 0 && !g_lockstep) {
+    /* Use the effective mode: online rollback overrides the saved low/lowest preference. */
+    int mode = latency_mode();
+    g_lat_last_d = 0;
+    if (mode > 0 && !g_lockstep) {
         LONG64 n = g_vsync_n, t = g_tick_at[n & 15];
         double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
-        g_lat_last_d = 0;
         if (g_lat_backoff > 0) InterlockedDecrement(&g_lat_backoff);
         else if (t && n == g_latch && g_lat_ri >= 256) {
             LONG64 mx = 0;
