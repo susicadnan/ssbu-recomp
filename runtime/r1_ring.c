@@ -464,8 +464,35 @@ static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; 
  * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
  * extras copied whole; nothing listed again (no 200 ms walk) and no shadow page dropped. r1_ring_ww_reset: the watch starts
  * at the pre-base. */
-static int g_rg_fast_refresh;
+static int g_rg_fast_refresh, g_rg_fresh_ranges;
 void r1_ring_ww_reset(void) { if (g_win1 && g_wn1) ResetWriteWatch(g_win1, g_wn1); }
+int r1_live_base_join(void); int r1_live_base_state(void); void r1_live_base_abort(void);
+/* (net4 live) the ready-go after a live pre-base: the worker joined (ranges complete), then match 1: the mark maps on and the
+ * ring made (as the full save's end, threads held), then the refresh (every page written since the copy started). 0 = not
+ * usable: the caller makes the base the old way */
+int r1_ring_live_finish(long long frame, Ctx *c) {
+    double t0 = now_ms();
+    if (!r1_live_base_join()) return 0;
+    if (!g_rg_ready) {
+        if (!ra_hold_quiet(200)) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
+        g_ctx_save = *c;
+        if (!mark_setup_finish()) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
+        g_ra_ready = 1; g_cycle = 1;
+        if (g_mark <= 0) { unpark(); g_ra_off = 1; LOG("r1: RING: no marks (the game DLL with marks is not loaded): OFF\n"); return 0; }
+        if (!rg_init()) { unpark(); g_rg_nomem = 2; LOG("r1: RING: its own allocations FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+        g_rg_ready = 1;
+        RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
+        s->frame = -1; s->nent = 0;
+        fibers_save(); nvn_r1_cb_save();
+        rg_meta_capture(s, &g_ctx_save);
+        unpark();
+        LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (held)\n", now_ms() - t0);
+    }
+    g_rg_fresh_ranges = 1;
+    int r = r1_ring_refresh(frame, c);
+    g_rg_fresh_ranges = 0;
+    return r;
+}
 int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
 int r1_ring_rebase(long long frame, Ctx *c) {
     if (g_rg_nomem == 2) return 0;                        /* (hs13) the ring broke earlier: no rollback */
@@ -488,7 +515,7 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
-    collect(c);                                           /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed); the walk is ~200 ms of the refresh */
+    if (!g_rg_fresh_ranges) collect(c);                   /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed); the live pre-base walked them just now (r1_ring_live_finish) */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);

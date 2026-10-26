@@ -46,21 +46,17 @@ static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu
  * From the second match on the same, with the ring's rebase (a copy of every page) instead of the full save.
  * SSBU_RB_NET_PREBASE=0: the old way (the full save at the ready-go). */
 static int g_rbg_prebased, g_rbg_prebase_setup; static long long g_rbg_prebase_tries;
-int r1_ring_refresh(long long frame, Ctx *c); void r1_ring_ww_reset(void); void nvn_ww_hold(int on);
+int r1_ring_refresh(long long frame, Ctx *c); void r1_ring_ww_reset(void); void nvn_ww_hold(int on); int r1_live_base_state(void); void r1_live_base_abort(void);
 int debug_match_setups(void); int debug_hs_ok(void); int debug_fm_scene(void); long input_frame_draws_seen(void);
 static void rbg_prebase(Ctx *c) {
-    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }      /* (2026-10-26: p22 crashed real matches because the fast refresh reused the pre-base's extras list; fixed in r1_ring_rebase, g_collect_lite) default ON again: SSBU_RB_NET_PREBASE=0 turns it off */
+    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }      /* =0: the full save at the ready-go, as before */
     if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted()) return;
     int setups = debug_match_setups();
-    if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is made */
-    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene() || input_frame_draws_seen() < 100) return;      /* the match agreed, the scene set up, the stage drawing */
-    if (++g_rbg_prebase_tries % 5) return;                   /* a try every 5th frame: a try that finds the loaders busy holds main up to 200 ms */
-    double t0 = now_ms(); int ok;
-    if (!g_rg_ready) ok = r1_ring_capture(-1, c);
-    else ok = r1_ring_rebase(-1, c);
-    if (ok) { g_rbg_prebase_setup = setups; g_rbg_prebased = 1; g_rbg_rebase = 0; nvn_ww_hold(1); r1_ring_ww_reset();
-        LOG("r1: RB NET: PRE-BASE: the ring's base made before the fight (set-up %d, %s) in %.1f ms: the ready-go will only capture frame 0\n", setups, g_rg_ready ? "full save" : "rebase", now_ms() - t0); }
-    else if (g_rg_nomem) LOG("r1: RB NET: PRE-BASE: not made (no memory): this match goes without the ring\n");
+    if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is under way */
+    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene()) return;      /* the match agreed, the scene set up (the loading screen: the copy runs under it) */
+    int r1_live_base_start(Ctx *c, int second);
+    if (r1_live_base_start(c, g_rg_ready)) { g_rbg_prebase_setup = setups; g_rbg_prebased = 2; g_rbg_rebase = 0;
+        LOG("r1: RB NET: LIVE PRE-BASE started (set-up %d, %s): the game keeps running while the ring's base is copied\n", setups, g_rg_ready ? "the existing shadow filled again" : "match 1"); }
 }      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
 void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
 static void rbg_match_report_atexit(void);
@@ -203,14 +199,25 @@ static void rbg_step_body(Ctx *c) {
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
             if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
         if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
-        if (g_rbg_prebased) {                           /* (net4) see rbg_prebase: the base refreshed (every page that changed since: the loaders still wrote during the entrance; a plain capture here DESYNCED, p20) */
+        int done = 0;
+        if (g_rbg_prebased == 2) {                      /* (net4 live) see rbg_prebase: the live copy joined, the base finished, every page written since copied */
+            double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
+            int r1_ring_live_finish(long long frame, Ctx *c); int st = r1_live_base_state();
+            int rr = (st == 1 || st == 2 || st == 3) ? r1_ring_live_finish(i, c) : 0;
+            if (rr) { done = 1; nvn_ww_hold(0); LOG("r1: RB NET: the ready-go after the LIVE pre-base: held for %.1f ms in all (no full save)\n", now_ms() - tr); }
+            else if (st == 1 || st == 2 || st == 3) { if (r1_live_base_state() > 0 && !g_rg_nomem && now_ms() - tr < 300) { LOG("r1: RB NET: the live base is not ready yet: next pass\n"); return; } }
+            if (!done) { r1_live_base_abort(); nvn_ww_hold(0); g_rbg_prebased = 0; LOG("r1: RB NET: the live pre-base could not be used (state %d): the base the old way\n", st); }
+        }
+        if (!done && g_rbg_prebased == 1) {             /* (net4) the held pre-base of p28 (SSBU_RB_NET_PREBASE_HELD=1): the base refreshed */
             double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
             int rr = r1_ring_refresh(i, c); nvn_ww_hold(0);
             if (!rr) { if (!g_rg_nomem) LOG("r1: RB NET: the base refresh at the ready-go was refused: next pass\n"); return; }
             LOG("r1: RB NET: the base refreshed at the ready-go in %.1f ms (after the pre-base: no full save here)\n", now_ms() - tr);
+            done = 1;
         }
-        else if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
-        else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
+        if (done) { }
+        else if (!done && g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
+        else if (!done) { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
         g_rbg_noring = g_rg_nomem != 0;
         rbn_set_lockstep(g_rbg_noring);
         if (g_rbg_noring) {
@@ -504,7 +511,7 @@ static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
     if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
-    if (g_rbg_prebased) nvn_ww_hold(0);
+    if (g_rbg_prebased) { nvn_ww_hold(0); if (g_rbg_prebased == 2) r1_live_base_abort(); }
     g_rbg_prebased = 0;                                 /* (net4) the next match's pre-base is its own */
     if (g_rbg_in_match == 1 && rbn_room_rollback() && !rbn_loop()) {      /* (net4) a room match: the result screen's pads exchanged until the next fight (at most 3 min) */
         static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_MENU_PADS"); want = !(e && e[0] == '0'); }

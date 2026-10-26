@@ -1117,11 +1117,14 @@ static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
  * never made. mark_setup_fill does the set-up up to and including the fill; mark_setup_finish the rest (the maps on: the
  * marks start). mark_setup = both at once (the old way, from r->s). g_dst: every page's copy (shadow or extra) in order of
  * g_r, for the compare. SSBU_R1_DIRECT=0: the old way. */
+static volatile LONG g_live_state;                      /* (net4 live) see live_base_thread below */
+void nvn_ww_hold(int on);
 static int mark_setup_fill(int direct) {
     size_t big = 0; uint8_t *base = NULL; double ms0 = now_ms(), ms_commit = 0, ms_copy = 0, ms_drop = 0, ms_x;
     for (int i = 0; i < g_nheap; i++)
         if (g_heap_span[i] > big && g_heap_base[i] != g_ar) { big = g_heap_span[i]; base = g_heap_base[i]; }
     g_win1 = base; g_wn1 = big;
+    if (g_live_state == 1 && g_win1) { ResetWriteWatch(g_win1, g_wn1); nvn_ww_hold(1); }      /* (net4 live) from here on the OS notes every page written: the copy below is made with the game running, the refresh at the ready-go takes what changed */
     g_mctx = g_ctx_save;                               /* main's registers of this (full) save */
     for (int i = 0; i < g_nheap; i++) LOG("r1: MARK: reservation >= 16 GB at %p%s\n", (void *)g_heap_base[i], g_heap_base[i] == base ? " (window 1)" : g_heap_base[i] == g_ar ? " (malloc arena)" : " (NOT a window: its pages are extras)");
     g_sh1 = VirtualAlloc(NULL, g_wn1, MEM_RESERVE, PAGE_NOACCESS); g_sh1c = calloc(g_wn1 >> 12, 1);
@@ -1206,6 +1209,123 @@ static int mark_setup_finish(void) {
         (void *)g_win1, g_wn1 / 1073741824.0, (g_wn1 >> 12) / 1048576.0, WIN2, WN2 / 1073741824.0, (WN2 >> 12) / 1048576.0, shb / 1048576.0, g_nx, g_xbytes / 1048576.0);
     ls_after_setup();                                   /* R4: the learned-set save protects the windows (threads still held) */
     return 1;
+}
+/* ---------------------------------------------------------------- (net4 live, 2026-10-26, owner: "as seamless as possible") THE LIVE PRE-BASE
+ * The ring's base (the full copy of the game's memory into the shadow, 1.9 GB) is made by a worker thread WHILE THE GAME
+ * RUNS, from the match's set-up on (the loading screen, the entrance): no hold, no hitch. The OS write watch (the game's
+ * region is reserved with MEM_WRITE_WATCH) starts when the copy starts, so every page the game or its loaders write
+ * during or after the copy is copied again at the ready-go (r1_ring_refresh: threads held, only those pages), and torn
+ * pages of the live copy do not matter. The ranges are walked at the start and again every 1.5 s (the learned-set
+ * protection at the ready-go is built from that list); the commits and decommits between the last walk and the
+ * ready-go are tracked (live_track) and merged in. Match 1: the shadow is made and filled (mark_setup_fill, direct);
+ * from the second match on every committed page is copied into the existing shadow. Anything failing -> the old way
+ * (the full save with the game held, at the ready-go). rb_rollback.c rbg_prebase starts it, rbg_step_body finishes it
+ * through r1_ring_live_finish (r1_ring.c). */
+static volatile LONG g_live_stop, g_live_second, g_live_joined; static HANDLE g_live_th; static Ctx g_live_ctx; static double g_live_t0, g_live_copy_ms, g_live_walk_t;
+static int g_live_walks;
+#define RT_N 8192
+static uint8_t *g_rt_a[RT_N]; static size_t g_rt_n_[RT_N]; static uint8_t g_rt_d[RT_N]; static volatile LONG g_rt_n, g_rt_over, g_rt_on;
+static void live_track(void *p, size_t n, int decommit) {
+    if (!g_rt_on || !n) return;
+    LONG i = InterlockedIncrement(&g_rt_n) - 1;
+    if (i < RT_N) { g_rt_a[i] = (uint8_t *)p; g_rt_n_[i] = n; g_rt_d[i] = (uint8_t)decommit; } else g_rt_over = 1;
+}
+static int live_memcheck(void) {
+    size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n;
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+    double need = tot / 1048576.0 + 512.0, avail = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPageFile / 1048576.0 : 1e12;
+    g_save_need_mb = need; g_save_avail_mb = avail;
+    if (rb_test_nomem() == 1 || avail < need + 1024.0) { LOG("r1: LIVE BASE: not enough free commit memory: it needs %.0f MB (+ 1024 MB left for the game), %.0f MB free\n", need, avail); return 0; }
+    return 1;
+}
+static DWORD WINAPI live_base_thread(void *arg) {
+    (void)arg; double t0 = now_ms();
+    collect(&g_live_ctx); g_live_walks = 1; g_live_walk_t = now_ms();
+    if (!live_memcheck()) { g_live_state = -1; return 0; }
+    if (!g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { LOG("r1: LIVE BASE: fiber pool allocation FAILED\n"); g_live_state = -1; return 0; } }
+    if (g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { LOG("r1: LIVE BASE: list allocation FAILED\n"); g_live_state = -1; return 0; } }
+    cp_init();
+    int ok = 1; size_t pages = 0;
+    if (!g_live_second) {
+        g_ctx_save = g_live_ctx; g_rs_drop = 1; ok = mark_setup_fill(1); g_rs_drop = 0;      /* the shadow made and filled straight from the game's memory (the write watch starts inside, once the windows are known) */
+    } else {
+        if (g_win1) { ResetWriteWatch(g_win1, g_wn1); nvn_ww_hold(1); }
+        for (int i = 0; i < g_nr && ok; i++) {
+            Rng *r = &g_r[i]; size_t np = r->n / PG;
+            for (size_t p = 0; p < np; p++) {
+                uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+                if (!sh) continue;
+                if (cm == g_sh2c ? g_ns2[pi] : g_ns1[pi]) continue;
+                if (!sh_commit(sh, cm, pi)) { LOG("r1: LIVE BASE: commit of the shadow FAILED (out of memory)\n"); ok = 0; break; }
+                cp_add(sh, a); pages++;
+            }
+            cp_run();
+        }
+    }
+    if (!ok) { g_live_state = -1; return 0; }
+    g_live_copy_ms = now_ms() - t0;
+    LOG("r1: LIVE BASE: %s copied in %.0f ms with the game running (%s); the ranges walked again every 1.5 s until the ready-go\n", g_live_second ? "every committed page" : "the shadow made and filled", g_live_copy_ms, g_live_second ? "into the existing shadow" : "match 1");
+    InterlockedExchange(&g_live_state, 2);
+    while (!g_live_stop) {
+        Sleep(20);
+        if (!g_live_stop && now_ms() - g_live_walk_t > 1500) { collect(&g_live_ctx); g_live_walks++; g_live_walk_t = now_ms(); }
+    }
+    InterlockedExchange(&g_live_state, 3);
+    return 0;
+}
+int r1_live_base_start(Ctx *c, int second) {           /* rb_rollback.c rbg_prebase, at a safe point with the fight off */
+    if (g_live_state == 1 || g_live_state == 2) return 1;
+    g_live_ctx = *c; g_live_second = second; g_live_stop = 0; g_live_joined = 0; g_rt_n = 0; g_rt_over = 0; g_rt_on = 1; g_live_t0 = now_ms();
+    InterlockedExchange(&g_live_state, 1);
+    g_live_th = CreateThread(NULL, 0, live_base_thread, NULL, 0, NULL);
+    if (!g_live_th) { g_live_state = -1; g_rt_on = 0; return 0; }
+    return 1;
+}
+int r1_live_base_state(void) { return g_live_state; }
+/* the ready-go: the worker stopped (its copy finished first, if it was still at it), the commits since the last walk merged
+ * into the ranges, the decommits cut out. 1 = the ranges are good, 0 = nothing usable (the old way then) */
+static int cmp_rng(const void *a, const void *b);
+int r1_live_base_join(void) {
+    if (g_live_joined) return g_live_joined > 0;
+    if (g_live_state <= 0) { g_live_joined = -1; return 0; }
+    InterlockedExchange(&g_live_stop, 1);
+    double tw = now_ms();
+    if (g_live_th) { DWORD w = WaitForSingleObject(g_live_th, 8000); if (w != WAIT_OBJECT_0) { LOG("r1: LIVE BASE: the worker did not finish in 8 s: not used\n"); g_live_joined = -1; return 0; } CloseHandle(g_live_th); g_live_th = NULL; }
+    g_rt_on = 0;
+    if (g_live_state != 3) { g_live_joined = -1; return 0; }
+    int merged = 0, cut = 0;
+    if (g_rt_over) { collect(&g_live_ctx); merged = -1; }
+    else {
+        LONG n = g_rt_n; if (n > RT_N) n = RT_N;
+        for (LONG i = 0; i < n; i++) if (!g_rt_d[i] && g_nr < MAXR) { uint8_t *a = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)); size_t len = (g_rt_n_[i] + ((uintptr_t)g_rt_a[i] - (uintptr_t)a) + PG - 1) & ~(size_t)(PG - 1); g_r[g_nr].a = a; g_r[g_nr].n = len; g_r[g_nr].s = NULL; g_r[g_nr].dirty = NULL; g_r[g_nr].async = NULL; g_nr++; merged++; }
+        qsort(g_r, (size_t)g_nr, sizeof g_r[0], cmp_rng);
+        int o = 0;                                       /* overlaps joined */
+        for (int i = 0; i < g_nr; i++) {
+            if (o && g_r[i].a < g_r[o - 1].a + g_r[o - 1].n) { uint8_t *e = g_r[i].a + g_r[i].n; if (e > g_r[o - 1].a + g_r[o - 1].n) g_r[o - 1].n = (size_t)(e - g_r[o - 1].a); continue; }
+            g_r[o++] = g_r[i];
+        }
+        g_nr = o;
+        for (LONG i = 0; i < n; i++) if (g_rt_d[i]) {     /* the decommits cut out of every range */
+            uint8_t *lo = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *hi = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
+            for (int k = 0; k < g_nr; k++) {
+                Rng *r = &g_r[k]; uint8_t *a = r->a, *b = r->a + r->n;
+                if (hi <= a || lo >= b) continue;
+                cut++;
+                if (lo > a && hi < b && g_nr < MAXR) { memmove(&g_r[k + 2], &g_r[k + 1], (size_t)(g_nr - k - 1) * sizeof g_r[0]); g_nr++; g_r[k + 1].a = hi; g_r[k + 1].n = (size_t)(b - hi); r->n = (size_t)(lo - a); }
+                else if (lo <= a && hi >= b) r->n = 0;
+                else if (lo <= a) { r->a = hi; r->n = (size_t)(b - hi); }
+                else r->n = (size_t)(lo - a);
+            }
+        }
+        int o2 = 0; for (int i = 0; i < g_nr; i++) if (g_r[i].n) g_r[o2++] = g_r[i]; g_nr = o2;
+    }
+    LOG("r1: LIVE BASE: joined at the ready-go after %.1f s (copy %.0f ms, %d walks, waited %.0f ms); commits since the last walk: %s, decommits cut %d\n", (now_ms() - g_live_t0) / 1000.0, g_live_copy_ms, g_live_walks, now_ms() - tw, merged < 0 ? "too many: walked again" : "merged", cut);
+    g_live_joined = 1;
+    return 1;
+}
+void r1_live_base_abort(void) {                         /* the match did not come (or is over): the worker stopped, nothing kept */
+    if (g_live_state == 1 || g_live_state == 2) { InterlockedExchange(&g_live_stop, 1); if (g_live_th) { WaitForSingleObject(g_live_th, 8000); CloseHandle(g_live_th); g_live_th = NULL; } }
+    g_rt_on = 0; InterlockedExchange(&g_live_state, 0); g_live_joined = 0;
 }
 /* every marked page: dir 0 memory -> shadow (save), 1 shadow -> memory (restore); marks cleared. Returns pages. */
 /* Round 5 (cheaper sweep): window 1 is 62 GB (a 15.5 MB map) but the game commits only ~2 GB of it: the map is swept only
@@ -2178,8 +2298,10 @@ static void dc_set(void *p, size_t n, int v) {
     if (i1 > (g_wn1 >> 12)) i1 = g_wn1 >> 12;
     memset(g_dc + i0, v, i1 - i0);
 }
-void r1_on_decommit(void *p, size_t n) { r1_mark_range((uint64_t)(uintptr_t)p, n); ls_range((uint64_t)(uintptr_t)p, n, 1); dc_set(p, n, 1); }
+void r1_on_decommit(void *p, size_t n) { live_track(p, n, 1); r1_mark_range((uint64_t)(uintptr_t)p, n); ls_range((uint64_t)(uintptr_t)p, n, 1); dc_set(p, n, 1); }
+static void live_track(void *p, size_t n, int decommit);  /* (net4 live) below */
 void r1_on_commit(void *p, size_t n) {
+    live_track(p, n, 0);
     dc_set(p, n, 0);
     ls_range((uint64_t)(uintptr_t)p, n, 2);              /* R4: new pages of a fight read-only (their first write faults) */
     uint8_t *a = (uint8_t *)p;
