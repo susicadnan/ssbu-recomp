@@ -2213,6 +2213,7 @@ static void ra_report(void) {
     for (long long i = printed; i < g_ra_nkind; i += 200, printed = i < g_ra_nkind ? i : g_ra_nkind) LOG("r1: RA kinds %lld: %.*s\n", i + 1, (int)(g_ra_nkind - i < 200 ? g_ra_nkind - i : 200), g_ra_kind + i);
     if (rgs_wanted()) rgs_report();
 }
+static const char *cm_find(uint8_t *a, char *b, size_t bn);      /* (research) below: the tracked commits */
 #include "r1_ring.c"                                  /* R2: the snapshot ring (rollback) */
 #include "rb_rollback.c"                              /* R3: online rollback on the ring (SSBU_RB_NET) */
 static void ra_init(void) {
