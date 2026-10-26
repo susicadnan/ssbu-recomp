@@ -36,7 +36,7 @@ void input_mark(const char *what);                      /* nnhid.c: the input se
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
 static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
 static int g_rbg_mr_done;                                 /* (net4) this match's report written (once: at the fight's end, or at the exit during a fight) */
-static int g_rbg_menu; static double g_rbg_menu_t0; static RbPad g_rbg_menu_own;      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
+static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu_other_a; static RbPad g_rbg_menu_own;      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
 void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
 static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
@@ -407,9 +407,13 @@ static void rbg_step(Ctx *c) {
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
 static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_rbg_menu && !g_rbg_in_match && (id == 0 || id == 1)) {      /* (net4) the result screen after a room match: see rbg_fight_off */
-        if (now_ms() - g_rbg_menu_t0 > 180000 || rbn_peer_gone()) {
+        /* (net4, 2026-10-25 21:00, real players: the forwarded pads went on into the room's character select, where an A press on
+         * a port ADDS a local player: "Retard1 / Adnan2 / Retard2" panels) menu mode ends 1.5 s after BOTH players' OK (A) presses
+         * were seen (the result screens are through by then), or after 60 s, or when the other player is gone */
+        double tn = now_ms(); int both = g_rbg_menu_own_a > 0 && g_rbg_menu_other_a > 0;
+        if ((both && tn - (g_rbg_menu_own_a > g_rbg_menu_other_a ? g_rbg_menu_own_a : g_rbg_menu_other_a) > 1500) || tn - g_rbg_menu_t0 > 60000 || rbn_peer_gone()) {
             long long tx, rx; rbn_menu_counts(&tx, &rx); g_rbg_menu = 0;
-            LOG("r1: RB NET: menu mode off (%s after %.0f s; pads sent %lld, received %lld): the ports are this PC's own again\n", rbn_peer_gone() ? "the other player is gone" : "time is up", (now_ms() - g_rbg_menu_t0) / 1000.0, tx, rx);
+            LOG("r1: RB NET: menu mode off (%s after %.1f s; pads sent %lld, received %lld): the ports are this PC's own again\n", rbn_peer_gone() ? "the other player is gone" : both ? "both OK presses seen" : "time is up", (tn - g_rbg_menu_t0) / 1000.0, tx, rx);
             return;
         }
         int local = rbn_local_player();
@@ -421,6 +425,7 @@ static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
         RbPad src; int have = 1;
         if (id == local) src = g_rbg_menu_own; else have = rbn_menu_pad(&src);
         if (!have) memset(&src, 0, sizeof src);
+        if (src.buttons & 1) { if (id == local) g_rbg_menu_own_a = tn; else g_rbg_menu_other_a = tn; }      /* (BTN_A = bit 0, nnhid.c) */
         *b = src.buttons; *lx = src.lx; *ly = src.ly; *rx = src.rx; *ry = src.ry;
         return;
     }
@@ -470,7 +475,7 @@ static void rbg_fight_off(void) {
     if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
     if (g_rbg_in_match == 1 && rbn_room_rollback() && !rbn_loop()) {      /* (net4) a room match: the result screen's pads exchanged until the next fight (at most 3 min) */
         static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_MENU_PADS"); want = !(e && e[0] == '0'); }
-        if (want) { g_rbg_menu = 1; g_rbg_menu_t0 = now_ms(); memset(&g_rbg_menu_own, 0, sizeof g_rbg_menu_own);
+        if (want) { g_rbg_menu = 1; g_rbg_menu_t0 = now_ms(); g_rbg_menu_own_a = g_rbg_menu_other_a = 0; memset(&g_rbg_menu_own, 0, sizeof g_rbg_menu_own);
             LOG("r1: RB NET: menu mode: the result screen's pads are exchanged with the other game (its player's OK press reaches its port here)\n"); }
     }      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
