@@ -492,7 +492,8 @@ int r1_ring_live_finish(long long frame, Ctx *c) {
     double t0 = now_ms();
     if (!r1_live_base_join()) return 0;
     if (!g_rg_ready) {
-        if (!ra_hold_quiet(200)) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
+        g_hq_long_ms = 40; int hq = ra_hold_quiet(200); g_hq_long_ms = 0;
+        if (!hq) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
         g_ctx_save = *c; double tfh = now_ms();
         g_ls_no_protect = 1; int mf = mark_setup_finish(); g_ls_no_protect = 0; double tfm = now_ms();      /* the protection comes with the refresh below (under its hold): protecting here made the next hold take 185 ms of faults */
         if (!mf) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
@@ -522,7 +523,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     double t0 = now_ms();
     r1_ring_let_go();
     r1_ring_release();
-    if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
+    g_hq_long_ms = 40; int hq = ra_hold_quiet(200); g_hq_long_ms = 0;
+    if (!hq) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
     double t1 = now_ms(); double tpre = t1;
     HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
     HANDLE aw_th = NULL;                                  /* (p48: a 30 ms window found nothing and the audio thread crashed at a load; the whole held time is the window again, read at the end, see below) */

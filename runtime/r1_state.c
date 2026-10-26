@@ -1882,6 +1882,7 @@ static void r1_hold_prof_report(void) {
     LOG("r1: HOLD PROF: %lld holds; fiber checks %lld, %.4f ms each\n", g_hp_holds, g_hp_fib_n, g_hp_fib_n ? g_hp_fib_ms / g_hp_fib_n : 0.0);
     for (int i = 0; i < g_hp_n; i++) LOG("r1: HOLD PROF thread %s: %lld times, mean %.4f ms, max %.3f ms, retries %lld\n", g_hp[i].n, g_hp[i].cnt, g_hp[i].ms / (g_hp[i].cnt ? g_hp[i].cnt : 1), g_hp[i].mx, g_hp[i].spins);
 }
+static double g_hq_long_ms;                             /* (p63 timing) set around the ready-go holds: a thread not at a wait is waited for in place up to this long (each failed try cost a suspend + resume of every thread, 3 ms, over 4-16 tries: nus3::audio update) */
 static int ra_hold_save(void) {
     DWORD me = GetCurrentThreadId(); Ctx *tc; const char *nm; HANDLE h;
     if (g_hp_on < 0) g_hp_on = getenv("SSBU_RB_HOLD_PROF") && atoi(getenv("SSBU_RB_HOLD_PROF")) > 0;
@@ -1921,7 +1922,7 @@ static int ra_hold_save(void) {
             if (SuspendThread(t->h) == (DWORD)-1) break;
             if (waiting_import(t->c->in_import) && th_blocked(t->h)) { t->held = 1; t->parked = 1; t->rsp = g_tb_rsp; t->rip = g_tb_rip; t->cok = 1; break; }
             ResumeThread(t->h); spins++;
-            if (now_ms() - t0 > g_ra_park_ms) {
+            if (now_ms() - t0 > (g_hq_long_ms > g_ra_park_ms ? g_hq_long_ms : g_ra_park_ms)) {
                 if (g_hp_on) hp_add(t->name, now_ms() - t0, spins);
                 for (int j = 0; j < i; j++) th_resume(&g_th[j]);
                 ra_wh_give_back();
