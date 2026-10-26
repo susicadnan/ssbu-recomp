@@ -763,12 +763,19 @@ int latency_mode(void) {
         printf("display: latency = %s%s (margin %.1f ms)%c", g_lat_mode == 2 ? "lowest" : g_lat_mode == 1 ? "low" : "normal",
                g_lat_mode ? ": the game is released late in the frame so that it reads the pad just in time for the next tick" : "", g_lat_margin, 10);
     }
-    /* (net4) an online rollback match runs as "normal": low / lowest release the game late in the frame, on purpose just in
-     * time for the tick, which takes away the spare time a rollback hides in (every rollback then shows as a late frame) */
+    /* (net4) meant to make an online match run as "normal", but only pace_options asks this, once, at the first present
+     * (before any match), so it never took effect: the release delay (lat_release) runs online too. (resp1, 2026-10-26)
+     * Kept, and made rollback-aware there instead: the delay is the frame's idle time moved before the pad read, and a
+     * rollback that becomes pending during it lets the game go at once (see lat_release). */
     { int rbn_started(void); if (g_lat_mode && rbn_started()) return 0; }
     return g_lat_mode;
 }
-typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks; int polls, press; } L1Frame;
+typedef struct { LONG64 release, poll, call, ready, qp, shown, n, fight_ticks; int polls, press, rb; } L1Frame;
+/* (resp1) online: the frame was let go early for a pending rollback (in the release delay, or the refresh wait put off):
+ * its release -> ready time holds the rollback, so it is not a sample for the delay, and its lateness is not the delay's */
+static volatile LONG g_lat_rb;
+static LONG64 g_lat_rb_early, g_lat_rb_saved;
+static int (*g_rb_pending)(void);                       /* rb_rollback.c, through display_set_rb_pending (below) */
 static L1Frame g_l1_ring[64], g_l1_cur;
 static volatile LONG64 g_l1_wr, g_l1_rd;
 static volatile LONG64 g_l1_poll_qpc, g_l1_polls, g_l1_ticks;
@@ -828,11 +835,12 @@ static void l1_plan(int late) {
     if (InterlockedExchange(&g_l1_waited, 0)) { g_l1_chk_frames++; if (g_l1_subs_now) { g_l1_chk_bad++; g_l1_chk_subs += g_l1_subs_now; } }
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (late && g_lat_mode > 0) { InterlockedExchange(&g_lat_backoff, 300); g_lat_backoffs++; }      /* round 2: ANY late frame: no delay for 300 frames (a spike tends to come with others) */
+    int rb = InterlockedExchange(&g_lat_rb, 0);
+    if (late && g_lat_mode > 0 && !rb) { InterlockedExchange(&g_lat_backoff, 300); g_lat_backoffs++; }      /* round 2: ANY late frame: no delay for 300 frames (a spike tends to come with others) */
     L1Frame f;
     memset(&f, 0, sizeof f);
     f.release = g_lat_release; f.poll = g_l1_poll_qpc; f.call = now.QuadPart; f.n = g_frames + 1; f.polls = (int)InterlockedExchange64(&g_l1_polls, 0); f.fight_ticks = g_l1_ticks;
-    f.press = InterlockedExchange(&g_l1_press, 0);
+    f.press = InterlockedExchange(&g_l1_press, 0); f.rb = rb;
     if (f.poll && f.poll < f.release) f.poll = 0;                  /* no poll since the release: the frame did not read the pad after it */
     g_l1_ring[g_l1_wr & 63] = f;
     InterlockedIncrement64(&g_l1_wr);
@@ -848,12 +856,12 @@ static void l1_ready(LONG64 tgt) {
     InterlockedIncrement64(&g_l1_rd);
     g_l1_cur.ready = now.QuadPart;
     (void)late;
-    if (g_lat_mode > 0 && tgt && g_lat_last_d > 0) {      /* round 2: a NEAR miss of a delayed frame (ready < 2 ms before its tick): no delay for 120 frames */
+    if (g_lat_mode > 0 && tgt && g_lat_last_d > 0 && !g_l1_cur.rb) {      /* round 2: a NEAR miss of a delayed frame (ready < 2 ms before its tick): no delay for 120 frames */
         LONG64 n = g_vsync_n, t = g_tick_at[n & 15];
         double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
         if (t && (double)t + (double)(tgt - n) * per - (double)now.QuadPart < 2.0 * (double)g_freq.QuadPart / 1000.0) { if (g_lat_backoff < 120) InterlockedExchange(&g_lat_backoff, 120); g_lat_near++; }
     }
-    if (g_l1_cur.release && now.QuadPart > g_l1_cur.release && now.QuadPart - g_l1_cur.release < g_freq.QuadPart / 10) {
+    if (g_l1_cur.release && !g_l1_cur.rb && now.QuadPart > g_l1_cur.release && now.QuadPart - g_l1_cur.release < g_freq.QuadPart / 10) {
         LONG i = InterlockedIncrement(&g_lat_ri);
         g_lat_r[i & 255] = now.QuadPart - g_l1_cur.release;
     }
@@ -894,7 +902,14 @@ static void lat_release(void) {
             if (d > dmax) d = dmax;
             if (d > (double)g_freq.QuadPart / 2000.0) {
                 if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002, TIMER_ALL_ACCESS);
-                precise_wait_until(t + (LONG64)d, timer);
+                LONG64 until = t + (LONG64)d;
+                if (g_rb_pending) {                        /* (resp1) online: asked every millisecond, as the refresh wait does */
+                    LONG64 step = g_freq.QuadPart / 1000;
+                    for (QueryPerformanceCounter(&now); now.QuadPart < until; QueryPerformanceCounter(&now)) {
+                        if (g_rb_pending()) { InterlockedExchange(&g_lat_rb, 1); g_lat_rb_early++; g_lat_rb_saved += until - now.QuadPart; d = (double)(now.QuadPart - t); break; }
+                        precise_wait_until(now.QuadPart + step < until ? now.QuadPart + step : until, timer);
+                    }
+                } else precise_wait_until(until, timer);
                 g_lat_d_sum += (LONG64)d; g_lat_d_n++; g_lat_last_d = (LONG64)d;
             }
         }
@@ -911,6 +926,7 @@ static void l1_report(FILE *out) {
     { void nvn_l1_report(FILE *out); nvn_l1_report(out); }
     if (g_lat_mode) fprintf(out, "l1: latency = %s: release delayed in %lld of %lld waits, mean delay %.2f ms, late frames (then 300 frames without) %lld, near misses (then 120 without) %lld\n", g_lat_mode == 2 ? "lowest" : "low", (long long)g_lat_d_n, (long long)g_lat_waits,
                             g_lat_d_n ? (double)g_lat_d_sum / (double)g_lat_d_n * 1000.0 / (double)g_freq.QuadPart : 0.0, (long long)g_lat_backoffs, (long long)g_lat_near);
+    if (g_lat_mode && g_lat_rb_early) fprintf(out, "l1: online: the release delay was cut short for a pending rollback %lld times (%.2f ms given to the rollback on average)\n", (long long)g_lat_rb_early, (double)g_lat_rb_saved / (double)g_lat_rb_early * 1000.0 / (double)g_freq.QuadPart);
     if (!g_l1) return;
     for (int k = 0; k < L1_ST; k++) {
         if (!g_l1_cnt[k]) continue;
@@ -1018,7 +1034,6 @@ void display_present_done(int fight) {
     }
 }
 /* (net4) see display_wait_refresh: the pending-rollback question, the wait put off, and the wait made up */
-static int (*g_rb_pending)(void);
 static volatile LONG g_vsync_deferred; static LONG64 g_vsync_deferred_latch, g_vsync_deferred_n;
 void display_set_rb_pending(int (*fn)(void)) { g_rb_pending = fn; }
 long long display_vsync_deferred_count(void) { return g_vsync_deferred_n; }
@@ -1094,7 +1109,7 @@ int display_wait_refresh(void) {
         SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, g_rb_pending ? 1 : 100, 0);
         if (g_vsync_n < g_latch && g_rb_pending) {
             ReleaseSRWLockExclusive(&g_vsync_lock);
-            if (g_rb_pending()) { g_vsync_deferred_latch = g_latch; InterlockedExchange(&g_vsync_deferred, 1); g_vsync_deferred_n++; return 1; }
+            if (g_rb_pending()) { g_vsync_deferred_latch = g_latch; InterlockedExchange(&g_vsync_deferred, 1); g_vsync_deferred_n++; InterlockedExchange(&g_lat_rb, 1); return 1; }
             AcquireSRWLockExclusive(&g_vsync_lock);
         }
     }
