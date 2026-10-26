@@ -65,7 +65,7 @@ static Rng g_r[MAXR];
 static int g_nr;
 static int g_on = -1, g_n, g_k, g_p, g_c, g_cycle, g_phase;        /* phase 0 idle, 1 first pass, 2 re-run, 3 done */
 static long long g_ff, g_target;
-static uint8_t *g_heap_base[8]; static int g_nheap;
+static uint8_t *g_heap_base[8]; static size_t g_heap_span[8]; static int g_nheap;      /* (net4) g_heap_span: the reservation's size, from find_heaps' walk */
 static Ctx g_ctx_save;
 static double g_qpf;
 static double now_ms(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / g_qpf; }
@@ -146,12 +146,12 @@ static void find_heaps(void) {             /* once: the reservations of >= 16 GB
     uint8_t *cur = NULL; size_t span = 0;
     for (uint8_t *p = (uint8_t *)0x10000; (uintptr_t)p < 0x7FFFFFFF0000ull && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
         if (m.AllocationBase != cur) {
-            if (cur && span >= (16ull << 30) && g_nheap < 8) g_heap_base[g_nheap++] = cur;
+            if (cur && span >= (16ull << 30) && g_nheap < 8) { g_heap_span[g_nheap] = span; g_heap_base[g_nheap++] = cur; }
             cur = (uint8_t *)m.AllocationBase; span = 0;
         }
         if (cur) span += m.RegionSize;
     }
-    if (cur && span >= (16ull << 30) && g_nheap < 8) g_heap_base[g_nheap++] = cur;
+    if (cur && span >= (16ull << 30) && g_nheap < 8) { g_heap_span[g_nheap] = span; g_heap_base[g_nheap++] = cur; }
     for (int i = 0; i < g_nheap; i++) LOG("r1: game address region %d at %p\n", i, (void *)g_heap_base[i]);
 }
 static uint64_t g_ex[512][2]; static int g_nex;                       /* other guest threads' stacks: never saved / restored */
@@ -624,6 +624,7 @@ static size_t g_saved_bytes;
  * range at a time. The result is the same bytes. */
 static void cp_init(void); static void cp_add(uint8_t *d, const uint8_t *s); static void cp_add_range(uint8_t *d, const uint8_t *s, size_t n); static void cp_run(void);
 static uint8_t *g_cp_cmp;
+static uint8_t **g_dst; static size_t g_dst_n; static int mark_setup_fill(int direct); static int mark_setup_finish(void);      /* (net4) see mark_setup_fill */
 static void save(Ctx *c) {
     double t0 = now_ms();
     collect(c);
@@ -640,13 +641,21 @@ static void save(Ctx *c) {
             g_save_failed = 2; return;
         }
     }
+    int direct = 0;                                   /* (net4) the first save straight into the shadow: see mark_setup_fill */
+    {   static int want = -1; if (want < 0) { const char *e = getenv("SSBU_R1_DIRECT"); want = !(e && e[0] == '0'); }
+        direct = want && g_mark > 0 && g_cycle == 0 && g_rs_drop && rb_test_nomem() != 2; }
     {   int bad = 0;
+        if (direct) {                                   /* (allocated before the threads are held) */
+            size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n / PG;
+            free(g_dst); g_dst = malloc((tot ? tot : 1) * sizeof *g_dst); g_dst_n = g_dst ? tot : 0;
+            if (!g_dst) { bad = 1; LOG("r1: FULL SAVE NOT MADE: page list allocation FAILED\n"); }
+        }
         for (int i = 0; i < g_nr && !bad; i++) {
             Rng *r = &g_r[i];
-            r->s = (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
+            r->s = direct ? NULL : (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
             r->dirty = calloc(r->n / PG, 1);
             r->async = calloc(r->n / PG, 1);
-            if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
+            if ((!r->s && !direct) || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
         }
         if (!bad && !g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
         if (!bad && g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { bad = 1; LOG("r1: FULL SAVE NOT MADE: list allocation FAILED\n"); } }   /* no allocation while threads are held */
@@ -658,9 +667,11 @@ static void save(Ctx *c) {
     fibers_save();
     double t1b = now_ms();
     cp_init();
-    for (int i = 0; i < g_nr; i++) { cp_add_range(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
-    cp_run();
+    int mfail = 0;
+    if (direct) { g_ctx_save = *c; mfail = !mark_setup_fill(1); for (int i = 0; i < g_nr; i++) g_saved_bytes += g_r[i].n; }
+    else { for (int i = 0; i < g_nr; i++) { cp_add_range(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; } cp_run(); }
     double t2 = now_ms();
+    if (mfail) { unpark(); release(); g_save_failed = 2; return; }
     {   /* pages the OTHER threads write while main is held here (audio, vsync counter, loaders, render threads): they are
          * not the simulation's; they are left out of restore and verify. SSBU_R1_PAUSE=<ms> (default 50, 0 = none) */
         const char *pe = getenv("SSBU_R1_PAUSE"); int pause = pe ? atoi(pe) : 30;
@@ -670,23 +681,28 @@ static void save(Ctx *c) {
             size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n / PG;
             uint8_t *diff = calloc(tot ? tot : 1, 1);
             if (diff) {                                   /* the compare by the copy threads (nothing copied); then only the pages that differ */
-                for (int i = 0; i < g_nr; i++) cp_add_range(g_r[i].a, g_r[i].s, g_r[i].n);
-                g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL;
+                if (direct) { size_t k = 0; for (int i = 0; i < g_nr; i++) for (size_t p = 0; p < g_r[i].n / PG; p++, k++) { if (g_dst[k]) cp_add(g_r[i].a + p * PG, g_dst[k]); else diff[k] = 2; } }
+                else for (int i = 0; i < g_nr; i++) cp_add_range(g_r[i].a, g_r[i].s, g_r[i].n);
+                if (direct) {                             /* (the jobs are the pages with a copy only: their results back in page order) */
+                    size_t nj = 0; for (size_t k = 0; k < tot; k++) nj += diff[k] != 2;
+                    uint8_t *res = calloc(nj ? nj : 1, 1); g_cp_cmp = res; cp_run(); g_cp_cmp = NULL;
+                    for (size_t k = 0, j = 0; k < tot; k++) diff[k] = diff[k] == 2 ? 0 : res[j++];
+                    free(res);
+                } else { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL; }
             }
             size_t q = 0;
             for (int i = 0; i < g_nr; i++) {
                 Rng *r = &g_r[i];
                 for (size_t p = 0; p < r->n / PG; p++, q++)
-                    if (diff ? diff[q] : memcmp(r->a + p * PG, r->s + p * PG, PG) != 0) {
+                    if (diff ? diff[q] : direct ? (g_dst[q] && memcmp(r->a + p * PG, g_dst[q], PG) != 0) : memcmp(r->a + p * PG, r->s + p * PG, PG) != 0) {
                         r->async[p] = 1; np++; if (g_audio_free) async_add(r->a + p * PG);
-                        memcpy(r->s + p * PG, r->a + p * PG, PG);
+                        if (direct) { if (g_dst[q]) memcpy(g_dst[q], r->a + p * PG, PG); } else memcpy(r->s + p * PG, r->a + p * PG, PG);
                         if (g_cycle == 0 && shown < 40) g_e[shown++].a = r->a + p * PG;
                     }
             }
             free(diff);
         }
-        int mfail = 0;
-        if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
+        if (g_mark > 0 && g_cycle == 0) { if (direct) mfail = !mark_setup_finish(); else { g_ctx_save = *c; mfail = !mark_setup(); } }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
         if (g_ra > 0 && !mfail) nvn_r1_cb_save();
         unpark();
         if (mfail) { release(); g_save_failed = 2; return; }
@@ -1064,13 +1080,16 @@ static void mark_undo(void) {
 }
 /* after the first (full) save: shadows, extras, maps on. 1 = done; 0 = out of memory (mark_undo done: no marks) */
 static void ls_after_setup(void);                      /* R4 (rb_learned.c) */
-static int mark_setup(void) {
+/* (net4, 2026-10-25 evening) the first save of a match froze both players for 1.3-1.8 s. Part of it was the shadow set-up:
+ * the game's memory copied to r->s (1.9 GB), compared, copied AGAIN into the shadow, r->s given back. Now (direct) the save
+ * copies the game's memory straight into the shadow and the extras, the compare after the pause reads them, and r->s is
+ * never made. mark_setup_fill does the set-up up to and including the fill; mark_setup_finish the rest (the maps on: the
+ * marks start). mark_setup = both at once (the old way, from r->s). g_dst: every page's copy (shadow or extra) in order of
+ * g_r, for the compare. SSBU_R1_DIRECT=0: the old way. */
+static int mark_setup_fill(int direct) {
     size_t big = 0; uint8_t *base = NULL; double ms0 = now_ms(), ms_commit = 0, ms_copy = 0, ms_drop = 0, ms_x;
-    for (int i = 0; i < g_nheap; i++) {
-        MEMORY_BASIC_INFORMATION m; uint8_t *p = g_heap_base[i];
-        while (VirtualQuery(p, &m, sizeof m) && m.AllocationBase == g_heap_base[i]) p = (uint8_t *)m.BaseAddress + m.RegionSize;
-        if ((size_t)(p - g_heap_base[i]) > big && g_heap_base[i] != g_ar) { big = (size_t)(p - g_heap_base[i]); base = g_heap_base[i]; }
-    }
+    for (int i = 0; i < g_nheap; i++)
+        if (g_heap_span[i] > big && g_heap_base[i] != g_ar) { big = g_heap_span[i]; base = g_heap_base[i]; }
     g_win1 = base; g_wn1 = big;
     g_mctx = g_ctx_save;                               /* main's registers of this (full) save */
     for (int i = 0; i < g_nheap; i++) LOG("r1: MARK: reservation >= 16 GB at %p%s\n", (void *)g_heap_base[i], g_heap_base[i] == base ? " (window 1)" : g_heap_base[i] == g_ar ? " (malloc arena)" : " (NOT a window: its pages are extras)");
@@ -1097,7 +1116,7 @@ static int mark_setup(void) {
         if (!g_x[i].b) { LOG("r1: MARK setup: allocation of %.1f KB for an extra FAILED: marks OFF\n", g_x[i].n / 1024.0); mark_undo(); return 0; }
     }
     {   /* the bytes of the save point into the shadow and the extras; with g_rs_drop the copy of the full save is given back 1 MB at a time behind */
-        int cx = 0; size_t xo = 0; long long dropped = 0;
+        int cx = 0; size_t xo = 0, q = 0; long long dropped = 0;
         for (int i = 0; i < g_nr; i++) {
             Rng *r = &g_r[i]; size_t np = r->n / PG;
             {   /* (net4) the shadow of this range committed in one call (it was 64 KB at a time); per page again if that fails */
@@ -1106,23 +1125,31 @@ static int mark_setup(void) {
                     if (k < np && VirtualAlloc(sh0 + k * PG, (np - k) * PG, MEM_COMMIT, PAGE_READWRITE)) memset(cm0 + pi0 + k, 1, np - k); ms_commit += now_ms() - tc; }
             }
             double tcp = now_ms();
-            for (size_t p = 0; p < np; p++) {
-                uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+            const uint8_t *src = direct ? r->a : r->s;
+            for (size_t p = 0; p < np; p++, q++) {
+                uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi), *dst = NULL;
                 if (sh) {
                     if (!sh_commit(sh, cm, pi)) { LOG("r1: MARK setup: commit of the shadow FAILED after %.1f MB%s: marks OFF\n", shb / 1048576.0, rb_test_nomem() == 4 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=4)" : ""); mark_undo(); return 0; }
-                    cp_add(sh, r->s + p * PG); shb += PG;   /* (net4) copied by the copy threads, per range */
+                    cp_add(sh, src + p * PG); shb += PG; dst = sh;   /* (net4) copied by the copy threads, per range */
                 } else {
                     if (cx < g_nx && xo == g_x[cx].n) { cx++; xo = 0; }
-                    if (cx < g_nx && g_x[cx].a + xo == a) { memcpy(g_x[cx].b + xo, r->s + p * PG, PG); xo += PG; }
+                    if (cx < g_nx && g_x[cx].a + xo == a) { dst = g_x[cx].b + xo; cp_add(dst, src + p * PG); xo += PG; }
                 }
+                if (g_dst && q < g_dst_n) g_dst[q] = dst;
             }
             cp_run(); ms_copy += now_ms() - tcp; tcp = now_ms();
-            if (g_rs_drop) { VirtualFree(r->s, np * PG, MEM_DECOMMIT); dropped += (long long)np; }      /* the copy given back, this range's at a time */
+            if (g_rs_drop && !direct) { VirtualFree(r->s, np * PG, MEM_DECOMMIT); dropped += (long long)np; }      /* the copy given back, this range's at a time */
             ms_drop += now_ms() - tcp;
         }
         LOG("r1: MARK setup timing: windows + maps %.1f ms, extras listed %.1f ms, shadow: commit %.1f ms, copy %.1f ms, the copy given back %.1f ms (%d ranges, %.1f MB)\n", ms_x - ms0, now_ms() - ms_x - ms_commit - ms_copy - ms_drop, ms_commit, ms_copy, ms_drop, g_nr, shb / 1048576.0);
-        if (g_rs_drop) LOG("r1: MARK setup: the copy of the full save given back while the shadow took it (%.1f MB): peak commit ~one copy\n", dropped * (double)PG / 1048576.0);
+        if (g_rs_drop && !direct) LOG("r1: MARK setup: the copy of the full save given back while the shadow took it (%.1f MB): peak commit ~one copy\n", dropped * (double)PG / 1048576.0);
+        if (direct) LOG("r1: MARK setup: the game's memory copied straight into the shadow and the extras (%.1f MB): no second copy\n", shb / 1048576.0 + g_xbytes / 1048576.0);
     }
+    return 1;
+}
+static int mark_setup(void) { return mark_setup_fill(0) && mark_setup_finish(); }
+static int mark_setup_finish(void) {
+    size_t shb = 0; for (size_t i = 0; i < g_wn1 >> 12; i++) shb += g_sh1c[i]; for (size_t i = 0; i < WN2 >> 12; i++) shb += g_sh2c[i]; shb *= PG;
     uint8_t *m1 = VirtualAlloc(NULL, g_wn1 >> 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     uint8_t *m2 = VirtualAlloc(NULL, WN2 >> 12, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!m1 || !m2) { if (m1) VirtualFree(m1, 0, MEM_RELEASE); if (m2) VirtualFree(m2, 0, MEM_RELEASE); LOG("r1: MARK setup: allocation of the mark maps FAILED: marks OFF\n"); mark_undo(); return 0; }
