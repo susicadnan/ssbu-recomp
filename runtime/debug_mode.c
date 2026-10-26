@@ -94,6 +94,10 @@ void debug_mode_frame(long long frame) {
                     memcpy(prev, cur, sizeof cur); had = 1;
                 }
             } else if (had) { printf("debug fmwatch: presented frame %lld: no FighterManager impl\n", frame); fflush(stdout); had = 0; }
+            {   /* (research) the fight-frame counter and the ready-go flag every 10 presented frames while the manager is there */
+                long long r1_fight_frame(void); static long long last_ff = -1; static int n;
+                if (impl && (++n % 10 == 0 || r1_fight_frame() != last_ff && last_ff < 0)) { last_ff = r1_fight_frame(); printf("debug fmwatch: presented frame %lld: fight frame %lld, ready-go %d\n", frame, last_ff, impl ? rd8(impl + 0xd2) : -1); fflush(stdout); }
+            }
         }
     }
     if (!g_end_limit && !g_dm.text[0]) return;

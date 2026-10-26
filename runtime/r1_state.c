@@ -2065,6 +2065,7 @@ int r1_poll(int ticks) {
 /* nnhid.c, port 2's values just before they are written (R3 online rollback only) */
 void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) { if (g_ra > 0 && rgs_wanted() && rbg_on()) rbg_pad(id, b, lx, ly, rx, ry); }
 int r1_net_on(void) { return rbn_on() > 0; }
+long long r1_fight_frame(void) { return g_ff; }           /* (net4, research) the fight-frame counter (fighter ticks) */
 void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_ra > 0 && rgs_wanted()) { rgs_pad(b, lx, ly, rx, ry); return; }      /* R2 simulation: recorded per pass, given again in its re-run */
     if (g_ra > 0) {                                       /* run-ahead: the speculative pass gets player 1's last real values */
