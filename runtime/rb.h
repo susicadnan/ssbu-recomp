@@ -37,7 +37,7 @@ int rb_input_peek_mismatch(void);                  /* the same, left pending */
 int rb_input_finalized(void);
 
 /* ---------------------------------------------------------------- wire format (rb_wire.c), little-endian */
-enum { RB_MSG_PADS = 1, RB_MSG_ACK = 2, RB_MSG_PING = 3, RB_MSG_PONG = 4 };
+enum { RB_MSG_PADS = 1, RB_MSG_ACK = 2, RB_MSG_PING = 3, RB_MSG_PONG = 4, RB_MSG_MENU = 5 };      /* MENU (net4): the other player's pad on the result screen after a room match (rb_net.c rbn_menu_send) */
 #define RB_PAD_WIRE 16
 #define RB_PADS_HEAD 20
 #define RB_MAX_PADS_PER_MSG 64

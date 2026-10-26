@@ -76,6 +76,10 @@ int rbn_on(void) {
     else if (net_online() > 0) {                        /* (net4) graphics.ini rollback_delay = <frames> | auto (default) */
         int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
         if (net_ini_value("rollback_delay", v, sizeof v) && v[0] >= '0' && v[0] <= '9') { g_delay_cfg = atoi(v); if (g_delay_cfg > 12) g_delay_cfg = 12; }
+        /* (net4, the green / purple recolor seen by real players) graphics.ini rollback_lite = <mask> (default 127: camera, UI,
+         * lighting, render layers, recorder, dynamic resolution and effect ticks skipped in the re-run passes but the last;
+         * 0 = nothing skipped, for the test whether the recolor comes from a skipped tick) */
+        if (!getenv("SSBU_RB_SIM_LITE") && net_ini_value("rollback_lite", v, sizeof v) && v[0] >= '0' && v[0] <= '9') { char w[40]; snprintf(w, sizeof w, "SSBU_RB_SIM_LITE=%d", atoi(v)); _putenv(w); printf("[rbnet] re-run lite mask %d from graphics.ini\n", atoi(v)); }
     }
     if ((e = getenv("SSBU_RB_NET_BOT")) && *e) { g_bot = 1; g_bot_seed = (unsigned)strtoul(e, NULL, 0); }
     if ((e = getenv("SSBU_RB_NET_AHEAD")) && atoi(e) > 0) g_ahead = atoi(e);
@@ -626,9 +630,36 @@ void rbn_link(int *jitter_ms, int *loss_pct) {
     *loss_pct = g_lq_loss_pct;
 }
 /* net_relay.c's receive thread: one rollback message from the other player */
+/* (net4, 2026-10-25, real players: after a room match played with rollback both result screens waited for the other player's
+ * OK: on each PC the other player is a local human on controller 2 for the match, and nobody presses its OK) the pads of the
+ * result screen: each game sends its own player's pad (17 bytes: type, buttons, four sticks) at every poll, and gives the
+ * last received one to the other player's port (rb_rollback.c rbg_pad, menu mode). No frame numbers: the screens are not
+ * in lockstep; a pad older than a second counts as none. */
+static RbPad g_menu_pad; static volatile LONG64 g_menu_rx_ms; static volatile LONG64 g_menu_tx, g_menu_rx;
+void rbn_menu_send(const RbPad *p) {
+    uint8_t b[17]; b[0] = RB_MSG_MENU; memcpy(b + 1, &p->buttons, 8);
+    const int16_t st[4] = {p->lx, p->ly, p->rx, p->ry};
+    for (int i = 0; i < 4; i++) { b[9 + 2 * i] = (uint8_t)st[i]; b[10 + 2 * i] = (uint8_t)((uint16_t)st[i] >> 8); }
+    if (net_rb_send(b, 17)) InterlockedIncrement64(&g_menu_tx);
+}
+int rbn_menu_pad(RbPad *out) {                          /* 1 = a pad of the last second */
+    LONG64 at = g_menu_rx_ms; if (!at || GetTickCount64() - (ULONGLONG)at > 1000) return 0;
+    AcquireSRWLockExclusive(&g_rq_lock); *out = g_menu_pad; ReleaseSRWLockExclusive(&g_rq_lock); return 1;
+}
+void rbn_menu_counts(long long *tx, long long *rx) { *tx = g_menu_tx; *rx = g_menu_rx; }
 void rbn_rx(const uint8_t *p, int n) {
     if (rbn_on() > 0 && n > 0 && hs_rx(p, n)) return;  /* the match handshake */
     if (rbn_on() <= 0 || n <= 0 || n > RQ_MAX) { InterlockedIncrement64(&g_rx_bad); return; }
+    if (p[0] == RB_MSG_MENU) {                          /* (net4) the other player's pad on the result screen: the latest kept, nothing queued */
+        if (n != 17) { InterlockedIncrement64(&g_rx_bad); return; }
+        RbPad q; memcpy(&q.buttons, p + 1, 8);
+        int16_t st[4]; for (int i = 0; i < 4; i++) st[i] = (int16_t)((uint16_t)p[9 + 2 * i] | ((uint16_t)p[10 + 2 * i] << 8));
+        q.lx = st[0]; q.ly = st[1]; q.rx = st[2]; q.ry = st[3];
+        AcquireSRWLockExclusive(&g_rq_lock); g_menu_pad = q; ReleaseSRWLockExclusive(&g_rq_lock);
+        InterlockedExchange64(&g_menu_rx_ms, (LONG64)GetTickCount64()); InterlockedIncrement64(&g_menu_rx);
+        InterlockedExchange64(&g_rx_last_ms, (LONG64)GetTickCount64());
+        return;
+    }
     if (p[0] == RB_MSG_PADS && n >= RB_PADS_HEAD + 2 && (n - RB_PADS_HEAD) % RB_PAD_WIRE == 2) {     /* (hs12) the match tag, (hs14) then the mode byte, at the end */
         if (!g_started || p[n - 2] != pads_tag()) { InterlockedIncrement64(&g_rx_oldmatch); return; }      /* (between matches: the other game sends them again) */
         InterlockedExchange(&g_peer_mode, p[n - 1]);    /* (before it is queued: rbn_drain sees it with the message that starts the match) */

@@ -36,6 +36,8 @@ void input_mark(const char *what);                      /* nnhid.c: the input se
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
 static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
 static int g_rbg_mr_done;                                 /* (net4) this match's report written (once: at the fight's end, or at the exit during a fight) */
+static int g_rbg_menu; static double g_rbg_menu_t0; static RbPad g_rbg_menu_own;      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
+void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
 static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
  * first safe point with the fight on ("RA: first save: no quiet moment within 200 ms: not now"), it was made one pass later, and
@@ -163,7 +165,7 @@ static void rbg_step_body(Ctx *c) {
     if (g_rbg_in_match == 3) return;                    /* (R3 lwr, run lwr2: both games crashed here) a room fight already running stays one until its fight-off:
                                                          * the room's match is set up (handshake, rbn_match_cancelled() 0 again) while the waiting-stage fight still runs */
     if (rbn_match_cancelled() == 2) {                   /* (R3 pub2) a Local Wireless room fight: the game's own netcode, no ring, pads untouched */
-        if (!g_rbg_in_match) { g_rbg_in_match = 3; LOG("r1: RB NET: a Local Wireless room fight: no rollback (the game's own netcode)\n"); }
+        if (!g_rbg_in_match) { g_rbg_in_match = 3; if (g_rbg_menu) { g_rbg_menu = 0; LOG("r1: RB NET: menu mode off: the room's waiting stage\n"); } LOG("r1: RB NET: a Local Wireless room fight: no rollback (the game's own netcode)\n"); }
         return;
     }
     if (rbn_match_cancelled()) {                        /* (hs12) not agreed with the other game: no rollback; rbg_pad leaves this match */
@@ -187,7 +189,7 @@ static void rbg_step_body(Ctx *c) {
             printf("[rbnet] rollback OFF for this match (not enough memory): delay-based, the game waits for the other player's input every frame\n"); fflush(stdout);
         }
         if (g_rbg_wdfix) g_ra_wd_pause = 1;
-        g_rbg_in_match = 1; g_rbg_mr_done = 0;
+        g_rbg_in_match = 1; g_rbg_mr_done = 0; g_rbg_menu = 0;
         { static int reg; if (!reg++) atexit(rbg_match_report_atexit); }      /* (net4) the window closed during a fight: the report still written */
         if (i > 0) LOG("r1: RB NET: the base state was made %lld passes after the first safe point with the fight on (fight frame %lld): it is frame %lld, as on the other game (net3)\n", i, g_rbg_ff_first, i);
         rbn_start(i);
@@ -404,6 +406,24 @@ static void rbg_step(Ctx *c) {
 }
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
 static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
+    if (g_rbg_menu && !g_rbg_in_match && (id == 0 || id == 1)) {      /* (net4) the result screen after a room match: see rbg_fight_off */
+        if (now_ms() - g_rbg_menu_t0 > 180000 || rbn_peer_gone()) {
+            long long tx, rx; rbn_menu_counts(&tx, &rx); g_rbg_menu = 0;
+            LOG("r1: RB NET: menu mode off (%s after %.0f s; pads sent %lld, received %lld): the ports are this PC's own again\n", rbn_peer_gone() ? "the other player is gone" : "time is up", (now_ms() - g_rbg_menu_t0) / 1000.0, tx, rx);
+            return;
+        }
+        int local = rbn_local_player();
+        if (id == 0) {                                  /* port 1's poll carries this PC's own devices: kept, and sent to the other game */
+            RbPad p; p.buttons = *b; p.lx = (int16_t)*lx; p.ly = (int16_t)*ly; p.rx = (int16_t)*rx; p.ry = (int16_t)*ry;
+            g_rbg_menu_own = p;
+            if (g_ra_phase != 2) { static double last; double t = now_ms(); if (t - last >= 8) { last = t; rbn_menu_send(&p); } }
+        }
+        RbPad src; int have = 1;
+        if (id == local) src = g_rbg_menu_own; else have = rbn_menu_pad(&src);
+        if (!have) memset(&src, 0, sizeof src);
+        *b = src.buttons; *lx = src.lx; *ly = src.ly; *rx = src.rx; *ry = src.ry;
+        return;
+    }
     if (g_rbg_in_match == 2 && (id == 0 || id == 1)) {  /* (hs12) a match that was not agreed: this PC's player 1 pauses, then holds L + R + A (the game's own way out of a match), again every 4 s */
         /* (debug_mode.c makes it Final Destination with one stock) player 1 walks off the left edge for 20 s, which ends the
          * match the game's own way (results, then the stage select and the character select: run hw2 showed that pause +
@@ -447,7 +467,12 @@ static void rbg_match_report_atexit(void) { if (g_rbg_in_match == 1) rbg_match_r
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
-    if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
+    if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
+    if (g_rbg_in_match == 1 && rbn_room_rollback() && !rbn_loop()) {      /* (net4) a room match: the result screen's pads exchanged until the next fight (at most 3 min) */
+        static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_MENU_PADS"); want = !(e && e[0] == '0'); }
+        if (want) { g_rbg_menu = 1; g_rbg_menu_t0 = now_ms(); memset(&g_rbg_menu_own, 0, sizeof g_rbg_menu_own);
+            LOG("r1: RB NET: menu mode: the result screen's pads are exchanged with the other game (its player's OK press reaches its port here)\n"); }
+    }      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
