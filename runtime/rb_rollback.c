@@ -53,10 +53,8 @@ static void rbg_prebase(Ctx *c) {
     if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted()) return;
     int setups = debug_match_setups();
     if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is made */
-    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene()) return;      /* the match agreed, the scene set up (p23: the stage need not be drawing: the loading screen is the best place) */
-    if (++g_rbg_prebase_tries % 3) return;                   /* a try every 3rd frame */
-    if (!ra_hold_quiet(20)) return;                          /* (a probe of 20 ms: the loaders still busy -> next try; a 200 ms wait each time would slow the loading) */
-    unpark();
+    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene() || input_frame_draws_seen() < 100) return;      /* the match agreed, the scene set up, the stage drawing */
+    if (++g_rbg_prebase_tries % 5) return;                   /* a try every 5th frame: a try that finds the loaders busy holds main up to 200 ms */
     double t0 = now_ms(); int ok;
     if (!g_rg_ready) ok = r1_ring_capture(-1, c);
     else ok = r1_ring_rebase(-1, c);
