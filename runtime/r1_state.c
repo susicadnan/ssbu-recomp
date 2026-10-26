@@ -1979,11 +1979,11 @@ int os_r1_fibers_quiet_hint(int (*busy)(uint64_t key, Ctx *c));
 static int ra_fiber_busy_hint(uint64_t key, Ctx *c) { if (!os_r1_fiber_tid(key)) return 0; const char *imp = c ? c->in_import : NULL; return !c || !imp || strstr(imp, "SwitchToFiber") || !waiting_import(imp); }
 static long long g_ra_fiber_waits, g_ra_fiber_skips; static double g_ra_fiber_wait_ms;
 /* hold the threads at a quiet moment: retry until `limit` ms */
-static double g_hq_susp_ms, g_hq_wait_ms; static int g_hq_tries, g_hq_hint_stale, g_hq_hint_wrong;      /* (research) the last ra_hold_quiet: the suspend(s), the wait for quiet fibers, tries */
+static double g_hq_susp_ms, g_hq_wait_ms; static int g_hq_tries, g_hq_hint_stale, g_hq_hint_wrong, g_hq_fail_thread, g_hq_fail_fiber; static char g_hq_who[160];      /* (research) the last ra_hold_quiet: the suspend(s), the wait for quiet fibers, tries */
 static int ra_hold_quiet(double limit) {
     double t0 = now_ms(); int tries = 0; g_hq_susp_ms = 0; g_hq_tries = 0;
     static int hint_on = -1; if (hint_on < 0) { const char *e = getenv("SSBU_RB_HOLD_HINT"); hint_on = !(e && e[0] == '0'); }
-    g_hq_hint_stale = 0; g_hq_hint_wrong = 0;
+    g_hq_hint_stale = 0; g_hq_hint_wrong = 0; g_hq_fail_thread = 0; g_hq_fail_fiber = 0; g_hq_who[0] = 0;
     for (;;) {
         int hq = tries && hint_on ? os_r1_fibers_quiet_hint(ra_fiber_busy_hint) : 1;
         if (hq == 2) g_hq_hint_stale++;
@@ -1992,12 +1992,13 @@ static int ra_hold_quiet(double limit) {
             tries++; if (now_ms() - t0 > limit) return 0; SwitchToThread(); continue;
         }
         double ts = now_ms(); int held = ra_hold_save(); g_hq_susp_ms += now_ms() - ts; g_hq_tries = tries + 1; g_hq_wait_ms = now_ms() - t0 - g_hq_susp_ms;
+        if (!held) { g_hq_fail_thread++; if (strlen(g_hq_who) < 100) { size_t o = strlen(g_hq_who); snprintf(g_hq_who + o, sizeof g_hq_who - o, "%s%s@%s", o ? " " : "", g_ra_busy ? g_ra_busy : "?", g_ra_busy_imp ? g_ra_busy_imp : "?"); } }
         if (held) {
             double tf = g_hp_on > 0 ? now_ms() : 0; int fq = ra_fibers_quiet(); if (g_hp_on > 0) { g_hp_fib_ms += now_ms() - tf; g_hp_fib_n++; }
             if (fq) { if (tries) { g_ra_fiber_waits++; g_ra_fiber_wait_ms += now_ms() - t0; } return 1; }
             for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]);
             ra_wh_give_back();
-            if (hq == 1) g_hq_hint_wrong++;
+            if (hq == 1) g_hq_hint_wrong++; g_hq_fail_fiber++;
             g_ra_busy = "a job fiber (task worker)"; g_ra_skip_why[3]++;
         }
         tries++;
