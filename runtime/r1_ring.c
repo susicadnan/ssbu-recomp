@@ -459,6 +459,14 @@ int r1_ring_capture(long long frame, Ctx *c) {
  * (their count may change), host stacks made since are left out, modules loaded since get the mark maps. Then slot 0 = this
  * frame (threads, fibers, command buffers as a capture). 1 = done; 0 = not now (a thread not at a wait: next pass). */
 static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; }
+/* (net4) the FAST REFRESH after a pre-base (rb_rollback.c rbg_prebase): the game's region is reserved with MEM_WRITE_WATCH
+ * (nnsdk.c), so at the ready-go the OS names every page of window 1 written since the pre-base by ANY thread (the loaders
+ * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
+ * extras copied whole; nothing listed again (no 200 ms walk) and no shadow page dropped. r1_ring_ww_reset: the watch starts
+ * at the pre-base. */
+static int g_rg_fast_refresh;
+void r1_ring_ww_reset(void) { if (g_win1 && g_wn1) ResetWriteWatch(g_win1, g_wn1); }
+int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
 int r1_ring_rebase(long long frame, Ctx *c) {
     if (g_rg_nomem == 2) return 0;                        /* (hs13) the ring broke earlier: no rollback */
     if (!g_rg_ready) return r1_ring_capture(frame, c);
@@ -480,12 +488,33 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
-    collect(c);
+    if (!g_rg_fast_refresh) collect(c);
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
-    for (int i = 0; i < g_nr; i++) {
+    int ww_fail = 0; size_t ww_pages = 0;
+    if (g_rg_fast_refresh) {
+        memset(in, 1, nwin);                              /* every shadow page kept */
+        static void **ww; static const ULONG_PTR cap = 1u << 22;
+        if (!ww) ww = malloc(cap * sizeof *ww);
+        if (!ww) ww_fail = 1;
+        for (int round = 0; !ww_fail && round < 64; round++) {
+            ULONG_PTR cnt = cap; DWORD gran = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, ww, &cnt, &gran)) { ww_fail = 1; break; }
+            for (ULONG_PTR k = 0; k < cnt; k++) {
+                uint8_t *a = ww[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                if (g_dc[pi] || g_ns1[pi]) continue;      /* not committed now / not simulation (a host stack) */
+                uint8_t *sh = g_sh1 + pi * PG;
+                if (!sh_commit(sh, g_sh1c, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+                cp_add(sh, a); copied++; ww_pages++; g_dc[pi] = 0;
+            }
+            if (cnt < cap) break;
+        }
+        if (!ww_fail) for (size_t pi = 0; pi < (WN2 >> 12); pi++) if (g_sh2c[pi] && !g_ns2[pi]) cp_add(g_sh2 + pi * PG, (uint8_t *)(uintptr_t)WIN2 + pi * PG);      /* window 2: compared, copied where it differs */
+        if (ww_fail) { LOG("r1: RING refresh: GetWriteWatch FAILED (error %lu): the slow rebase instead\n", GetLastError()); g_rg_fast_refresh = 0; g_rg_ntl = 0; collect(c); memset(in, 0, nwin); cp_init(); }
+    }
+    if (!g_rg_fast_refresh) for (int i = 0; i < g_nr; i++) {
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
             uint8_t *a = r->a + p * PG, *cm; size_t pi;
@@ -511,7 +540,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (cm[pi]) { VirtualFree((w2 ? g_sh2 : g_sh1) + pi * PG, PG, MEM_DECOMMIT); cm[pi] = 0; dropped++; }
     }
     free(in);
-    {   /* the extras again */
+    if (g_rg_fast_refresh) { for (int i = 0; i < g_nx; i++) memcpy(g_x[i].b, g_x[i].a, g_x[i].n); LOG("r1: RING refresh: %zu pages written since the pre-base copied into the shadow (%.1f MB); extras %d copied whole\n", ww_pages, ww_pages * (double)PG / 1048576.0, g_nx); }
+    else {   /* the extras again */
         size_t npg = 0; for (int i = 0; i < nnx; i++) npg += nx[i].n / PG;
         size_t tot = nwin + npg;
         for (size_t e = 0; e < g_rg_nx; e++) rg_pool_put(g_rg_idx[nwin + e]);
