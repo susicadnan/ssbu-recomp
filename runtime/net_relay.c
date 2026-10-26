@@ -49,7 +49,7 @@
  *   SSBU_ONLINE_CODE                 online_code                      lobby code: only players with the same code meet
  *   SSBU_ONLINE_DIRECT=0             online_direct = off              no direct paths: everything through the lobby
  *   SSBU_ONLINE_PORT=<n>             local UDP port (default: any)
- *   SSBU_ONLINE_LOG=0..3             log level (default 1)
+ *   SSBU_ONLINE_LOG=0..3             online_log = 0..3               log level (default 1; 2 = every room message)
  *   SSBU_ONLINE_BUILD                build id override (players of different builds never meet) */
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -329,6 +329,7 @@ static void configure(void) {
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
     if ((e = getenv("SSBU_ONLINE_LOG"))) g_log = atoi(e);
+    else if (ini_value("online_log", v, sizeof v) && v[0] >= '0' && v[0] <= '3') g_log = atoi(v);      /* (net4) graphics.ini online_log = 0..3 (2: every room message) */
     mods_scan();                       /* O1: the mods this game loads (their names and hashes go to the lobby) */
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
     else {
