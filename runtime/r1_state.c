@@ -225,11 +225,13 @@ static int g_rb_test_nomem = -1;                        /* SSBU_RB_NET_TEST_NOME
 static int rb_test_nomem(void) { if (g_rb_test_nomem < 0) { const char *e = getenv("SSBU_RB_NET_TEST_NOMEM"); g_rb_test_nomem = e ? atoi(e) : 0; } return g_rb_test_nomem; }
 static double g_save_need_mb, g_save_avail_mb;          /* the last commit check (MB) */
 static uint8_t *ls_pool_meta(size_t *n);              /* R4 (rb_learned.c) */
+static uint8_t *g_win1;                                 /* (defined with the shadow below; a tentative definition here for collect) */
+static int g_collect_lite;                              /* (net4) set: the game's big heap (window 1) is not walked: the ring's fast refresh covers it by the write watch */
 static void collect(Ctx *c) {
     for (int i = 0; i < g_nr; i++) { rs_free(g_r[i].s); g_r[i].s = NULL; free(g_r[i].dirty); free(g_r[i].async); }
     g_nr = 0;
     if (!g_nheap) find_heaps();
-    for (int i = 0; i < g_nheap; i++) add_alloc(g_heap_base[i]);
+    for (int i = 0; i < g_nheap; i++) if (!(g_collect_lite && g_win1 && g_heap_base[i] == g_win1)) add_alloc(g_heap_base[i]);
     add_span((uint8_t *)0x7100000000ull, (uint8_t *)0x7300000000ull);
     add_fighter_dlls();
     { size_t pmn; uint8_t *pm = ls_pool_meta(&pmn); if (pm && pmn) add_span(pm, pm + pmn); }      /* R4: the presentation pool's bookkeeping (rb_learned.c) */

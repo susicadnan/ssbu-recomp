@@ -489,13 +489,14 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
     g_rg_ntl = 0;
     if (!g_rg_fast_refresh) collect(c);
+    else { g_collect_lite = 1; collect(c); g_collect_lite = 0; }      /* (net4) everything but the 62 GB heap walk: window 2, the extras (malloc arena, stacks, TLS, fighter DLL data, catch table) listed again (p22 crashed: the pre-base's extras list missed what the match start allocated) */
     cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
     int ww_fail = 0; size_t ww_pages = 0;
     if (g_rg_fast_refresh) {
-        memset(in, 1, nwin);                              /* every shadow page kept */
+        memset(in, 1, g_rg_n1);                           /* window 1: every shadow page kept (the write watch below); window 2: by the walk (in[] set in the loop below) */
         static void **ww; static const ULONG_PTR cap = 1u << 22;
         if (!ww) ww = malloc(cap * sizeof *ww);
         if (!ww) ww_fail = 1;
@@ -511,14 +512,22 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
             if (cnt < cap) break;
         }
-        if (!ww_fail) for (size_t pi = 0; pi < (WN2 >> 12); pi++) if (g_sh2c[pi] && !g_ns2[pi]) cp_add(g_sh2 + pi * PG, (uint8_t *)(uintptr_t)WIN2 + pi * PG);      /* window 2: compared, copied where it differs */
         if (ww_fail) { LOG("r1: RING refresh: GetWriteWatch FAILED (error %lu): the slow rebase instead\n", GetLastError()); g_rg_fast_refresh = 0; g_rg_ntl = 0; collect(c); memset(in, 0, nwin); cp_init(); }
     }
-    if (!g_rg_fast_refresh) for (int i = 0; i < g_nr; i++) {
+    for (int i = 0; i < g_nr; i++) {                      /* (fast refresh: g_r holds window 2 and the extras only; window 1 pages of it, if any, are skipped) */
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
             uint8_t *a = r->a + p * PG, *cm; size_t pi;
             uint8_t *sh = in_shadow(a, &cm, &pi);
+            if (sh && g_rg_fast_refresh) {               /* (net4) window 2 in the fast refresh: compared and copied where it differs; a page new since the pre-base committed into the shadow */
+                int w2 = cm == g_sh2c;
+                if (!w2) continue;
+                if (g_ns2[pi]) continue;
+                in[g_rg_n1 + pi] = 1;
+                if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+                cp_add(sh, a); copied++;
+                continue;
+            }
             if (sh) {
                 int w2 = cm == g_sh2c;
                 if (w2 ? g_ns2[pi] : g_ns1[pi]) continue;                    /* not simulation (a host stack) */
@@ -540,8 +549,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         if (cm[pi]) { VirtualFree((w2 ? g_sh2 : g_sh1) + pi * PG, PG, MEM_DECOMMIT); cm[pi] = 0; dropped++; }
     }
     free(in);
-    if (g_rg_fast_refresh) { for (int i = 0; i < g_nx; i++) memcpy(g_x[i].b, g_x[i].a, g_x[i].n); LOG("r1: RING refresh: %zu pages written since the pre-base copied into the shadow (%.1f MB); extras %d copied whole\n", ww_pages, ww_pages * (double)PG / 1048576.0, g_nx); }
-    else {   /* the extras again */
+    if (g_rg_fast_refresh) LOG("r1: RING refresh: %zu window-1 pages written since the pre-base (%.1f MB) and window 2 (%zu pages compared) into the shadow; the extras listed again below\n", ww_pages, ww_pages * (double)PG / 1048576.0, copied - ww_pages);
+    {   /* the extras again */
         size_t npg = 0; for (int i = 0; i < nnx; i++) npg += nx[i].n / PG;
         size_t tot = nwin + npg;
         for (size_t e = 0; e < g_rg_nx; e++) rg_pool_put(g_rg_idx[nwin + e]);
