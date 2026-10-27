@@ -60,7 +60,8 @@ int rbn_on(void) {
         int set = net_ini_value("rollback", v, sizeof v);
         if (!set || !(!v[0] || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"))) {
             _putenv("SSBU_RB_NET=net"); e = getenv("SSBU_RB_NET");      /* (every other reader of the variable sees it too: rbn_handshake_wanted, the menu) */
-            printf("[rbnet] rollback on from graphics.ini (%s)\n", set ? "rollback = on" : "no rollback key: on by default");
+            if (set && !_stricmp(v, "delay")) { _putenv("SSBU_RB_NET_DELAYONLY=1"); }      /* (2026-10-26, the owner: "without it feels smoother") rollback = delay: the same connection and input delay, no snapshot ring: a wrong guess is never needed (every frame waits for the other player's pad), no rollback hitches, far less memory */
+            printf("[rbnet] rollback on from graphics.ini (%s)\n", set ? !_stricmp(v, "delay") ? "rollback = delay: delay-based, no snapshot ring" : "rollback = on" : "no rollback key: on by default");
         }
     }
     g_on = e && e[0] && e[0] != '0';

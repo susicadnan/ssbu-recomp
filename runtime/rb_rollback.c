@@ -48,9 +48,13 @@ static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu
 static int g_rbg_prebased, g_rbg_prebase_setup; static long long g_rbg_prebase_tries;
 int r1_ring_refresh(long long frame, Ctx *c); void r1_ring_ww_reset(void); void nvn_ww_hold(int on); int r1_live_base_state(void); void r1_live_base_abort(void);
 int debug_match_setups(void); int debug_hs_ok(void); int debug_fm_scene(void); long input_frame_draws_seen(void);
+static int rbg_delay_only(void) {                        /* graphics.ini rollback = delay (rb_net.c) or SSBU_RB_NET_DELAYONLY=1: no snapshot ring, every match delay-based */
+    static int v = -1; if (v < 0) { const char *e = getenv("SSBU_RB_NET_DELAYONLY"); v = e && e[0] == '1'; }
+    return v;
+}
 static void rbg_prebase(Ctx *c) {
     static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }      /* =0: the full save at the ready-go, as before */
-    if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted()) return;
+    if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted() || rbg_delay_only()) return;
     int setups = debug_match_setups();
     if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is under way */
     if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene()) return;      /* the match agreed, the scene set up (the loading screen: the copy runs under it) */
@@ -200,8 +204,9 @@ static void rbg_step_body(Ctx *c) {
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
             if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
         if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
-        int done = 0;
-        if (g_rbg_prebased == 2) {                      /* (net4 live) see rbg_prebase: the live copy joined, the base finished, every page written since copied */
+        int done = 0, delay_only = rbg_delay_only();
+        if (delay_only) done = 1;                       /* (rollback = delay) no base state, no ring: the match is delay-based from the start */
+        if (g_rbg_prebased == 2 && !delay_only) {       /* (net4 live) see rbg_prebase: the live copy joined, the base finished, every page written since copied */
             double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
             int r1_ring_live_finish(long long frame, Ctx *c); int st = r1_live_base_state();
             int rr = (st == 1 || st == 2 || st == 3) ? r1_ring_live_finish(i, c) : 0;
@@ -220,9 +225,13 @@ static void rbg_step_body(Ctx *c) {
         if (done) { }
         else if (!done && g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
         else if (!done) { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
-        g_rbg_noring = g_rg_nomem != 0;
+        g_rbg_noring = g_rg_nomem != 0 || delay_only;
         rbn_set_lockstep(g_rbg_noring);
-        if (g_rbg_noring) {
+        if (delay_only) {
+            g_rbg_noring_matches++;
+            LOG("r1: RB NET: DELAY-BASED MATCH (graphics.ini rollback = delay): no snapshot ring; every frame waits for the other player's pad\n");
+            printf("[rbnet] delay-based match (rollback = delay): the game waits for the other player's input every frame, no rollback\n"); fflush(stdout);
+        } else if (g_rbg_noring) {
             g_rbg_noring_matches++;
             LOG("r1: RB NET: ROLLBACK OFF FOR THIS MATCH: not enough memory for the snapshot ring (%s); the match goes on delay-based: every frame waits for the other player's pad\n",
                 g_rg_nomem == 1 ? "the base state needs about one copy of the game's memory in free commit" : "the ring broke on the way: off for the rest of this session");
@@ -585,7 +594,8 @@ static void rbg_match_report(void) {
             const char *resp = d <= 1 ? "like offline" : d == 2 ? "very good (one frame more than offline)" : d == 3 ? "good (two frames more than offline)" : d <= 5 ? "noticeable" : "heavy";
             const char *smooth = rbpm < 3 && over < 60 ? "smooth" : rbpm < 15 && over < 300 ? "mostly smooth (a jump now and then)" : "stuttery";
             fprintf(f, "Responsiveness  +%.0f ms over offline from the %d delay frames: %s. A lower rollback_delay in graphics.ini trades this for more rollbacks.\n", d * 1000.0 / 60.0, d, resp);
-            fprintf(f, "Smoothness      %.1f rollbacks per minute, %.0f late frames: %s\n", rbpm, over, smooth);
+            if (g_rbg_noring) fprintf(f, "Smoothness      delay-based match, no rollback (%s): %.0f late frames: %s\n", rbg_delay_only() ? "rollback = delay in graphics.ini" : "ROLLBACK OFF: not enough memory", over, over < 60 ? "smooth" : over < 300 ? "mostly smooth" : "stuttery");
+            else fprintf(f, "Smoothness      %.1f rollbacks per minute, %.0f late frames: %s\n", rbpm, over, smooth);
         }
         fprintf(f, "Rollbacks %lld in %lld frames (%.1f per minute), longest %d frames; waits for the other player %lld (%.0f ms in all)\n", g_rbg_rb, g_rbg_real, g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0, (int)g_rbg_max_k, g_rbg_stalls, g_rbg_stall_ms);
         fprintf(f, "Frames    mean %.2f ms, p90 %.2f, p99 %.2f (16.67 = perfect); frames later than 20 ms: %.0f of %d\n", mean, p90, p99, over, g_rbg_ng);
