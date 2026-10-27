@@ -677,7 +677,8 @@ static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from)
         if (ok) heard_direct(q, c, t);
         ReleaseSRWLockExclusive(&g_peers_lock);
         if (!ok || !src || src == g_ip) return;
-        if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); return; }    /* (as T_RB: not our opponent) */
+        {   uint32_t want = nnldn_other_ip() ? nnldn_other_ip() : mp;      /* (2026-10-26 evening) the room's other player, else the matched opponent; another game's messages are not ours */
+            if (want && src != want) { InterlockedIncrement64(&g_rb_rx_other); return; } }
         g_rb_peer = src; g_rb_direct_from = src;
         InterlockedIncrement64(&g_rb_in_direct);
         rbn_rx(p + 16, n - 16);
@@ -1583,8 +1584,8 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             if (g_joined && g_direct) read_peers(buf + 4, n - 4);
             break;
         case T_RB:                                       /* R3: a rollback message of the other player */
-            if (n > 8 && g_joined) { uint32_t src = g32(buf + 4), mp = g_rb_match_peer;
-                if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); break; }     /* (R3 net3) not our opponent */
+            if (n > 8 && g_joined) { uint32_t src = g32(buf + 4), mp = g_rb_match_peer, want = nnldn_other_ip() ? nnldn_other_ip() : mp;
+                if (want && src != want) { InterlockedIncrement64(&g_rb_rx_other); break; }     /* (R3 net3, 2026-10-26) not our opponent: the room's other player, else the matched one */
                 if (src && src != g_ip) { g_rb_peer = src; InterlockedIncrement64(&g_rb_in_relay); rbn_rx(buf + 8, n - 8); } }
             break;
         }
