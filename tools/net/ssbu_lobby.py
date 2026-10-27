@@ -68,7 +68,7 @@ LDN_PORT = 65511
 M_ADVERTISE, M_JOIN, M_ACCEPT, M_REJECT, M_KEEP, M_LEAVE, M_GONE, M_KICK = range(1, 9)
 NI_SIZE, NI_SESSION, NI_POLICY, NI_NODE_MAX, NI_NODE_COUNT, NI_NODES, NODE_LEN = 0x480, 0x10, 0x62, 0x66, 0x67, 0x68, 0x40
 LIST_MAX = 24
-CLIENT_TIMEOUT, ROOM_TIMEOUT, LISTED_FOR = 10.0, 10.0, 4.0
+CLIENT_TIMEOUT, ROOM_TIMEOUT, LISTED_FOR = 20.0, 20.0, 4.0   # (2026-10-26: were 10 s) longer than the game's own room silence limit (nnldn.c SILENT_MS 15 s), so a short outage of mobile internet does not close the room
 MAX_DATA = 1500
 
 

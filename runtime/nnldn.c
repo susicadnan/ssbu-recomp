@@ -80,7 +80,7 @@ enum { DR_NONE, DR_USER, DR_SYSTEM, DR_DESTROYED_BY_USER, DR_DESTROYED_BY_SYSTEM
 #define NI_ADV 0x26c
 #define NODE(i) (NI_NODES + 0x40 * (i))
 #define SEEN_MAX 24
-#define SILENT_MS 6000
+#define SILENT_MS 15000         /* (resp1, 2026-10-26: was 6000) a player silent this long leaves the room; mobile internet (T-Mobile home) can go quiet for some seconds and come back. The lobby server waits longer (CLIENT_TIMEOUT 20 s) */
 
 typedef struct { uint8_t info[NI_SIZE]; uint32_t from; uint64_t at; } Seen;
 static struct {
