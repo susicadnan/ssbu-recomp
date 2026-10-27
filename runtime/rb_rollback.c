@@ -365,6 +365,7 @@ static void rbg_step_body(Ctx *c) {
         if (g_rgs_next - rbn_confirmed() <= (g_rbg_noring || g_rg_short ? 0 : rbn_ahead())) break;
         if (!g_rbg_noring && g_rg_short && g_rgs_next - rbn_confirmed() <= rbn_ahead() && !stalled) g_rbg_short_waits++;
         if (rbn_peer_gone()) { if (!g_rbg_gone++) LOG("r1: RB NET: no message from the other player for 5 s at frame %lld: going on alone (guesses)\n", i); break; }
+        if (stalled && now_ms() - ts > 20000) { if (!g_rbg_gone++) LOG("r1: RB NET: no usable pad from the other player for 20 s at frame %lld (its messages still arrive: another match's, or none with pads): going on alone (guesses)\n", i); break; }      /* (2026-10-26 19:18: 100 s at frame 7, frozen) */
         if (!stalled) { stalled = 1; ts = now_ms(); g_rbg_stalls++; r1_ring_let_go(); }
         {   /* while waiting: bounded input retries (default 50 ms), even with both games stalled; a line every 2 s */
             static double last_log; double now = now_ms();
@@ -517,6 +518,7 @@ static void rbg_match_report_atexit(void) { if (g_rbg_in_match == 1) rbg_match_r
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
     display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
+    { void r1_mem_audit(const char *when); char w[64]; snprintf(w, sizeof w, "fight over, in_match %d", g_rbg_in_match); r1_mem_audit(w); }      /* (2026-10-26 review: +5 GB per room fight) */
     if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
     if (g_rbg_prebased) { nvn_ww_hold(0); if (g_rbg_prebased == 2) r1_live_base_abort(); }
     g_rbg_prebased = 0;                                 /* (net4) the next match's pre-base is its own */

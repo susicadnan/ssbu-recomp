@@ -1459,6 +1459,43 @@ static void live_late_merge(void) {
     g_rt_merged = n;
     LOG("r1: LIVE BASE: late merge (held): %d commits added, %d decommits cut since the join\n", added, cut);
 }
+/* (2026-10-26 session review: the process's private memory grew ~5 GB per Local Wireless room fight, 4 -> 56 GB, with the
+ * working set at 10 GB: committed, never touched, never freed; the live base then found 723 MB free and rollback went off)
+ * The audit: the commit charge, and the 12 biggest committed private allocations (by allocation base), labelled when known.
+ * Two audits apart show what grew. rb_rollback.c rbg_fight_off calls it at every fight's end. */
+typedef struct { uint8_t *base; size_t commit, reserve; DWORD prot; } MaRec;
+static const char *ma_label(uint8_t *b) {
+    if (g_win1 && b == g_win1) return "window 1 (the game's region)";
+    if (b == (uint8_t *)(uintptr_t)0x7100000000ull) return "window 2";
+    if (g_sh1 && b == g_sh1) return "shadow 1"; if (g_sh2 && b == g_sh2) return "shadow 2";
+    if (g_ar && b == g_ar) return "malloc arena";
+    for (int i = 0; i < g_nheap; i++) if (b == g_heap_base[i]) return "a game region";
+    return "";
+}
+void r1_mem_audit(const char *when) {
+    static MaRec recs[4096]; int n = 0; size_t tot_commit = 0, tot_priv = 0; int regions = 0;
+    MEMORY_BASIC_INFORMATION m; uint8_t *cur = NULL; MaRec r = {0};
+    for (uint8_t *p = (uint8_t *)0x10000; (uintptr_t)p < 0x7FFFFFFF0000ull && VirtualQuery(p, &m, sizeof m); p = (uint8_t *)m.BaseAddress + m.RegionSize) {
+        regions++;
+        if ((uint8_t *)m.AllocationBase != cur) {
+            if (cur && r.commit && n < 4096) recs[n++] = r;
+            cur = (uint8_t *)m.AllocationBase; memset(&r, 0, sizeof r); r.base = cur;
+        }
+        if (m.State == MEM_COMMIT) { r.commit += m.RegionSize; if (!r.prot) r.prot = m.Protect; if (m.Type == MEM_PRIVATE) { tot_priv += m.RegionSize; } tot_commit += m.RegionSize; }
+        if (m.State != MEM_FREE) r.reserve += m.RegionSize;
+    }
+    if (cur && r.commit && n < 4096) recs[n++] = r;
+    for (int i = 1; i < n; i++) { MaRec t = recs[i]; int j = i - 1; while (j >= 0 && recs[j].commit < t.commit) { recs[j + 1] = recs[j]; j--; } recs[j + 1] = t; }
+    typedef struct { DWORD cb; DWORD PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage; } PmcEx;
+    typedef BOOL (WINAPI *GpmiFn)(HANDLE, PmcEx *, DWORD); static GpmiFn gpmi; static int tried;
+    if (!tried) { tried = 1; gpmi = (GpmiFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetProcessMemoryInfo"); }
+    PmcEx pm; memset(&pm, 0, sizeof pm); pm.cb = sizeof pm; if (gpmi) gpmi(GetCurrentProcess(), &pm, sizeof pm);
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
+    LOG("r1: MEMORY AUDIT (%s): private %.0f MB, working set %.0f MB, committed in this process %.0f MB (private %.0f MB) over %d regions; free commit on the PC %.0f MB\n",
+        when, pm.PrivateUsage / 1048576.0, pm.WorkingSetSize / 1048576.0, tot_commit / 1048576.0, tot_priv / 1048576.0, regions, ms.ullAvailPageFile / 1048576.0);
+    for (int i = 0; i < n && i < 12; i++)
+        LOG("r1:   %p: %.0f MB committed of %.0f MB reserved, protection %lx %s\n", (void *)recs[i].base, recs[i].commit / 1048576.0, recs[i].reserve / 1048576.0, (unsigned long)recs[i].prot, ma_label(recs[i].base));
+}
 void r1_live_base_abort(void) {                         /* the match did not come (or is over): the worker stopped, nothing kept */
     if (g_live_state == 1 || g_live_state == 2) { InterlockedExchange(&g_live_stop, 1); if (g_live_th) { WaitForSingleObject(g_live_th, 8000); CloseHandle(g_live_th); g_live_th = NULL; } }
     ls_early_undo();
