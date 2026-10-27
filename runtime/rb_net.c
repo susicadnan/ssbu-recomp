@@ -159,10 +159,11 @@ static uint64_t g_hs_seed; static uint32_t g_match_id;  /* the agreed match: its
 static volatile LONG g_hs_cancelled;                    /* this match: 1 = no agreement: played locally and left at once; 2 = (pub2) set up
                                                            * inside a Local Wireless room: the game's own netcode plays it, no rollback, nothing changed */
 static int g_match_n;                                   /* (hs12) online matches of this session so far (1 = the first; rbn_start) */
+int rbn_handshake_wanted(void);
 /* (hs12) the tag byte at the end of every PADS message: the agreed match id and the match number of the session. Run tw7:
  * the other game's last pads of match 1 arrived after this game's match-1 reset and were taken at the start of match 2
  * (their acknowledgement 1081 made each game send no pads any more: both waited for ever at frame 7). */
-static uint8_t pads_tag(void) { return (uint8_t)(g_match_id ^ ((uint32_t)g_match_n * 0x3bu)); }
+static uint8_t pads_tag(void) { return rbn_handshake_wanted() && g_match_id ? (uint8_t)g_match_id : (uint8_t)(g_match_id ^ ((uint32_t)g_match_n * 0x3bu)); }      /* (2026-10-26 19:18 freeze) the session's match counter is NOT part of it with a handshake: the counters differ when one game was restarted between matches, and every message was dropped on both sides (both games waited at frame 0 for ever) */
 static long long g_hs_tx, g_hs_rx;
 #define RBH_BLK 0xa48                                   /* match block + 0 .. + 0x580 + 2 * 0x260 + 8 */
 static uint8_t g_hs_mine_blk[RBH_BLK], g_hs_peer_blk[RBH_BLK]; static int g_hs_mine_ok, g_hs_peer_got, g_hs_blk_done; static uint8_t g_hs_peer_have[RBH_BLK / 768 + 1];
@@ -565,6 +566,7 @@ static void hs_block_compare(void) {                    /* main thread (rbn_drai
 static struct { uint64_t at_us; long long at_frame; int n; uint8_t b[RQ_MAX]; } *g_rq;
 static volatile LONG g_rq_head, g_rq_tail; static SRWLOCK g_rq_lock = SRWLOCK_INIT;
 static volatile LONG64 g_rx_pkts, g_rx_bad, g_rx_drop, g_tx_pkts, g_tx_fail, g_rx_last_ms, g_rx_oldmatch;
+long long rbn_oldmatch_dropped(void) { return (long long)g_rx_oldmatch; }
 static volatile LONG g_rtt_us = -1, g_rtt_min_us = -1;
 static long long g_rtt_n; static double g_rtt_sum;      /* (under g_rq_lock) */
 #define TSQ 64

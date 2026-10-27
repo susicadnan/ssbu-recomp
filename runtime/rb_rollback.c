@@ -59,6 +59,7 @@ static void rbg_prebase(Ctx *c) {
         LOG("r1: RB NET: LIVE PRE-BASE started (set-up %d, %s): the game keeps running while the ring's base is copied\n", setups, g_rg_ready ? "the existing shadow filled again" : "match 1"); }
 }      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
 void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
+long long rbn_oldmatch_dropped(void); void rbn_status(char *out, size_t n);
 static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
  * first safe point with the fight on ("RA: first save: no quiet moment within 200 ms: not now"), it was made one pass later, and
@@ -246,11 +247,16 @@ static void rbg_step_body(Ctx *c) {
         LOG("r1: RB NET: match start, base state = frame %lld (fight frame %lld); pacing %s; re-run skip mask %d, lite mask %d%s\n", i, g_ff, g_rbg_pace ? "60 Hz" : "off", g_rgs_skip, g_rgs_lite, g_rgs_lastlite ? " (the last re-run pass too)" : "");
         {   /* start barrier: both games begin frame 1 together (the one that finished loading first waits here, at frame 0,
              * instead of stalling seconds at frame 8 with states it might have to roll back to: rnh2 / rnh3 hung after that) */
-            double tb = now_ms(), lastx = 0;
+            double tb = now_ms(), lastx = 0, lastlog = 0; long long old0 = rbn_oldmatch_dropped();
             while (!rbn_peer_started() && now_ms() - tb < 120000) {
                 if (now_ms() - lastx >= 50) { lastx = now_ms(); rbn_hello(); }
                 rbn_drain(i);
                 rbg_wait_until(now_ms() + 1.0);
+                if (now_ms() - lastlog >= 5000) {       /* (2026-10-26 19:18 freeze: 120 s here, nothing logged) */
+                    lastlog = now_ms(); char st[300]; rbn_status(st, sizeof st); long long old = rbn_oldmatch_dropped() - old0;
+                    LOG("r1: RB NET: start barrier: still waiting for the other game after %.0f s (%s; its messages dropped as another match's: %lld%s)\n", (now_ms() - tb) / 1000.0, st, old,
+                        old > 0 ? " <- the two games disagree on the match: a restart of one of them between matches?" : "");
+                }
             }
             rbn_hello(); rbn_choose_delay();
             if (i > rbn_delay()) LOG("r1: RB NET: WARNING: the base state is frame %lld, later than the input delay (%d): the other player's first pads may differ (desync risk)\n", i, rbn_delay());
