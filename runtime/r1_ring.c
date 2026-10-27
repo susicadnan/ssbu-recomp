@@ -44,7 +44,6 @@ typedef struct {
     Ctx ctx;
     Th th[256]; int nth, ninfo;
     Fib *fib; int nfib; uint8_t *fpool; size_t fpool_used, fpool_com;
-    long long capgen;                                  /* (2026-10-27) the capture generation of its fibers (os_threads.c: retired host fibers) */
     int ncbs; uint8_t *cbs; uint8_t *cbd; size_t cbd_used, cbd_com;
     size_t pages, xpages;
 } RgSlot;
@@ -285,7 +284,6 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     memcpy(s->th, g_th, (size_t)g_nth * sizeof *g_th);
     for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; s->th[i].pre = 0; }
     s->nfib = g_nfib; memcpy(s->fib, g_fib, (size_t)g_nfib * sizeof *g_fib);
-    { long long os_fibers_capgen(void); s->capgen = os_fibers_capgen(); }      /* g_fib is the newest fibers_save's */
     s->fpool_used = 0;
     if (g_fpool_used && rg_vcom(s->fpool, &s->fpool_com, g_fpool_used, 1u << 20)) { memcpy(s->fpool, g_fpool, g_fpool_used); s->fpool_used = g_fpool_used; }
     else if (g_fpool_used) for (int i = 0; i < s->nfib; i++) s->fib[i].susp = 0;

@@ -50,7 +50,6 @@ void r1_register_heap(void) { r1_on(); }
 #include <string.h>
 #include <windows.h>
 #include <emmintrin.h>
-#include <limits.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -650,8 +649,7 @@ static void park_quiet(int restore_mode) {
         unpark(); SwitchToThread();
     }
 }
-long long os_fibers_captured(void);                   /* os_threads.c: one more capture generation (retired host fibers are stamped with it) */
-static void fibers_save(void) { os_fibers_captured(); if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); } if (g_fib_live_on) live_rsps(); g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
+static void fibers_save(void) { if (g_fib_live_on < 0) { const char *e = getenv("SSBU_R1_LIVESTK"); g_fib_live_on = !(e && e[0] == '0'); } if (g_fib_live_on) live_rsps(); g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
 static void fibers_restore(void) {
     fibers_restore_all();
     int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break; if (i == g_nfib) born++; }
@@ -2403,16 +2401,11 @@ void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_phase == 1 && g_npad < 8192) { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_pad[g_npad++] = r; }
     else if (g_phase == 2 && g_ipad < g_npad) { PadRec r = g_pad[g_ipad++]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; }
 }
-/* (2026-10-27) os_threads.c: a retired host fiber (its guest fiber finalized or given another one) is deleted once no saved
- * state that may hold it can be loaded. A ring load takes the fibers of its target slot only, and every load targets a
- * live slot: those retired before the oldest live slot's capture go (the base is slot 0 until it rotates out). Kept
- * whole: the live pre-base, run-ahead between its save and restore, the SSBU_R1 test's save, a ring match with no slot
- * yet. Room fights without the ring: deleted at once. LLONG_MAX = nothing can be loaded, 0 = keep everything. */
-static long long r1_fibers_keep_from(void) {
-    if (g_live_state == 1 || g_live_state == 2 || g_ra_phase == 1 || g_phase == 1 || g_phase == 2) return 0;
-    if (g_rg_count > 0) { long long m = LLONG_MAX; for (int i = 0; i < g_rg_count; i++) if (rg_slot(i)->capgen < m) m = rg_slot(i)->capgen; return m; }
-    if (g_rg_kept || (g_rbg_in_match == 1 && g_rg_ready && !g_rbg_noring)) return 0;
-    return LLONG_MAX;
+/* (2026-10-27) os_threads.c: a retired host fiber (its guest fiber finalized or given another one) is deleted only while
+ * no saved state that may hold it can be loaded: a ring with captures (or threads kept for a load), the live pre-base,
+ * run-ahead between its save and restore, the SSBU_R1 test's save. Room fights without the ring: deleted at once. */
+static int r1_fibers_pinned(void) {
+    return g_rg_count > 0 || g_rg_kept || (g_rbg_in_match == 1 && g_rg_ready && !g_rbg_noring) || g_live_state == 1 || g_live_state == 2 || g_ra_phase == 1 || g_phase == 1 || g_phase == 2;
 }
 void r1_init(void) {
     if (!r1_on()) return;
@@ -2423,7 +2416,7 @@ void r1_init(void) {
     g_mark = getenv("SSBU_R1_MARK") != NULL;
     g_prot = getenv("SSBU_R1_MARK_PROT") != NULL; if (g_prot) AddVectoredExceptionHandler(1, prot_veh); g_mcheck = getenv("SSBU_R1_MARK_CHECK") != NULL; if (g_mark && !mark_bind()) g_mark = 0;
     g_fast = getenv("SSBU_R1_FAST") != NULL; g_fcheck = getenv("SSBU_R1_FAST_CHECK") != NULL; if (getenv("SSBU_R1_LEARN")) g_learn = atoi(getenv("SSBU_R1_LEARN"));
-    g_r1_keep_fibers = 1; { extern long long (*g_r1_fibers_keep_from)(void); g_r1_fibers_keep_from = r1_fibers_keep_from; } g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
+    g_r1_keep_fibers = 1; { extern int (*g_r1_fibers_pinned)(void); g_r1_fibers_pinned = r1_fibers_pinned; } g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
     ls_init();                                          /* R4: the presentation pool of the learned-set save */
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
