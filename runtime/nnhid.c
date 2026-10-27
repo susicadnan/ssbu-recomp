@@ -121,6 +121,7 @@ void input_mark(const char *what) {                       /* any thread: somethi
     if (i < MARK_MAX) { strncpy(g_marks[i], what, sizeof g_marks[i] - 1); MemoryBarrier(); }
 }
 void input_frame_draws(int draws) { g_frame_draws_seen = draws; }       /* nvn_gl.c, once per presented frame */
+long input_frame_draws_seen(void) { return g_frame_draws_seen; }        /* (net4) rb_rollback.c rbg_prebase: the stage is drawing (not the loading screen) */
 
 static int mark_seen(const char *what) {
     LONG n = g_mark_count;

@@ -53,7 +53,7 @@ typedef struct {
 static int g_rg_nomem;
 static int rbg_on(void);
 static RgSlot *g_rg; static int g_rg_cap, g_rg_head, g_rg_count, g_rg_ready, g_rg_depth = 7;
-static uint32_t *g_rg_idx; static uint8_t *g_rg_touch; static uint32_t *g_rg_tl; static size_t g_rg_ntl, g_rg_tlcap;
+static uint32_t *g_rg_idx; static uint8_t *g_rg_touch; static uint32_t *g_rg_tl; static size_t g_rg_ntl, g_rg_tlcap, g_rg_idx_cap;
 static size_t g_rg_n1, g_rg_n2, g_rg_nx;               /* page counts: window 1, window 2, extras */
 static uint8_t **g_rg_xa, **g_rg_xb;                   /* extras page e: its address, its flat (first save) bytes */
 static uint8_t *g_rg_pool; static uint32_t g_rg_bump, g_rg_pcom, *g_rg_free, g_rg_nfree;
@@ -182,6 +182,39 @@ static void rg_cap_page(uint32_t id, int w, size_t j) {
     if (g_rgpg_on > 0) rgpg_note(rg_addr(id));
 }
 static void rg_load_page(uint32_t id, int w, size_t j) { (void)w; (void)j; rg_touch(id); }
+/* (R5 fast1) the compare of a capture copies the changed pages as it finds them (r1_state.c cp_part, g_cp_fbuf), into pool
+ * buffers taken in advance: as many as the last capture needed and a half more (the rest go back to the pool after). A page
+ * found changed after the buffers ran out is taken the old way (rg_cap_page: copied in a second pass). SSBU_RB_FUSE=0: off. */
+static uint32_t *g_rg_fidx; static size_t g_rg_fcap; static LONG g_rg_fuse_last = 1024; static int g_rg_fuse = -1; static long long g_rg_fused_pages, g_rg_fused_short, g_rg_fused_caps;
+static void rg_fused_prepare(size_t njobs) {
+    if (g_rg_fuse < 0) { const char *e = getenv("SSBU_RB_FUSE"); g_rg_fuse = !(e && e[0] == '0'); }
+    g_cp_fbuf = NULL; g_cp_fcnt = 0; g_cp_fn = 0;
+    if (!g_rg_fuse || !njobs) return;
+    size_t want = (size_t)g_rg_fuse_last + (size_t)g_rg_fuse_last / 2 + 128; if (want > njobs) want = njobs;
+    if (g_rg_fcap < want) { g_rg_fcap = want + 1024; free(g_rg_fidx); g_rg_fidx = malloc(g_rg_fcap * sizeof *g_rg_fidx); }
+    static uint8_t **bufs; static size_t bcap; if (bcap < g_rg_fcap) { bcap = g_rg_fcap; free(bufs); bufs = malloc(bcap * sizeof *bufs); }
+    static size_t dcap; if (dcap < njobs) { dcap = njobs + 4096; free(g_cp_fdst); g_cp_fdst = malloc(dcap * sizeof *g_cp_fdst); }
+    if (!g_rg_fidx || !bufs || !g_cp_fdst) { g_rg_fcap = 0; return; }
+    LONG n = 0;
+    for (; (size_t)n < want; n++) { uint32_t nb = rg_pool_get_cap(); if (!nb) break; g_rg_fidx[n] = nb; bufs[n] = rg_pool_ptr(nb); }
+    g_cp_fcnt = n; g_cp_fbuf = bufs;
+}
+static void rg_fused_finish(void) {                      /* after the compare: the buffers not used go back; the demand is remembered */
+    if (!g_cp_fbuf) return;
+    LONG used = g_cp_fn < g_cp_fcnt ? g_cp_fn : g_cp_fcnt;
+    for (LONG n = used; n < g_cp_fcnt; n++) rg_pool_put(g_rg_fidx[n]);
+    if (g_cp_fn > g_cp_fcnt) g_rg_fused_short++;
+    g_rg_fuse_last = g_cp_fn; g_rg_fused_pages += used; g_rg_fused_caps++;
+    g_cp_fbuf = NULL; g_cp_fcnt = 0;
+}
+static void rg_cap_page_done(uint32_t id, uint32_t q) {  /* page id: its bytes are already in the pool buffer the compare took for job q */
+    uint32_t nb = g_rg_fidx[g_cp_fdst[q] - 1];
+    if (g_rg_fail_now) { rg_pool_put(nb); if (g_rg_poolfix) rg_remark(id); return; }
+    uint32_t old = g_rg_idx[id];
+    if (!rg_push(g_rg_cur, id, old)) { rg_pool_put(nb); g_rg_fail_now = 1; if (g_rg_poolfix) rg_remark(id); return; }
+    g_rg_idx[id] = nb; g_rg_cur->pages++;
+    if (g_rgpg_on > 0) rgpg_note(rg_addr(id));
+}
 static void rg_remark(uint32_t id) {                     /* (hs14) a window page marked as written again (a capture given up) */
     if (id < g_rg_n1) (*pm1)[id] = 1; else if (id < g_rg_n1 + g_rg_n2) (*pm2)[id - g_rg_n1] = 1;
 }
@@ -249,7 +282,7 @@ static void rg_meta_capture(RgSlot *s, Ctx *c) {       /* threads still held: th
     s->ctx = *c;
     s->nth = g_nth; s->ninfo = g_ninfo;
     memcpy(s->th, g_th, (size_t)g_nth * sizeof *g_th);
-    for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; }
+    for (int i = 0; i < s->nth; i++) { s->th[i].held = 0; s->th[i].cok = 0; s->th[i].pre = 0; }
     s->nfib = g_nfib; memcpy(s->fib, g_fib, (size_t)g_nfib * sizeof *g_fib);
     s->fpool_used = 0;
     if (g_fpool_used && rg_vcom(s->fpool, &s->fpool_com, g_fpool_used, 1u << 20)) { memcpy(s->fpool, g_fpool, g_fpool_used); s->fpool_used = g_fpool_used; }
@@ -280,7 +313,7 @@ static int rg_init(void) {
     size_t tot = g_rg_n1 + g_rg_n2 + g_rg_nx;
     { const char *e = getenv("SSBU_RB_DEPTH"); if (e) g_rg_depth = atoi(e); if (g_rg_depth < 1) g_rg_depth = 1; if (g_rg_depth > RG_MAXSLOT - 1) g_rg_depth = RG_MAXSLOT - 1; }
     g_rg_cap = g_rg_depth + 1;
-    g_rg_idx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    g_rg_idx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); g_rg_idx_cap = tot;
     g_rg_touch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_rg_tlcap = 8u << 20; g_rg_tl = VirtualAlloc(NULL, g_rg_tlcap * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     g_rg_pool = rg_vres((size_t)RG_POOL_MAX * PG);
@@ -368,19 +401,24 @@ int r1_ring_capture(long long frame, Ctx *c) {
     g_rg_cur = s; g_rg_fail_now = 0;
     static uint8_t *xdiff; static size_t xdn; if (xdn < g_rg_nx + 1) { free(xdiff); xdn = g_rg_nx + 1; xdiff = calloc(xdn, 1); }   /* (hs12: the extras can change at a rebase) */
     for (size_t e = 0; e < g_rg_nx; e++) cp_add(g_rg_xa[e], rg_src((uint32_t)(g_rg_n1 + g_rg_n2 + e)));      /* (round 3) extras compared by main + the copy threads */
-    g_cp_cmp = xdiff; cp_run(); g_cp_cmp = NULL;
+    int fused = g_ls_active && g_ls_cmp;                   /* (fast1) with the learned set's compare: one fan-out for the extras and the learned pages, the changed ones copied as found */
+    if (!fused) { g_cp_cmp = xdiff; cp_run(); g_cp_cmp = NULL; }
     if (g_rgpg_on < 0) g_rgpg_on = getenv("SSBU_RB_SIM_PAGES") != NULL;
     g_rgpg_kind = g_ra_phase != 2 ? 0 : g_rgs_left > 1 ? 1 : 2; g_rgpg_caps[g_rgpg_kind]++;
-    if (g_ls_active) ls_capture(rg_cap_page); else rg_sweep(rg_cap_page);      /* R4: the learned set (rb_learned.c) instead of the marks */
-    for (size_t e = 0; e < g_rg_nx && !g_rg_fail_now; e++) {             /* extras: the pages that differ from their newest value */
+    if (g_ls_active) ls_capture(rg_cap_page, fused ? g_rg_nx : 0, xdiff); else rg_sweep(rg_cap_page);      /* R4: the learned set (rb_learned.c) instead of the marks */
+    for (size_t e = 0; e < g_rg_nx; e++) {                                /* extras: the pages that differ from their newest value */
         uint32_t id = (uint32_t)(g_rg_n1 + g_rg_n2 + e);
         if (!xdiff[e]) continue;
+        int fd = fused && g_cp_fbuf && g_cp_fdst[e];                       /* (fast1) copied by the compare already */
+        if (g_rg_fail_now) { if (fd) rg_pool_put(g_rg_fidx[g_cp_fdst[e] - 1]); continue; }
+        if (fd) { size_t before = s->pages; rg_cap_page_done(id, (uint32_t)e); if (s->pages != before) { s->pages--; s->xpages++; } continue; }
         uint32_t nb = rg_pool_get_cap();
-        if (!nb || !rg_push(s, id, g_rg_idx[id])) { if (nb) rg_pool_put(nb); g_rg_fail_now = 1; break; }
+        if (!nb || !rg_push(s, id, g_rg_idx[id])) { if (nb) rg_pool_put(nb); g_rg_fail_now = 1; continue; }
         cp_add(rg_pool_ptr(nb), g_rg_xa[e]); g_rg_idx[id] = nb; s->xpages++;
     }
+    if (fused) rg_fused_finish();
     double t2 = now_ms();
-    cp_run();
+    cp_run_nt(1);
     if (g_rg_fail_now && g_rg_poolfix) {                    /* (hs14) given up: this capture's pages back to their previous values, marked again */
         size_t undone = s->nent;
         for (size_t n = s->nent; n-- > 0;) { uint32_t id = s->ent[2 * n], old = s->ent[2 * n + 1]; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = old; rg_remark(id); }
@@ -421,42 +459,182 @@ int r1_ring_capture(long long frame, Ctx *c) {
  * (their count may change), host stacks made since are left out, modules loaded since get the mark maps. Then slot 0 = this
  * frame (threads, fibers, command buffers as a capture). 1 = done; 0 = not now (a thread not at a wait: next pass). */
 static void rg_noop(uint32_t id, int w, size_t j) { (void)id; (void)w; (void)j; }
+static double g_walk_made;
+static DWORD WINAPI rg_walk_thread(void *p) { collect((Ctx *)p); return 0; }
+/* (net4 live, p46 timing) the 30 ms window in which the HOST threads' writes are found (the guest threads are held): a
+ * helper thread sleeps 30 ms from the hold and reads the write watch, while this thread scans; its pages are both copied
+ * (they changed) and left out of the state (async). Reading at the END of the refresh instead (p46) found 5000 pages in
+ * 300+ ms: too many, too slow. */
+static void **g_aw_pages; static ULONG_PTR g_aw_n; static volatile LONG g_aw_fail;
+static DWORD WINAPI rg_async_window_thread(void *p) {
+    (void)p; static const ULONG_PTR cap = 1u << 18;
+    if (!g_aw_pages) g_aw_pages = malloc(cap * sizeof *g_aw_pages);
+    g_aw_n = 0; g_aw_fail = 0;
+    if (!g_aw_pages || !g_win1) { g_aw_fail = 1; return 0; }
+    Sleep(30);
+    ULONG_PTR cnt = cap; DWORD gran = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, g_aw_pages, &cnt, &gran)) { g_aw_fail = 1; return 0; }
+    g_aw_n = cnt;
+    return 0;
+}
+/* (net4) the FAST REFRESH after a pre-base (rb_rollback.c rbg_prebase): the game's region is reserved with MEM_WRITE_WATCH
+ * (nnsdk.c), so at the ready-go the OS names every page of window 1 written since the pre-base by ANY thread (the loaders
+ * too: a plain capture there desynced, p20); only those are copied into the shadow; window 2 is compared and copied; the
+ * extras copied whole; nothing listed again (no 200 ms walk) and no shadow page dropped. r1_ring_ww_reset: the watch starts
+ * at the pre-base. */
+static int g_rg_fast_refresh, g_rg_fresh_ranges, g_rg_live_async;
+void r1_ring_ww_reset(void) { if (g_win1 && g_wn1) ResetWriteWatch(g_win1, g_wn1); }
+int r1_live_base_join(void); int r1_live_base_state(void); void r1_live_base_abort(void);
+/* (net4 live) the ready-go after a live pre-base: the worker joined (ranges complete), then match 1: the mark maps on and the
+ * ring made (as the full save's end, threads held), then the refresh (every page written since the copy started). 0 = not
+ * usable: the caller makes the base the old way */
+int r1_ring_live_finish(long long frame, Ctx *c) {
+    double t0 = now_ms();
+    if (!r1_live_base_join()) return 0;
+    if (!g_rg_ready) {
+        g_hq_long_ms = 40; int hq = ra_hold_quiet(200); g_hq_long_ms = 0;
+        if (!hq) { LOG("r1: RING live base: no quiet moment within 200 ms: next pass\n"); return 0; }
+        g_ctx_save = *c; double tfh = now_ms();
+        g_ls_no_protect = 1; int mf = mark_setup_finish(); g_ls_no_protect = 0; double tfm = now_ms();      /* the protection comes with the refresh below (under its hold): protecting here made the next hold take 185 ms of faults */
+        if (!mf) { unpark(); LOG("r1: RING live base: the mark maps FAILED: the old way\n"); return 0; }
+        g_ra_ready = 1; g_cycle = 1;
+        if (g_mark <= 0) { unpark(); g_ra_off = 1; LOG("r1: RING: no marks (the game DLL with marks is not loaded): OFF\n"); return 0; }
+        if (!rg_init()) { unpark(); g_rg_nomem = 2; LOG("r1: RING: its own allocations FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+        double tfi = now_ms(); g_rg_ready = 1;
+        RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
+        s->frame = -1; s->nent = 0;
+        fibers_save(); nvn_r1_cb_save();
+        rg_meta_capture(s, &g_ctx_save);
+        unpark();
+        LOG("r1: RING: base state (frame -1) from the live copy: the mark maps and the ring made in %.1f ms (join + hold %.0f, mark maps %.0f, ring %.0f, meta %.0f)\n", now_ms() - t0, tfh - t0, tfm - tfh, tfi - tfm, now_ms() - tfi);
+    }
+    int r;
+    const char *ls = getenv("SSBU_R1_LIVE_SLOW");
+    if (ls && ls[0] == '2') { g_rg_fresh_ranges = 1; g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }      /* (research) the slow page loop (every committed page compared / copied) on the worker's fresh ranges */
+    else if (ls) { g_rg_live_async = 1; r = r1_ring_rebase(frame, c); g_rg_live_async = 0; }      /* (research) the slow rebase at the ready-go (collect + every page copied) on the live-made shadow */
+    else { static int walk = -1; if (walk < 0) { const char *e = getenv("SSBU_R1_LIVE_WALK"); walk = e && e[0] == '1'; }      /* (p61) default: NO walk of the 62 GB heap at the ready-go (90 ms): the worker's last walk + the tracked commits and decommits, applied in order (live_apply_tracked; out of order they lost re-allocated chunks: the p38 / p39 / p43 crashes). SSBU_R1_LIVE_WALK=1: the walk, as before */
+           g_rg_fresh_ranges = !walk; g_rg_live_async = 1; r = r1_ring_refresh(frame, c); g_rg_fresh_ranges = 0; g_rg_live_async = 0; }
+    return r;
+}
+int r1_ring_refresh(long long frame, Ctx *c) { g_rg_fast_refresh = 1; int r = r1_ring_rebase(frame, c); g_rg_fast_refresh = 0; return r; }
 int r1_ring_rebase(long long frame, Ctx *c) {
     if (g_rg_nomem == 2) return 0;                        /* (hs13) the ring broke earlier: no rollback */
     if (!g_rg_ready) return r1_ring_capture(frame, c);
     double t0 = now_ms();
     r1_ring_let_go();
     r1_ring_release();
-    if (!ra_hold_quiet(200)) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
-    double t1 = now_ms();
+    g_hq_long_ms = 40; int hq = ra_hold_quiet(200); g_hq_long_ms = 0;
+    if (!hq) { LOG("r1: RING rebase (frame %lld): no quiet moment within 200 ms: next pass\n", frame); return 0; }
+    double t1 = now_ms(); double tpre = t1;
+    HANDLE walk_th = NULL; static Ctx walk_ctx;         /* (net4, p44 timing) the 145 ms walk of the ranges on a helper thread while this one scans the threads and modules (87 ms): they touch different data */
+    HANDLE aw_th = NULL;                                  /* (p48: a 30 ms window found nothing and the audio thread crashed at a load; the whole held time is the window again, read at the end, see below) */
+    static Rng *prev_r; static int prev_nr; static int diff_on = -1;
+    if (diff_on < 0) { diff_on = getenv("SSBU_R1_WALK_DIFF") != NULL; if (diff_on) prev_r = malloc(MAXR * sizeof *prev_r); }
+    if (diff_on && prev_r && !g_rg_fresh_ranges) { prev_nr = g_nr; memcpy(prev_r, g_r, (size_t)g_nr * sizeof *prev_r); }      /* (research) the worker's list BEFORE the walk thread replaces it (p47 copied it after: a race, its 483776 "missing" pages were the half-built new list) */
+    if (!g_rg_fresh_ranges) { walk_ctx = *c; g_walk_made = now_ms(); walk_th = CreateThread(NULL, 0, rg_walk_thread, &walk_ctx, 0, NULL); }
     hs_exclude_all();
+    double ths = now_ms();
     int nmod = 0;
-    {   HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-        MODULEENTRY32 me; me.dwSize = sizeof me;
-        for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-            uint8_t **a1 = (uint8_t **)GetProcAddress(me.hModule, "r1_m1"), **a2 = (uint8_t **)GetProcAddress(me.hModule, "r1_m2");
-            uint64_t *l1 = (uint64_t *)GetProcAddress(me.hModule, "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(me.hModule, "r1_n1"), *n2 = (uint64_t *)GetProcAddress(me.hModule, "r1_n2");
-            if (!a1 || !a2 || !l1 || !n1 || !n2) continue;
-            if (*a1 != *pm1) { *a1 = *pm1; *a2 = *pm2; *l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *n2 = WN2; *n1 = g_wn1; nmod++; LOG("r1: RING rebase: mark maps set in %s (loaded after the first save)\n", me.szModule); }
+    {   /* (net4, p44 timing) the modules with mark maps, found once and kept (a module snapshot each time was part of a 90 ms phase);
+         * found again only when the module count changes (K32EnumProcessModules: cheap) */
+        typedef struct { HMODULE h; uint8_t **a1, **a2; uint64_t *l1, *n1, *n2; char name[64]; } RgMod;
+        static RgMod mods[256]; static int nmods = -1; static DWORD last_count;
+        typedef BOOL (WINAPI *EpmFn)(HANDLE, HMODULE *, DWORD, LPDWORD); static EpmFn epm; static int epm_tried;
+        if (!epm_tried) { epm_tried = 1; epm = (EpmFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules"); }
+        DWORD need = 0; static HMODULE hs[1024]; int count = -1;
+        if (epm && epm(GetCurrentProcess(), hs, sizeof hs, &need)) count = (int)(need / sizeof(HMODULE));
+        if (nmods < 0 || count < 0 || (DWORD)count != last_count) {
+            nmods = 0; last_count = count < 0 ? 0 : (DWORD)count;
+            HANDLE sn = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+            MODULEENTRY32 me; me.dwSize = sizeof me;
+            for (BOOL ok = sn != INVALID_HANDLE_VALUE && Module32First(sn, &me); ok && nmods < 256; ok = Module32Next(sn, &me)) {
+                uint8_t **a1 = (uint8_t **)GetProcAddress(me.hModule, "r1_m1"), **a2 = (uint8_t **)GetProcAddress(me.hModule, "r1_m2");
+                uint64_t *l1 = (uint64_t *)GetProcAddress(me.hModule, "r1_lo1"), *n1 = (uint64_t *)GetProcAddress(me.hModule, "r1_n1"), *n2 = (uint64_t *)GetProcAddress(me.hModule, "r1_n2");
+                if (!a1 || !a2 || !l1 || !n1 || !n2) continue;
+                mods[nmods].h = me.hModule; mods[nmods].a1 = a1; mods[nmods].a2 = a2; mods[nmods].l1 = l1; mods[nmods].n1 = n1; mods[nmods].n2 = n2; snprintf(mods[nmods].name, sizeof mods[nmods].name, "%s", me.szModule); nmods++;
+            }
+            if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn);
         }
-        if (sn != INVALID_HANDLE_VALUE) CloseHandle(sn); }
+        for (int i = 0; i < nmods; i++) {
+            RgMod *m = &mods[i];
+            if (*m->a1 != *pm1) { *m->a1 = *pm1; *m->a2 = *pm2; *m->l1 = (uint64_t)(uintptr_t)g_win1; MemoryBarrier(); *m->n2 = WN2; *m->n1 = g_wn1; nmod++; LOG("r1: RING rebase: mark maps set in %s (loaded after the first save)\n", m->name); }
+        }
+    }
+    double tmo = now_ms();
     rg_sweep(rg_noop);                                    /* marks since the last capture: the copy below takes everything */
+    double tsw = now_ms();
     g_rg_ntl = 0;
-    collect(c);
+    double tq[12]; int nq = 0; tq[nq++] = now_ms();       /* (research) the refresh's phases */
+    double tex = tq[0] - tpre;                            /* hs_exclude_all + the module scan + the sweep */
+    if (walk_th) { WaitForSingleObject(walk_th, INFINITE); CloseHandle(walk_th); }      /* (the walk, see above) */
+    if (diff_on && walk_th && prev_r && g_win1) {       /* (research, SSBU_R1_WALK_DIFF) window-1 pages the walk has and the worker's list (last walk + tracked commits) has not */
+        size_t miss = 0, shown = 0; uint8_t *run_a = NULL; size_t run_n = 0;
+        for (int i = 0; i < g_nr; i++) {
+            Rng *r = &g_r[i]; if (r->a < g_win1 || r->a >= g_win1 + g_wn1) continue;
+            for (size_t p = 0; p < r->n / PG; p++) {
+                uint8_t *a = r->a + p * PG; int have = 0;
+                for (int k = 0; k < prev_nr && !have; k++) if (a >= prev_r[k].a && a < prev_r[k].a + prev_r[k].n) have = 1;
+                if (have) { if (run_n) { if (shown++ < 12) { char cb[80]; LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list (%s)\n", where(run_a), run_n, cm_find(run_a, cb, sizeof cb)); } run_n = 0; } continue; }
+                miss++; if (!run_n) run_a = a; run_n++;
+            }
+            if (run_n) { if (shown++ < 12) { char cb[80]; LOG("r1: WALK DIFF: %s + %zu pages not in the worker's list (%s)\n", where(run_a), run_n, cm_find(run_a, cb, sizeof cb)); } run_n = 0; }
+        }
+        LOG("r1: WALK DIFF: %zu window-1 pages the walk found that the worker's list did not have\n", miss);
+    }
+    else if (!g_rg_fresh_ranges) collect(c);              /* (net4) the fast refresh too: rb_learned.c ls_protect_all protects the pages of THIS list (p26, without the heap walk, left the heap unprotected: captures missed its writes, the first load crashed) */
+    else live_late_merge();                               /* (net4 live) the join walked everything but the heap and merged the tracked heap commits; the last ones now, held */
+    cp_init();                                            /* (net4) the pages into the shadow by the copy threads, only those that differ (g_cp_cond): was a memcpy per page */
     size_t nwin = g_rg_n1 + g_rg_n2, copied = 0, dropped = 0, freed = 0;
     uint8_t *in = calloc(nwin, 1);
     static Extra nx[8192]; int nnx = 0;
-    for (int i = 0; i < g_nr; i++) {
+    tq[nq++] = now_ms();
+    int ww_fail = 0; size_t ww_pages = 0, aw_pages = 0; (void)aw_th;
+    if (g_rg_fast_refresh) {
+        /* (p35 bisect) window 1's shadow pages of pages NOT committed now are dropped (in[] from the ranges, in the loop below), as
+         * the slow rebase does: after a live copy over the loading screen, ~30000 shadow pages held old loader buffers whose
+         * pages were freed and given to new allocations, unwritten yet (zero) at the ready-go: a load put the old bytes back. */
+        static void **ww; static const ULONG_PTR cap = 1u << 22;
+        if (!ww) ww = malloc(cap * sizeof *ww);
+        if (!ww) ww_fail = 1;
+        static int ww_ranges = -1; if (ww_ranges < 0) { const char *e = getenv("SSBU_R1_WW_RANGES"); ww_ranges = e && e[0] == '1'; }
+        int ri = -1;                                      /* (option) the watch read per committed range of window 1 instead of over the whole 62 GB reservation */
+        for (int round = 0; !ww_fail && round < 100000; round++) {
+            ULONG_PTR cnt = cap; DWORD gran = 0; uint8_t *qa = g_win1; size_t qn = g_wn1;
+            if (ww_ranges) { do ri++; while (ri < g_nr && !(g_r[ri].a >= g_win1 && g_r[ri].a < g_win1 + g_wn1)); if (ri >= g_nr) break; qa = g_r[ri].a; qn = g_r[ri].n; }
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, qa, qn, ww, &cnt, &gran)) { ww_fail = 1; break; }
+            for (ULONG_PTR k = 0; k < cnt; k++) {
+                uint8_t *a = ww[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                if (g_dc[pi] || g_ns1[pi]) continue;      /* not committed now / not simulation (a host stack) */
+                uint8_t *sh = g_sh1 + pi * PG;
+                if (!sh_commit(sh, g_sh1c, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+                cp_add(sh, a); copied++; ww_pages++; g_dc[pi] = 0;
+            }
+            if (!ww_ranges && cnt < cap) break;
+            if (ww_ranges && cnt == cap) ri--;            /* (more in this range: asked again) */
+        }
+        if (ww_fail) { LOG("r1: RING refresh: GetWriteWatch FAILED (error %lu): the slow rebase instead\n", GetLastError()); g_rg_fast_refresh = 0; g_rg_ntl = 0; collect(c); memset(in, 0, nwin); cp_init(); }
+    }
+    tq[nq++] = now_ms();
+    for (int i = 0; i < g_nr; i++) {                      /* (fast refresh: g_r holds window 2 and the extras only; window 1 pages of it, if any, are skipped) */
         Rng *r = &g_r[i];
         for (size_t p = 0; p < r->n / PG; p++) {
             uint8_t *a = r->a + p * PG, *cm; size_t pi;
             uint8_t *sh = in_shadow(a, &cm, &pi);
+            if (sh && g_rg_fast_refresh) {               /* (net4) window 2 in the fast refresh: compared and copied where it differs; a page new since the pre-base committed into the shadow */
+                int w2 = cm == g_sh2c;
+                if (!w2) { in[pi] = 1; g_dc[pi] = 0; continue; }        /* window 1: committed now, kept (the write watch copies what was written); the decommit map cleared as the slow rebase does (a page freed and committed again by a path that is not tracked stayed "decommitted": the ring then never restored it: the p36 crashes at the first load) */
+                if (g_ns2[pi]) continue;
+                in[g_rg_n1 + pi] = 1;
+                if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING refresh: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
+                cp_add(sh, a); copied++;
+                continue;
+            }
             if (sh) {
                 int w2 = cm == g_sh2c;
                 if (w2 ? g_ns2[pi] : g_ns1[pi]) continue;                    /* not simulation (a host stack) */
                 in[w2 ? g_rg_n1 + pi : pi] = 1;
                 if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING rebase: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
-                memcpy(sh, a, PG); copied++;
+                cp_add(sh, a); copied++;
                 if (!w2) g_dc[pi] = 0;
             } else if (nnx < 8192) {
                 if (nnx && nx[nnx - 1].a + nx[nnx - 1].n == a) nx[nnx - 1].n += PG;
@@ -464,25 +642,100 @@ int r1_ring_rebase(long long frame, Ctx *c) {
             }
         }
     }
-    for (size_t id = 0; id < nwin; id++) {
-        if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
-        if (in[id]) continue;
-        int w2 = id >= g_rg_n1; size_t pi = w2 ? id - g_rg_n1 : id; uint8_t *cm = w2 ? g_sh2c : g_sh1c;
-        if (cm[pi]) { VirtualFree((w2 ? g_sh2 : g_sh1) + pi * PG, PG, MEM_DECOMMIT); cm[pi] = 0; dropped++; }
+    tq[nq++] = now_ms();
+    if (g_rg_fast_refresh && g_rg_live_async && !g_rt_over) {      /* (p35 bisect) the pages of every commit tracked since the live copy started: copied again where they differ (a page freed and committed again holds zeros the write watch never saw) */
+        LONG n = g_rt_n; if (n > RT_N) n = RT_N; size_t again = 0;
+        for (LONG i = 0; i < n; i++) if (!g_rt_d[i]) {
+            uint8_t *a0 = (uint8_t *)((uintptr_t)g_rt_a[i] & ~(uintptr_t)(PG - 1)), *a1 = (uint8_t *)(((uintptr_t)g_rt_a[i] + g_rt_n_[i] + PG - 1) & ~(uintptr_t)(PG - 1));
+            for (uint8_t *a = a0; a < a1; a += PG) {
+                uint8_t *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+                if (!sh || cm != g_sh1c || g_dc[pi] || g_ns1[pi] || !in[pi]) continue;
+                if (!sh_commit(sh, cm, pi)) continue;
+                cp_add(sh, a); again++;
+            }
+        }
+        LOG("r1: RING refresh: %zu pages of the commits tracked since the live copy compared again\n", again);
     }
-    free(in);
+    tq[nq++] = now_ms();
+    g_cp_cond = 1; cp_run(); g_cp_cond = 0;               /* (net4) compared and copied where they differ, in parallel */
+    tq[nq++] = now_ms();
+    if (g_rg_live_async) {
+        /* (net4 live) what the held full save finds in its 30 ms pause and the live copy never did: the pages the HOST threads
+         * (audio, loaders) write while the guest threads are held are not the simulation's: left out of the state (is_async:
+         * the sweep and the protection skip them), or a load rolls their data back under those threads (p30 crashed at its
+         * first load). Window 1 by the write watch, window 2 by a compare against the shadow just filled. */
+        double ta = now_ms(); size_t n1 = aw_pages, n2 = 0;
+        if (g_win1) {                                     /* window 1: what the host threads wrote since the write-watch read above (the guest threads are held): the whole held refresh so far is the window */
+            static void **wwa; static const ULONG_PTR capa = 1u << 18; if (!wwa) wwa = malloc(capa * sizeof *wwa);
+            static uint8_t **al; static size_t alcap; size_t aln = 0;
+            for (int round = 0; wwa && round < 64; round++) {
+                ULONG_PTR cnt = capa; DWORD gran = 0;
+                if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_win1, g_wn1, wwa, &cnt, &gran)) break;
+                for (ULONG_PTR k = 0; k < cnt; k++) {
+                    uint8_t *a = wwa[k]; size_t pi = (size_t)(a - g_win1) >> 12;
+                    if (g_ns1[pi] || g_dc[pi]) continue;
+                    if (aln >= alcap) { alcap = alcap ? alcap * 2 : 8192; al = realloc(al, alcap * sizeof *al); }
+                    al[aln++] = a; n1++;
+                    uint8_t *sh = g_sh1 + pi * PG; if (sh_commit(sh, g_sh1c, pi)) memcpy(sh, a, PG);
+                }
+                if (cnt < capa) break;
+            }
+            async_add_bulk(al, aln);
+        }
+        cp_init();
+        for (int i = 0; i < g_nr; i++) {                  /* window 2 as committed NOW (the shadow also holds pages of modules unloaded since: reading those faulted, p31); its own ranges only (p44: the loop over every range cost 35 ms) */
+            Rng *r = &g_r[i];
+            if ((uintptr_t)r->a < WIN2 || (uintptr_t)r->a >= WIN2 + WN2) continue;
+            for (size_t p = 0; p < r->n / PG; p++) { uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || cm != g_sh2c || g_ns2[pi] || !g_sh2c[pi]) continue; cp_add(sh, a); }
+        }
+        {   size_t nj = g_ncj; uint8_t *diff = calloc(nj ? nj : 1, 1);
+            if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL;
+                for (size_t j = 0; j < nj; j++) if (diff[j]) { async_add((uint8_t *)g_cj[j].s); memcpy(g_cj[j].d, g_cj[j].s, PG); n2++; }
+                free(diff); }
+            else cp_init(); }
+        LOG("r1: RING live async: %zu pages written by host threads during the held refresh (window 1 %zu, window 2 %zu): left out of the state, %.1f ms\n", n1 + n2, n1, n2, now_ms() - ta);
+    }
+    tq[nq++] = now_ms();
+    {   /* (net4, p41 timing: this pass took 100 ms as a plain loop over 18 M entries) word-wise: the index is mostly RG_FLAT (0) and
+         * most shadow pages are absent, so zero words are skipped; the shadow pages dropped are decommitted a run at a time */
+        const uint64_t *iw = (const uint64_t *)g_rg_idx; size_t niw = nwin / 2;
+        for (size_t k = 0; k < niw; k++) if (iw[k]) for (size_t id = 2 * k; id < 2 * k + 2; id++) if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; }
+        if (nwin & 1) { size_t id = nwin - 1; if (g_rg_idx[id] != RG_FLAT) { if (g_rg_idx[id] >= 2) freed++; rg_pool_put(g_rg_idx[id]); g_rg_idx[id] = RG_FLAT; } }
+        static uint8_t zero_page[PG];                    /* (p45 timing) the dropped shadow pages zeroed by the copy threads, a page a job (one memset of ~130 MB took ~35 ms) */
+        cp_init();
+        for (int w2 = 0; w2 < 2; w2++) {
+            uint8_t *cm = w2 ? g_sh2c : g_sh1c, *shb = w2 ? g_sh2 : g_sh1; size_t np = w2 ? g_rg_n2 : g_rg_n1, base = w2 ? g_rg_n1 : 0;
+            const uint64_t *cw = (const uint64_t *)cm; size_t ncw = np / 8;
+            for (size_t k = 0; k <= ncw; k++) {
+                size_t p0 = k * 8, p1 = k < ncw ? p0 + 8 : np;
+                if (k < ncw && !cw[k]) continue;
+                for (size_t pi = p0; pi < p1; pi++) if (cm[pi] && !in[base + pi]) { cp_add(shb + pi * PG, zero_page); dropped++; }      /* zeroed, kept committed: = the zero page a decommitted shadow page reads as */
+            }
+        }
+        cp_run();
+    }
+    free(in); tq[nq++] = now_ms();
+    if (g_rg_fast_refresh) LOG("r1: RING refresh: %zu window-1 pages written since the pre-base (%.1f MB) and window 2 (%zu pages compared) into the shadow; the extras listed again below\n", ww_pages, ww_pages * (double)PG / 1048576.0, copied - ww_pages);
     {   /* the extras again */
         size_t npg = 0; for (int i = 0; i < nnx; i++) npg += nx[i].n / PG;
         size_t tot = nwin + npg;
         for (size_t e = 0; e < g_rg_nx; e++) rg_pool_put(g_rg_idx[nwin + e]);
-        uint32_t *nidx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        uint8_t *ntouch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         uint8_t **nxa = malloc((npg + 1) * sizeof *nxa), **nxb = malloc((npg + 1) * sizeof *nxb);
-        if (!nidx || !ntouch || !nxa || !nxb) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
-        memcpy(nidx, g_rg_idx, nwin * 4);
-        VirtualFree(g_rg_idx, 0, MEM_RELEASE); VirtualFree(g_rg_touch, 0, MEM_RELEASE); free(g_rg_xa); free(g_rg_xb);
+        if (!nxa || !nxb) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
+        if (tot <= g_rg_idx_cap) {                        /* (net4, p43 timing) the index and the touch map kept when they are big enough (a new 72 MB index and its copy cost ~100 ms); the extras' entries flat, the touch map cleared */
+            for (size_t e = 0; e < npg; e++) g_rg_idx[nwin + e] = RG_FLAT;
+            memset(g_rg_touch, 0, tot);
+        } else {
+            uint32_t *nidx = VirtualAlloc(NULL, tot * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            uint8_t *ntouch = VirtualAlloc(NULL, tot, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!nidx || !ntouch) { LOG("r1: RING rebase: allocation FAILED (out of memory): no rollback ring for the rest of this session\n"); g_rg_nomem = 2; unpark(); return 0; }
+            memcpy(nidx, g_rg_idx, nwin * 4);
+            VirtualFree(g_rg_idx, 0, MEM_RELEASE); VirtualFree(g_rg_touch, 0, MEM_RELEASE);
+            g_rg_idx = nidx; g_rg_touch = ntouch; g_rg_idx_cap = tot;
+        }
+        free(g_rg_xa); free(g_rg_xb);
         for (int i = 0; i < g_nx; i++) free(g_x[i].b);
-        g_rg_idx = nidx; g_rg_touch = ntouch; g_rg_xa = nxa; g_rg_xb = nxb;
+        g_rg_xa = nxa; g_rg_xb = nxb;
         g_nx = nnx; g_xbytes = 0; size_t e = 0;
         for (int i = 0; i < nnx; i++) {
             g_x[i] = nx[i]; g_x[i].b = malloc(g_x[i].n);
@@ -492,17 +745,27 @@ int r1_ring_rebase(long long frame, Ctx *c) {
         }
         g_rg_nx = npg;
     }
-    double t2 = now_ms();
+    double t2 = now_ms(); tq[nq++] = t2;
+    LOG("r1: RING rebase phases (ms): stacks %.0f, modules %.0f, sweep %.0f, walk %.0f (thread start %.0f, prelude %.0f, total %.0f; %lld regions: heap %lld in %.0f ms, window 2 %.0f, dlls %.0f, catch %.0f, arena %.0f, tls %.0f, sort %.0f), write watch %.0f, ranges loop %.0f, tracked %.0f, copy run %.0f, async %.0f, index reset %.0f, extras %.0f\n", ths - tpre, tmo - ths, tsw - tmo, tq[1] - tq[0], g_walk_t0 - g_walk_made, g_walk_pre_ms, g_walk_t1 - g_walk_t0, g_walk_regions, g_walk_heap_regions, g_walk_heap_ms, g_walk_w2_ms, g_walk_dll_ms, g_walk_catch_ms, g_walk_ar_ms, g_walk_tls_ms, g_walk_sort_ms, tq[2] - tq[1], tq[3] - tq[2], tq[4] - tq[3], tq[5] - tq[4], tq[6] - tq[5], tq[7] - tq[6], tq[8] - tq[7]);
     RgSlot *s = &g_rg[0]; g_rg_head = 0; g_rg_count = 1;
     s->frame = frame; s->nent = 0; s->pages = 0; s->xpages = 0;
-    fibers_save();
-    nvn_r1_cb_save();
-    rg_meta_capture(s, c);
+    double tf0 = now_ms(); fibers_save(); double tf1 = now_ms();
+    nvn_r1_cb_save(); double tf2 = now_ms();
+    rg_meta_capture(s, c); double tf3 = now_ms();
+    if (g_rg_live_async && getenv("SSBU_R1_LIVE_VERIFY")) {      /* (research) threads still held: the shadow against the memory, every page of the ranges */
+        cp_init(); size_t n = 0;
+        for (int i = 0; i < g_nr; i++) { Rng *rr = &g_r[i]; for (size_t p = 0; p < rr->n / PG; p++) { uint8_t *a = rr->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi); if (!sh || !cm[pi]) continue; if (cm == g_sh2c ? g_ns2[pi] : g_ns1[pi]) continue; cp_add(sh, a); n++; } }
+        uint8_t *diff = calloc(n ? n : 1, 1); size_t nd = 0, shown = 0;
+        if (diff) { g_cp_cmp = diff; cp_run(); g_cp_cmp = NULL; for (size_t j = 0; j < n; j++) if (diff[j]) { nd++; if (shown < 12) { shown++; LOG("r1: LIVE VERIFY (held): differs: %s%s\n", where((uint8_t *)g_cj[j].s), is_async((uint8_t *)g_cj[j].s) ? " (async)" : ""); } } free(diff); }
+        LOG("r1: LIVE VERIFY (held): %zu pages compared, %zu differ from the shadow at the end of the refresh\n", n, nd);
+    }
+    double tl0 = now_ms();
     ls_rebase();                                          /* R4: the windows read-only again, the learned set emptied */
+    LOG("r1: RING rebase tail (ms): fibers %.0f, command buffers %.0f, meta %.0f, protection %.0f\n", tf1 - tf0, tf2 - tf1, tf3 - tf2, now_ms() - tl0);
     unpark();
     g_rg_caps++;
-    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f, copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
-        frame, now_ms() - t0, t1 - t0, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
+    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f = suspend %.0f + quiet wait %.0f over %d tries [thread not at a wait %d: %s; fibers busy %d; hint stale %d, wrong %d], copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
+        frame, now_ms() - t0, t1 - t0, g_hq_susp_ms, g_hq_wait_ms, g_hq_tries, g_hq_fail_thread, g_hq_who, g_hq_fail_fiber, g_hq_hint_stale, g_hq_hint_wrong, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
     return 1;
 }
 /* (R3 hs13: tl4 / nmr / le3a / lg2a / lh4, c00000ff in ntdll's unwinder at a lua2cpp L2CExceptionShutdown throw, about 1 loop
@@ -579,13 +842,13 @@ int r1_ring_load(long long frame, Ctx *c) {
     for (int j = 0; j < ncur; j++) {                      /* held at the same wait as in capture g: stays held; otherwise let go (the loop below waits for it) */
         if (!cur[j].held) continue;
         int keep = 0;
-        for (int i = 0; i < g_nth; i++) if (g_th[i].h == cur[j].h) { if (g_th[i].parked && cur[j].from == g_th[i].from && cur[j].imp == g_th[i].imp) { g_th[i].held = 1; g_th[i].rsp = cur[j].rsp; g_th[i].rip = cur[j].rip; g_th[i].cok = cur[j].cok; keep = 1; } break; }
-        if (keep) g_rg_kept_same++; else ResumeThread(cur[j].h);
+        for (int i = 0; i < g_nth; i++) if (g_th[i].h == cur[j].h) { if (g_th[i].parked && cur[j].from == g_th[i].from && cur[j].imp == g_th[i].imp) { g_th[i].held = 1; g_th[i].rsp = cur[j].rsp; g_th[i].rip = cur[j].rip; g_th[i].cok = cur[j].cok; g_th[i].pre = cur[j].pre; keep = 1; } break; }
+        if (keep) g_rg_kept_same++; else th_resume(&cur[j]);
     }
     for (double tq = now_ms();;) {                        /* each thread at the wait it was held at in that capture, no job running */
         ra_hold_restore();
         if (ra_fibers_quiet() || now_ms() - tq > 200) { if (g_ra_busy_fibers) LOG("r1: RING load: %d fibers still busy after 200 ms\n", g_ra_busy_fibers); break; }
-        for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; }
+        for (int i = 0; i < g_nth; i++) th_resume(&g_th[i]);
         SwitchToThread();
     }
     /* (R3 pub1: fx2j / fx3h, c0000005 in the sound thread's memcpy right after "nus3::audio update not back at its wait after 500 ms
@@ -634,7 +897,7 @@ int r1_ring_load(long long frame, Ctx *c) {
     }
     {   /* (R3 net3) SSBU_RB_LOADCMP=1 (option, default off: measured no faster, na0 / na1): a page is written only if it differs from the value loaded */
         static int lc = -1; if (lc < 0) { const char *e = getenv("SSBU_RB_LOADCMP"); lc = e && e[0] == '1'; }
-        g_cp_cond = lc; cp_run(); g_cp_cond = 0; }
+        g_cp_cond = lc; cp_run_nt(2); g_cp_cond = 0; }
     double t2 = now_ms();
     g_nfib = g->nfib; memcpy(g_fib, g->fib, (size_t)g->nfib * sizeof *g_fib);
     if (g->fpool_used) memcpy(g_fpool, g->fpool, g->fpool_used);
@@ -663,7 +926,7 @@ static PadRec g_rgs_pad[256]; static long long g_rgs_padf[256]; static int g_rgs
 static double g_rgs_pass_t0, g_rgs_pass[2]; static long long g_rgs_npass[2];
 static double g_rgs_pl[2], g_rgs_plv[2][RG_NST / 4]; static long long g_rgs_npl[2]; static int g_rgs_nplv[2];      /* (round 3) re-run passes: 0 = skipped ones (not the last), 1 = the last one */
 static double g_rgs_pass_v[2][RG_NST / 4]; static int g_rgs_pass_nv[2];
-static int rbg_on(void); static void rbg_step(Ctx *c); static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry); static void rbg_report(void); static void rbg_fight_off(void);   /* R3: rb_rollback.c */
+static int rbg_on(void); static void rbg_step(Ctx *c); static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry); static void rbg_report(void); static void rbg_fight_off(void); static void rbg_prebase(Ctx *c);   /* R3: rb_rollback.c */
 static int rgs_wanted(void) {
     if (g_rgs_on < 0 && rbg_on()) { g_rgs_on = 1; g_rgs_n = 1 << 30; return 1; }      /* R3 online rollback (SSBU_RB_NET): the ring driven by the input queues */
     if (g_rgs_on < 0) { const char *e = getenv("SSBU_RB_SIM"); g_rgs_on = e && e[0] && e[0] != '0'; if (g_rgs_on) sscanf(e, "%d,%d,%d", &g_rgs_n, &g_rgs_k, &g_rgs_warm); if (g_rgs_k < 1) g_rgs_k = 1; if (g_rgs_k > RG_MAXSLOT - 1) g_rgs_k = RG_MAXSLOT - 1; if (g_rgs_n < 1) g_rgs_n = 1; }
@@ -685,7 +948,7 @@ static void rgs_step(Ctx *c) {
     }
     if (g_rgs_polls_cur > 1) g_rgs_multi++;
     g_rgs_polls_cur = 0;
-    if (g_ra_off || !ra_fight_on()) { ls_fight_off(); if (g_ra_phase) g_ra_after_quiet = 1; g_ra_phase = 0; g_rgs_left = 0; g_rgs_pass_t0 = 0; if (rbg_on()) rbg_fight_off(); return; }   /* (R3: the report once at the end of each match; hs12: the session reset for the next match) */
+    if (g_ra_off || !ra_fight_on()) { ls_fight_off(); if (g_ra_phase) g_ra_after_quiet = 1; g_ra_phase = 0; g_rgs_left = 0; g_rgs_pass_t0 = 0; if (rbg_on()) { rbg_fight_off(); rbg_prebase(c); } return; }   /* (R3: the report once at the end of each match; hs12: the session reset for the next match) */
     if (rbg_on()) { rbg_step(c); g_rgs_pass_t0 = now_ms(); g_rgs_cyc0 = rgs_cyc_now(); g_ra_t_mark = g_rgs_pass_t0; return; }      /* R3: online rollback */
     long long i = g_rgs_next;                             /* the pass that ended here */
     if (g_rg_keep_on < 0) { const char *e = getenv("SSBU_RB_KEEP"); g_rg_keep_on = !e || atoi(e) != 0; }
@@ -824,6 +1087,7 @@ static DWORD WINAPI rgss_thread(void *p) {
                 DWORD64 base = 0; PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(x.Rip, &base, NULL);
                 uint64_t g = guest_function_of(x.Rip);
                 if (g && (!nf || fr[nf - 1] != g)) fr[nf++] = g; else if (!g && d == 0) fr[nf++] = ((uint64_t)x.Rip >> 4 << 4) | (1ull << 63);      /* 1 = host code (imports, hooks); capture / load: the host address */
+                else if (!g && d == 1 && nf == 1 && (fr[0] >> 63)) fr[nf++] = ((uint64_t)x.Rip >> 4 << 4) | (1ull << 62);      /* (net4) the host CALLER of a host leaf (strcmp, memcpy: who) */
                 if (!f) break;
                 void *hd; DWORD64 est; RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, x.Rip, f, &x, &hd, &est, NULL);
                 if (!x.Rip) break;
@@ -869,7 +1133,14 @@ static void rgs_samp_report(void) {
         long long tot = sg >= 4 ? g_rgss_tot[0][sg] + g_rgss_tot[1][sg] : g_rgss_tot[kd][sg]; long long div = sg >= 4 ? (g_rg_caps + g_rg_loads ? (sg == 4 ? g_rg_caps : g_rg_loads) : 1) : (kd ? nr : np);
         for (int i = 0; i < (sg == 2 ? 80 : 40); i++) {
             RgsS *e = &g_rgss_c[i]; long long v = inc ? e->incl[kd][sg] : e->self[kd][sg]; if (!v) break;
-            LOG("r1: RB PROF 3 %s %s %s %llx: %.4f ms per %s (%lld of %lld samples); self %.4f\n", kd ? "re-run" : "real", sgn[sg], inc ? "incl" : "self", (unsigned long long)e->fn,
+            char hn[96] = "";                                /* (net4) a host address named by its module and offset (the linker map gives the function) */
+            if (e->fn >> 62) {
+                HMODULE hm = NULL; uint64_t a = e->fn & ~(3ull << 62); char mp[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)a, &hm) && hm) GetModuleFileNameA(hm, mp, MAX_PATH);
+                const char *b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                snprintf(hn, sizeof hn, " = host %s%s+%llx", (e->fn >> 63) ? "" : "caller ", b, (unsigned long long)(a - (uint64_t)(uintptr_t)hm));
+            }
+            LOG("r1: RB PROF 3 %s %s %s %llx%s: %.4f ms per %s (%lld of %lld samples); self %.4f\n", kd ? "re-run" : "real", sgn[sg], inc ? "incl" : "self", (unsigned long long)e->fn, hn,
                 v * 0.1 / div, sg == 4 ? "capture" : sg == 5 ? "load" : "pass", v, tot, e->self[kd][sg] * 0.1 / div);
         }
         memcpy(g_rgss_c, g_rgss, sizeof g_rgss);
@@ -1023,6 +1294,8 @@ static void rgs_report(void) {
     LOG("r1: RING loads right after a capture with the threads kept held: %lld (threads kept at the same wait: %lld); fibers %d (last); stale fiber-block notes refused %lld\n", g_rg_kept_n, g_rg_kept_same, g_nfib, g_r1_fls_stale);
     LOG("r1: RING capture: median %.3f mean %.3f p99 %.3f ms; parts (means): hold %.3f, sweep + undo log %.3f, page copy (parallel) %.3f, fibers + threads + command buffers + let go %.3f; pages %.0f + extras %.0f mean (%.1f MB)\n",
         rg_pct(g_rgc[0], n, 50), rg_mean(g_rgc[0], n), rg_pct(g_rgc[0], n, 99), rg_mean(g_rgc[1], n), rg_mean(g_rgc[2], n), rg_mean(g_rgc[3], n), rg_mean(g_rgc[4], n), n ? pg / n : 0, n ? xp / n : 0, n ? (pg + xp) / n * PG / 1048576.0 : 0);
+    LOG("r1: RING fast1: fused compare + copy %s: %lld captures, %.0f pages copied by the compare per capture, %lld captures short of buffers; non-temporal stores %d; helpers spin %.2f ms; holds: task workers taken as held since the kick %lld (watchdog releases held back %lld)\n",
+        g_rg_fuse > 0 ? "on" : "off", g_rg_fused_caps, g_rg_fused_caps ? (double)g_rg_fused_pages / g_rg_fused_caps : 0, g_rg_fused_short, g_cp_nt, g_cp_spin, g_ra_pre_held, g_ra_wd_held_back);
     {   long long w = 0; for (int q = 0; q < 9; q++) w += g_cp_wrote[q];
         LOG("r1: RING loads (net3, SSBU_RB_LOADCMP): pages to load %lld, of them written (they differed) %lld (%.1f%%)\n", g_rg_ldpg, w, g_rg_ldpg ? 100.0 * (double)w / (double)g_rg_ldpg : 0.0); }
     for (int k = 0; k < RG_MAXSLOT; k++) {

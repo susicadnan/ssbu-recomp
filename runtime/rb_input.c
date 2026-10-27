@@ -20,6 +20,10 @@ void rb_input_reset(int nplayers, int local, int delay) {
     g_llatest = g_mismatch = 0;
 }
 int rb_input_delay(void) { return g_delay; }
+/* (2026-10-27) the delay changed during a delay-based match: up = the next local pad is written one frame further and the
+ * frame between repeats the last pad (rb_input_local); down = the next local pad falls on a frame already written and sent
+ * (never overwritten): that one pad of the player is not used */
+void rb_input_set_delay(int delay) { g_delay = delay < 0 ? 0 : delay > 15 ? 15 : delay; }
 
 static int16_t rest1(int16_t v) { return (v >= -RB_STICK_REST && v <= RB_STICK_REST) ? 0 : v; }
 RbPad rb_pad_rest(RbPad p) { p.lx = rest1(p.lx); p.ly = rest1(p.ly); p.rx = rest1(p.rx); p.ry = rest1(p.ry); return p; }
@@ -30,7 +34,9 @@ int rb_pad_equal(const RbPad *a, const RbPad *b) {
 RbPad rb_input_local(int frame, RbPad now) {
     static const RbPad zero;
     int f = frame + g_delay;
-    for (int g = g_llatest + 1; g < f; g++) { g_lpad[g & M] = zero; g_lframe[g & M] = g; }     /* the first frames: nothing pressed */
+    /* the first frames: nothing pressed; (2026-10-27) a frame skipped because the delay went up during the match: the pad
+     * before it again (the player's input held one frame longer, not dropped for a frame) */
+    for (int g = g_llatest + 1; g < f; g++) { g_lpad[g & M] = g_llatest > 0 ? g_lpad[g_llatest & M] : zero; g_lframe[g & M] = g; }
     if (f > g_llatest) { g_lpad[f & M] = rb_pad_rest(now); g_lframe[f & M] = f; g_llatest = f; }
     return g_lframe[frame & M] == frame ? g_lpad[frame & M] : zero;
 }
@@ -43,7 +49,10 @@ int rb_input_local_get(int frame, RbPad *out) {
 
 void rb_input_remote_put(int p, int frame, RbPad pad) {
     if (p < 0 || p >= g_np || p == g_local || frame < 1) return;
-    if (frame <= g_r[p].latest - RB_RING + 1) return;              /* older than the ring */
+    /* Every frame through latest is already known. A late duplicate of one of those frames may share a slot with
+     * a newer, not-yet-consecutive input; writing it again would erase that input and manufacture a receive gap.
+     * Likewise a frame beyond the next ring window must not evict a still-pending input. The sender repeats it. */
+    if (frame <= g_r[p].latest || (int64_t)frame - g_r[p].latest > RB_RING) return;
     if (g_r[p].frame[frame & M] == frame) return;                  /* a redundant copy */
     pad = rb_pad_rest(pad);
     g_r[p].pad[frame & M] = pad; g_r[p].frame[frame & M] = frame;
@@ -70,6 +79,7 @@ RbPad rb_input_get(int p, int frame, int *predicted) {
 }
 
 int rb_input_take_mismatch(void) { int m = g_mismatch; g_mismatch = 0; return m; }
+int rb_input_peek_mismatch(void) { return g_mismatch; }      /* (net4) the pending wrong guess, left pending (display.c's wait asks) */
 void rb_input_put_mismatch(int m) { if (m > 0 && (!g_mismatch || m < g_mismatch)) g_mismatch = m; }      /* (R3 pub1) a load refused: taken again next tick */
 
 int rb_input_finalized(void) {

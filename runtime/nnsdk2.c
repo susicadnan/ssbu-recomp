@@ -424,6 +424,12 @@ static void os_SetMemoryPermission(Ctx *c) {
     cxxrt_mem_changed(c->x[0], c->x[1]);      /* nncxxrt.c: remembered readable checks of this range are forgotten (P3) */      // PR #2 (jfb112697): passes the range; prototype from hostrt.h (via sdklift.h)
     if (!VirtualProtect((void *)(uintptr_t)c->x[0], (SIZE_T)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
     cxxrt_mem_changed(c->x[0], c->x[1]);      // PR #2 (jfb112697): and after it, as the frees do: a check that ran in between saw the old state
+    {   /* (net4 live) r1 (r1_state.c) lists the committed READ-WRITE pages: a range made read-write here is a commit to it, one made
+         * read-only or inaccessible a decommit (and the rollback's own read-only protection of a page is gone after this call:
+         * r1_on_commit puts it back). Without this the live pre-base's tracked list missed these and crashed at the first load. */
+        void r1_on_commit(void *, size_t); void r1_on_decommit(void *, size_t);
+        if (prot == PAGE_READWRITE) r1_on_commit((void *)(uintptr_t)c->x[0], (size_t)c->x[1]); else r1_on_decommit((void *)(uintptr_t)c->x[0], (size_t)c->x[1]);
+    }
 }
 static void os_SetMemoryAttribute(Ctx *c) { (void)c; }
 static void os_FreeAddressRegion2(Ctx *c) {      // PR #2 (review): report the release before and after, as os_FreeAddressRegion in nnsdk.c does

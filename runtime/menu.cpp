@@ -922,6 +922,15 @@ static void restart_game(void) {
     GetCurrentDirectoryW(MAX_PATH, dir);
     swprintf(pid, 16, L"%lu", GetCurrentProcessId());
     SetEnvironmentVariableW(L"SSBU_RESTART_WAIT_PID", pid);
+    {   /* (net4) rollback is switched on by Play SSBU.bat (scripts/run.py: SSBU_RB_NET=net when graphics.ini has rollback = on),
+         * and the new copy inherits this one's environment: "Rollback netcode: ON" + Restart the game now kept rollback OFF
+         * (testers 2026-10-25: "he had it enabled and restarted", the room match used the game's own netcode). The new copy
+         * now gets the variable from the key as run.py would; a value set by hand (not "net") is left as it is. */
+        char v[16]; const char *cur = getenv("SSBU_RB_NET");
+        int on = ini_read("rollback", v, sizeof v) ? !off_word(v) : 1;
+        if (on && !cur) SetEnvironmentVariableW(L"SSBU_RB_NET", L"net");
+        else if (!on && cur && !strcmp(cur, "net")) SetEnvironmentVariableW(L"SSBU_RB_NET", NULL);
+    }
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof si); si.cb = sizeof si;
@@ -1035,6 +1044,14 @@ static void sec_experimental(void) {
     if (ra_build()) ImGui::TextDisabled("one frame less input delay in fights; costs a second pass of each frame on the CPU");
     else ImGui::TextDisabled("not ready yet: it is being moved onto the normal build (like rollback)");
     ImGui::Separator();
+    /* (1b) every fighter of the base roster available (unlock_all.c: graphics.ini unlock_all_fighters; SSBU_UNLOCK_ALL wins) */
+    static int ua_on = -1, ua_on0;
+    if (ua_on < 0) ua_on = ua_on0 = gfx_unlock_all();
+    if (onoff("ua", ua_on != 0, true)) { ua_on = !ua_on; ini("unlock_all_fighters", k_onoff[ua_on]); }
+    ImGui::SameLine(); ImGui::Text("All fighters unlocked");
+    tag(1, ua_on != ua_on0);
+    ImGui::SameLine(); ImGui::TextDisabled("every fighter of the base game from the start; the save is not changed");
+    ImGui::Separator();
     /* (2) your name: the console user's nickname (nnfs.c) and the name the lobby shows (net_relay.c); graphics.ini player_name */
     static char pname[33], pname0[33];
     static int pname_read;
@@ -1058,6 +1075,14 @@ static void sec_experimental(void) {
 #else
     if (!pname[0]) ImGui::TextDisabled("Empty: your login name is used.");
 #endif
+    /* (2b, net4) the lobby code: only players with the same code see each other's rooms (net_relay.c online_code; "public" = everyone) */
+    static char lcode[33], lcode0[33]; static int lcode_read;
+    if (!lcode_read) { lcode_read = 1; ini_read("online_code", lcode, sizeof lcode); memcpy(lcode0, lcode, sizeof lcode); }
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("Lobby code", "empty = public: everyone's rooms", lcode, sizeof lcode);
+    if (ImGui::IsItemDeactivatedAfterEdit()) ini("online_code", lcode);
+    tag(1, strcmp(lcode, lcode0) != 0);
+    ImGui::SameLine(); ImGui::TextDisabled("a private word you and your friends all enter: only your rooms are listed");
     ImGui::Separator();
     /* (3) online play (net_relay.c / nnldn.c) */
     bool on = O.mode != 0;
@@ -1079,7 +1104,7 @@ static void sec_experimental(void) {
 #else
             rb_have = 0;
 #endif
-            rb_on = ini_read("rollback", v, sizeof v) && !off_word(v); rb_on0 = rb_on;
+            rb_on = ini_read("rollback", v, sizeof v) ? !off_word(v) : 1; rb_on0 = rb_on;      /* (net4) on unless graphics.ini says off (scripts/run.py: the same default) */
         }
         if (onoff("rb", rb_on != 0, rb_have || rb_on)) { rb_on = !rb_on; ini("rollback", rb_on ? "on" : "off"); }
         ImGui::SameLine(); ImGui::Text("Rollback netcode");
@@ -1090,7 +1115,7 @@ static void sec_experimental(void) {
         if (getenv("SSBU_RB_NET")) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "Rollback is active in this run (SSBU_RB_NET=%s).", getenv("SSBU_RB_NET"));
         sec_online();
     }
-    if (online_differs() || S.runahead != S0.runahead || strcmp(pname, pname0)) {
+    if (online_differs() || S.runahead != S0.runahead || ua_on != ua_on0 || strcmp(pname, pname0) || strcmp(lcode, lcode0)) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Saved. These changes are used when the game starts again.");
         if (ImGui::Button("Restart the game now")) restart_game();
@@ -1364,13 +1389,33 @@ static void draw_stats(void) {
     ImGui::Begin("##stats", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                  ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("%.0f fps  %.2f ms", avg > 0 ? 1000.0f / avg : 0.0f, avg);
+    {   /* (2026-10-27, the owner: "an ID that verifies that we are all on the same build in the F2 menu") this exe's build id,
+         * with its link stamp (net_relay.c): players compare the 6 hex digits; a room of another exe cannot be joined anyway */
+        const char *b = net_build_id(); const char *dot = strchr(b, '.'); const char *dash = dot ? strchr(dot, '-') : NULL;
+        if (dot && dash && dash - dot - 1 == 6) ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1), "build %.6s  (%s)", dot + 1, dash + 1);
+        else ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1), "build %s", b); }
     static const char *const st[] = {"Offline", "Connecting...", "Online - connected", "Disconnected"};
     ImVec4 col = ns.state == NET_CONNECTED ? ImVec4(0.45f, 0.9f, 0.45f, 1) : ns.state == NET_CONNECTING ? ImVec4(1, 0.8f, 0.2f, 1) : ns.state == NET_DISCONNECTED ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.7f, 0.7f, 0.7f, 1);
     if (ns.state == NET_CONNECTED) ImGui::TextColored(col, "%s (%d players)", st[2], ns.players);
     else ImGui::TextColored(col, "%s", ns.state >= 0 && ns.state <= 3 ? st[ns.state] : "?");
     if (ns.state == NET_CONNECTED || ns.state == NET_CONNECTING) {
         if (ns.ping_ms >= 0) ImGui::Text("ping %d ms  delay %d f", ns.ping_ms, ns.delay); else ImGui::Text("ping -  delay %d f", ns.delay);
+        if (ns.path == NET_PATH_DIRECT) ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1), "direct to the other player");      /* (net4) */
+        else if (ns.path == NET_PATH_RELAYED) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "through the lobby server (slower)");
         ImGui::Text("rollback %d / %d f", ns.rollback_last, ns.rollback_max);
+        if (ns.jitter_ms >= 0) {                                /* (net4) the link: jitter, loss, and a verdict */
+            const char *v = ns.loss_pct >= 5 ? "losing packets (wired? no downloads?)" : ns.jitter_ms >= 15 ? "jittery (Wi-Fi?)" : ns.jitter_ms >= 6 ? "ok" : "good";
+            ImVec4 c = ns.loss_pct >= 5 || ns.jitter_ms >= 15 ? ImVec4(1, 0.5f, 0.3f, 1) : ImVec4(0.6f, 0.9f, 0.6f, 1);
+            ImGui::TextColored(c, "jitter %d ms  loss %d %%  %s", ns.jitter_ms, ns.loss_pct < 0 ? 0 : ns.loss_pct, v);
+        }
+        {   /* (net4) connection bars, as a Wi-Fi icon: 4 = good link, 1 = bad */
+            int bars = ns.ping_ms < 0 ? 0 : (ns.loss_pct >= 5 || ns.jitter_ms >= 20 || ns.path == NET_PATH_RELAYED) ? 1 : (ns.jitter_ms >= 10 || ns.ping_ms >= 150) ? 2 : (ns.jitter_ms >= 6 || ns.ping_ms >= 90) ? 3 : 4;
+            ImVec2 p = ImGui::GetCursorScreenPos(); ImDrawList *dl = ImGui::GetWindowDrawList(); float h = ImGui::GetTextLineHeight();
+            ImU32 on = bars >= 3 ? IM_COL32(110, 230, 110, 255) : bars == 2 ? IM_COL32(250, 200, 60, 255) : IM_COL32(250, 90, 70, 255), off = IM_COL32(120, 120, 120, 120);
+            for (int i = 0; i < 4; i++) { float bh = h * (0.35f + 0.22f * i); dl->AddRectFilled(ImVec2(p.x + i * (h * 0.45f), p.y + h - bh), ImVec2(p.x + i * (h * 0.45f) + h * 0.35f, p.y + h), i < bars ? on : off, 1.0f); }
+            ImGui::Dummy(ImVec2(h * 1.9f, h)); ImGui::SameLine();
+            ImGui::Text("%s", bars == 4 ? "excellent" : bars == 3 ? "good" : bars == 2 ? "fair" : bars == 1 ? "poor" : "connecting");
+        }
     }
     ImGui::Text("run-ahead %s", !ra_cfg ? "off" : r1_ra_phase() ? "on (running)" : "on");
     ImGui::End();

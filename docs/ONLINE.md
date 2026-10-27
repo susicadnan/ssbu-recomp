@@ -135,6 +135,12 @@ sees rooms of its own build.
 
 ## Rollback netcode (experimental)
 
+For controlled smoothness testing, `SSBU_RB_NET_PREDRAIN=1` applies inputs that arrived during the frame-pacing wait
+before the next simulation pass reads its controllers. It does not change the configured input delay or the wire
+protocol. It defaults off pending in-game determinism and frame-time comparisons. See
+[the experiment and reproducible tests](NETPLAY_SMOOTHNESS.md). Separately, `SSBU_RB_NET_RESEND_MS=17` retries outstanding
+inputs more frequently while stalled (default 50 ms; valid 8..50). This also remains an optional experiment.
+
 Smooth fights at high ping: each game runs the match locally and only the players' inputs travel; a late input rolls the
 game back a few frames and replays them, instead of slowing both players down.
 
@@ -154,8 +160,18 @@ the room's. Each player plays with his own name-tag controls (button layout and 
 off use the game's own online netcode as before (a short message says so once), so players with different settings can
 still play together in a room.
 
-Input delay is chosen from the best measured round trip: 1 frame below about 117 ms, 2 frames from about 117 ms, 3 from 150 ms,
-4 from about 184 ms (the rest of the trip is covered by rollback).
+Rollback is **on by default**; `rollback = off` in `config\graphics.ini` (or F1 > Experimental) turns it off. F1's
+"Restart the game now" applies the switch too.
+
+Input delay is chosen from the best measured round trip so that the other player's input normally arrives just before
+it is needed: the one-way time plus a third of a frame, rounded up. Round trip up to about 22 ms: 1 frame; up to 55 ms: 2;
+up to 88 ms: 3; up to 122 ms: 4; up to 155 ms: 5; above: 6. Rollback then only covers lag spikes, and the frames whose
+input is already there cost less (no state is saved for them). A lower `rollback_delay` gives less input delay and more
+rollbacks (each one shows as a slightly late frame). `rollback_delay = <frames>` in `config\graphics.ini` fixes it instead (`auto` = the rule above).
+
+The game uses a direct connection between the two players whenever the routers allow it, rollback messages included;
+F2 shows "direct to the other player" or "through the lobby server". A room still relayed 10 s after the other player
+joined shows a notice saying why ("Relay only" on one side, or a router / firewall).
 
 Limits today: rollbacks of 3 or more frames take a little longer than one frame (a short hitch at very high ping);
 Windows only; tested between two games on one PC with simulated 150 ms ping and loss (0 desyncs), not yet much between

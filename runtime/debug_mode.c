@@ -79,6 +79,27 @@ int oe_exit_request(void);                             /* nnmisc.c */
 static volatile LONG64 g_end_limit, g_end_fight_frames, g_end_fired;
 static volatile LONG64 g_end_first_frame;
 void debug_mode_frame(long long frame) {
+    {   /* (net4, research) SSBU_DEBUG_FMWATCH=1: the FighterManager impl's bytes + 0xa0 .. + 0xe0 every presented frame, the
+         * changes printed (which byte says "the fight scene is up / the entrance runs" before the ready-go at + 0xd2) */
+        static int on = -1; if (on < 0) { const char *e = getenv("SSBU_DEBUG_FMWATCH"); on = e && e[0] == '1'; }
+        if (on) {
+            static uint8_t prev[0x40]; static int had;
+            uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+            uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t cur[0x40];
+            if (impl && safe_read(impl + 0xa0, cur, sizeof cur)) {
+                if (!had || memcmp(cur, prev, sizeof cur)) {
+                    char line[1200]; int o = 0;
+                    for (int i = 0; i < 0x40 && o < (int)sizeof line - 24; i++) if (!had || cur[i] != prev[i]) o += snprintf(line + o, sizeof line - (size_t)o, " +%x:%02x->%02x", 0xa0 + i, had ? prev[i] : 0, cur[i]);
+                    printf("debug fmwatch: presented frame %lld: impl %llx%s:%s\n", frame, (unsigned long long)impl, had ? "" : " (first seen)", line); fflush(stdout);
+                    memcpy(prev, cur, sizeof cur); had = 1;
+                }
+            } else if (had) { printf("debug fmwatch: presented frame %lld: no FighterManager impl\n", frame); fflush(stdout); had = 0; }
+            {   /* (research) the fight-frame counter and the ready-go flag every 10 presented frames while the manager is there */
+                long long r1_fight_frame(void); static long long last_ff = -1; static int n;
+                if (impl && (++n % 10 == 0 || r1_fight_frame() != last_ff && last_ff < 0)) { last_ff = r1_fight_frame(); printf("debug fmwatch: presented frame %lld: fight frame %lld, ready-go %d\n", frame, last_ff, impl ? rd8(impl + 0xd2) : -1); fflush(stdout); }
+            }
+        }
+    }
     if (!g_end_limit && !g_dm.text[0]) return;
     uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
     uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0;
@@ -279,6 +300,35 @@ static uint64_t hash40(const char *s) {
  * Both games force + 0x454 = 1 with the agreed layout of each player, so a player's own controls are the same on both PCs. */
 #include "rb_hs.h"
 static int g_hs_wanted, g_hs_ok, g_hs_local, g_hs_lwr;      /* (R3 lwr) g_hs_lwr: a Local Wireless room's match played with rollback */
+static int g_dm_setup_n;                                     /* (net4) match set-ups seen (player 1's record built) */
+int debug_match_setups(void) { return g_dm_setup_n; }
+int debug_hs_ok(void) { return g_hs_ok; }                    /* (net4) the last set-up's match agreed with the other game */
+int debug_fm_scene(void) {                                   /* (net4) the FighterManager's fight scene is set up (impl + 0xb4, from SSBU_DEBUG_FMWATCH: 0 -> 1 at the set-up, before the loading) */
+    uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+    uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t v = 0;
+    return impl && safe_read(impl + 0xb4, &v, 1) && v == 1;
+}
+static int g_lwr_mode_set;                                   /* (net4) the melee mode of the match block was made 0 for this room match */
+/* (net4, 2026-10-25, real players: "when the match is done we can't get out of the lobby, we both wait for the other to confirm")
+ * the room match's melee mode stayed 0 (local) after the fight, so the result screens of both games ran as a local match's and
+ * neither told the other player's game it was done (the room's screens expect mode 1). rb_rollback.c calls this at the fight's
+ * end: the mode is 1 again (match block + 0 and the FighterManager's copy at impl + 0xc0, when the manager is there).
+ * SSBU_RB_NET_ROOM_MODE_BACK=0: not restored (the old way). */
+void debug_lwr_mode_back(void) {
+    if (!g_lwr_mode_set) return;
+    g_lwr_mode_set = 0;
+    /* (net4, 2026-10-25 20:44, a real match) with the mode back to 1 AND the other player's OK press forwarded (menu mode) the
+     * result screen went on and the game CRASHED in its own code (f_710134c690 read address 8: the Local Wireless match
+     * objects that this match never made). Default OFF now: the screens stay a local match's, the forwarded OK presses end
+     * them. SSBU_RB_NET_ROOM_MODE_BACK=1: the mode back (test). */
+    { const char *e = getenv("SSBU_RB_NET_ROOM_MODE_BACK"); if (!(e && e[0] == '1')) { printf("[rbnet] room match over: melee mode left at 0 (local): the result screens end by the exchanged OK presses\n"); fflush(stdout); return; } }
+    uint8_t was = rd8(MELEE_INFO); wr8(MELEE_INFO, 1);
+    uint64_t inst = hook_address("_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E");
+    uint64_t mgr = inst ? sr64(inst) : 0, impl = mgr ? sr64(mgr) : 0; uint8_t was_fm = impl ? rd8(impl + 0xc0) : 0;
+    if (impl) wr8(impl + 0xc0, 1);
+    printf("[rbnet] room match over: melee mode (match block + 0) %u -> 1, FighterManager impl + 0xc0 %u -> %s: the room's result screens again\n", was, was_fm, impl ? "1" : "(no manager)");
+    fflush(stdout);
+}
 static RbhMatch g_hs_m;
 /* (hs12) player 1's panel state as the game's function got it (before any change here): the template of player 2's state
  * when the select screen had NO panel for player 2 (each player picks only his own fighter; the other game's player is
@@ -417,6 +467,7 @@ static void hs_apply(uint64_t st, int idx, uint32_t type_was) {
         }
     }
     if (!g_hs_ok || idx < 0 || idx > 1) return;
+    if (g_hs_lwr) g_lwr_mode_set = 1;
     if (g_hs_lwr) {                                     /* (R3 lwr) the players' fighters, colours, rules are the room's own (the same on both PCs) */
         /* Which controller drives a player: state + 0x210 = the controller slot (the record builder reads the controller object
          * 0x7105338860[state + 0x210]). In the room's records this game's own player has slot 0 (its name tag, + 0x450) and the
@@ -519,7 +570,7 @@ static void match_player_hook(Ctx *c, void *user) {
         if (g_dm_hazards >= 0) wr8(GA(0x7105309985ULL), (uint8_t)g_dm_hazards);
         if (g_dm.items >= 0) wr32(MELEE_INFO + 0x54, g_dm.items ? 2u : 0u);
     }
-    if (idx == 0) { void nnhid_lwr_styles(int on, int gc0, int gc1); nnhid_lwr_styles(0, 0, 0); }      /* (R3 lwr) a new set-up: the ports in their own kinds again */
+    if (idx == 0) { void nnhid_lwr_styles(int on, int gc0, int gc1); nnhid_lwr_styles(0, 0, 0); g_dm_setup_n++; }      /* (R3 lwr) a new set-up: the ports in their own kinds again */
     if (idx == 0) { void rbn_set_setup_waiting(int waiting); rbn_set_setup_waiting(c->x[30] == GA(0x71017911dcULL)); }      /* (R3 lwr) a Local Wireless room's waiting-stage fight: built from its own set-up (runs lwres2 / lwres3: return address 0x71017911dc; the room's match and the select screens: 0x710178f498) */
     if (g_hs_wanted) hs_apply(st, idx, type_was);       /* R3: the match both online games agreed (rb_net.c handshake) */
     if (idx == 1) g_dm_state1_ok = safe_read(st, g_dm_state1, sizeof g_dm_state1);

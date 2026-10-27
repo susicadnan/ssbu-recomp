@@ -14,11 +14,13 @@
  * Frames: the ring's base capture (the first safe point of the fight) is frame 0; real pass n is frame n.
  * No game content in this file. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "rb.h"
+#include <time.h>                                       /* (net4) the match report's date */
 int rbn_on(void); void rbn_init(void); void rbn_start(long long f0); int rbn_started(void); int rbn_local_player(void); int rbn_ahead(void);
 void rbn_local_pad(long long f, RbPad now); RbPad rbn_pad(int player, long long f);
 void rbn_drain(long long cur); int rbn_take_mismatch(void); long long rbn_confirmed(void); int rbn_peer_gone(void);
+void rbn_before_frame(long long cur);
 void rbn_pass_hash(long long f); void rbn_finalize(long long cur); double rbn_pace_extra(long long f); void rbn_report(FILE *o, long long frames);
-int rbn_delay(void); int rbn_rtt_ms(void); double rbn_offset_ms(void); void rbn_resend(void); void rbn_status(char *out, size_t n); void rbn_hello(void); int rbn_peer_started(void); void rbn_choose_delay(void);
+int rbn_delay(void); int rbn_rtt_ms(void); double rbn_offset_ms(void); void rbn_resend(double now_ms); void rbn_status(char *out, size_t n); void rbn_hello(void); int rbn_peer_started(void); void rbn_choose_delay(void);
 
 int rbn_match_cancelled(void); void rbn_match_reset(void); int rbn_match_number(void);      /* (hs12) */
 void rbn_set_lockstep(int on); int rbn_loop(void);      /* (hs13) */
@@ -33,6 +35,36 @@ void input_mark(const char *what);                      /* nnhid.c: the input se
 /* (hs12) matches in one session: 0 = between matches, 1 = an online match runs (its base state made), 2 = a match that was
  * not agreed (handshake failed / given up) runs locally (Final Destination, one stock): no ring, and rbg_pad walks player 1 off the stage */
 static int g_rbg_in_match, g_rbg_rebase; static double g_rbg_quit_t0;
+static int g_rbg_mr_done;                                 /* (net4) this match's report written (once: at the fight's end, or at the exit during a fight) */
+static int g_rbg_menu; static double g_rbg_menu_t0, g_rbg_menu_own_a, g_rbg_menu_other_a; static RbPad g_rbg_menu_own;
+/* (net4, 2026-10-25 night, owner: "hide it in the character loading screen where it's static anyways") THE PRE-BASE: the full
+ * save that makes the ring's base (0.75-0.85 s on the owner's PC, 1.8 s before this evening) is made BEFORE the fight, at the
+ * first safe point after the match's set-up at which the stage is drawing (the loading is over; the entrance runs) and the
+ * game is quiet enough to hold. The first safe point with the fight on (the ready-go) then captures frame 0 as every other
+ * frame (a few ms). The base's own frame number is -1: no rollback ever goes there; the state at the ready-go is the same
+ * on both games as before (the loading frames do not touch the simulation: the base at the ready-go never desynced).
+ * From the second match on the same, with the ring's rebase (a copy of every page) instead of the full save.
+ * SSBU_RB_NET_PREBASE=0: the old way (the full save at the ready-go). */
+static int g_rbg_prebased, g_rbg_prebase_setup; static long long g_rbg_prebase_tries;
+int r1_ring_refresh(long long frame, Ctx *c); void r1_ring_ww_reset(void); void nvn_ww_hold(int on); int r1_live_base_state(void); void r1_live_base_abort(void);
+int debug_match_setups(void); int debug_hs_ok(void); int debug_fm_scene(void); long input_frame_draws_seen(void);
+static int rbg_delay_only(void) {                        /* graphics.ini rollback = delay (rb_net.c) or SSBU_RB_NET_DELAYONLY=1: no snapshot ring, every match delay-based */
+    static int v = -1; if (v < 0) { const char *e = getenv("SSBU_RB_NET_DELAYONLY"); v = e && e[0] == '1'; }
+    return v;
+}
+static void rbg_prebase(Ctx *c) {
+    static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_PREBASE"); want = !(e && e[0] == '0'); }      /* =0: the full save at the ready-go, as before */
+    if (!want || g_rbg_in_match || g_rg_nomem || rbn_loop() || !rbn_handshake_wanted() || rbg_delay_only()) return;
+    int setups = debug_match_setups();
+    if (!setups || setups == g_rbg_prebase_setup) return;      /* no set-up yet, or this set-up's base is under way */
+    if (rbn_match_cancelled() || !debug_hs_ok() || !debug_fm_scene()) return;      /* the match agreed, the scene set up (the loading screen: the copy runs under it) */
+    int r1_live_base_start(Ctx *c, int second);
+    if (r1_live_base_start(c, g_rg_ready)) { g_rbg_prebase_setup = setups; g_rbg_prebased = 2; g_rbg_rebase = 0;
+        LOG("r1: RB NET: LIVE PRE-BASE started (set-up %d, %s): the game keeps running while the ring's base is copied\n", setups, g_rg_ready ? "the existing shadow filled again" : "match 1"); }
+}      /* _a: when each player's A (OK) was last seen */      /* (net4) menu mode after a room match: the result screen's pads exchanged (rb_net.c rbn_menu_send) */
+void rbn_menu_send(const RbPad *p); int rbn_menu_pad(RbPad *out); void rbn_menu_counts(long long *tx, long long *rx); int rbn_room_rollback(void);
+long long rbn_oldmatch_dropped(void); void rbn_status(char *out, size_t n);
+static void rbg_match_report_atexit(void);
 /* (R3 net3, runs pe3 / pe4: DESYNC from frame 2) the base state is the first capture of the fight; when it cannot be made at the
  * first safe point with the fight on ("RA: first save: no quiet moment within 200 ms: not now"), it was made one pass later, and
  * that game called fight frame 218 "frame 0" while the other called 217 so: every frame one apart. Now the frames are counted
@@ -73,11 +105,38 @@ static double g_rbg_t_pre, g_rbg_t_load, g_rbg_t_rerun, g_rbg_t_recap, g_rbg_t_p
 
 /* (hs14) every capture of the match tells the ring the oldest frame a rollback may still need (r1_ring.c g_rg_need): the
  * newest frame with both players' pads known (a wrong guess can only be at a later frame, and loads the state before it) */
-static long long g_rbg_short_waits;
+static long long g_rbg_short_waits, g_rbg_mid_dropped;      /* (net4) wrong guesses answered by the rollback running (pads taken between its re-run passes) */
 /* (R3 pub1) a load refused at a wrong guess at frame g_rbg_pend (r1_ring_load -1): the state before it must stay in the ring
  * until the rollback is made next tick; g_rbg_refused_tick: no second try in the same tick (each try may hold for 500 ms) */
 static int g_rbg_pend, g_rbg_refused_tick;
 void rbn_put_mismatch(int m);
+/* (net4) the state of real frame i is needed only if frame i + 1 will run on a guess: a wrong guess at frame m loads the
+ * newest state at or before m - 1, and m is always a guessed frame. When the other player's pad of frame i + 1 is already
+ * here (the input delay covers the trip: rollback_delay at or above the one-way time), state i can never be loaded and the
+ * capture (3-5 ms of every frame: threads held, the learned pages compared and copied) is left out; the next capture then
+ * takes the changes of both frames. A pending wrong guess (a refused load) keeps every capture. SSBU_RB_NET_CAPNEED=0: every
+ * frame is captured (the old way). */
+static long long g_rbg_cap_unneeded, g_rbg_recap_unneeded;
+static long long g_rbg_wait_rb, g_rbg_wait_busy;
+/* (net4) display.c's wait for the refresh asks, every millisecond, whether a rollback is pending: the other player's pads
+ * received so far are taken (the main thread, the game blocked in that wait: nothing reads the pads meanwhile) and a wrong
+ * guess at a frame already run lets the game through to the safe point, which rolls back in the frame's idle time.
+ * SSBU_RB_NET_VSDEFER=0: off (the old way). */
+void display_set_rb_pending(int (*fn)(void)); void display_wait_refresh_deferred(void); long long display_vsync_deferred_count(void);
+static DWORD g_rbg_tid; static int g_rbg_vsdefer = -1;
+static int rbg_pending(void) {
+    if (g_rbg_in_match != 1 || g_rbg_noring || !g_rg_ready || g_ra_phase == 2 || !rbn_started() || rbn_loop() || GetCurrentThreadId() != g_rbg_tid) return 0;
+    long long cur = g_rgs_next - 1;
+    if (cur < 1) return 0;
+    rbn_drain(cur);
+    int m = rb_input_peek_mismatch();
+    return m > 0 && m <= cur;
+}                        /* (net4) rollbacks started inside the wait for the tick */
+static int rbg_capture_needed(long long i) {
+    static int on = -1; if (on < 0) { const char *e = getenv("SSBU_RB_NET_CAPNEED"); on = !(e && e[0] == '0'); }
+    if (!on || g_rbg_pend > 0 || rbn_loop()) return 1;
+    return rbn_confirmed() < i + 1;
+}
 static int rbg_capture(long long i, Ctx *c) { g_rg_need = rbn_confirmed(); if (g_rbg_pend > 0 && g_rbg_pend - 1 < g_rg_need) g_rg_need = g_rbg_pend - 1; return r1_ring_capture(i, c); }
 void rbn_stats(int *delay, int *last, int *maxk) { *delay = rbn_delay(); *last = (int)g_rbg_last_k; *maxk = (int)g_rbg_max_k; }   /* net_relay.c net_stats_get (F2) */
 
@@ -132,7 +191,7 @@ static void rbg_step_body(Ctx *c) {
     if (g_rbg_in_match == 3) return;                    /* (R3 lwr, run lwr2: both games crashed here) a room fight already running stays one until its fight-off:
                                                          * the room's match is set up (handshake, rbn_match_cancelled() 0 again) while the waiting-stage fight still runs */
     if (rbn_match_cancelled() == 2) {                   /* (R3 pub2) a Local Wireless room fight: the game's own netcode, no ring, pads untouched */
-        if (!g_rbg_in_match) { g_rbg_in_match = 3; LOG("r1: RB NET: a Local Wireless room fight: no rollback (the game's own netcode)\n"); }
+        if (!g_rbg_in_match) { g_rbg_in_match = 3; if (g_rbg_menu) { g_rbg_menu = 0; LOG("r1: RB NET: menu mode off: the room's waiting stage\n"); } LOG("r1: RB NET: a Local Wireless room fight: no rollback (the game's own netcode)\n"); }
         return;
     }
     if (rbn_match_cancelled()) {                        /* (hs12) not agreed with the other game: no rollback; rbg_pad leaves this match */
@@ -145,38 +204,68 @@ static void rbg_step_body(Ctx *c) {
         {   static int tl = -1; if (tl < 0) { const char *e = getenv("SSBU_RB_NET_TEST_LATEBASE"); tl = e ? atoi(e) : 0; }     /* (net3, TEST ONLY) the base made n passes late */
             if (tl > 0 && g_ff - g_rbg_ff_first < tl) { LOG("r1: RB NET TEST_LATEBASE: no base state at fight frame %lld\n", g_ff); return; } }
         if (g_rbg_basefix) g_rgs_next = i = g_ff - g_rbg_ff_first;      /* (net3) the base's frame number: 0, or the passes it came late */
-        if (g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
-        else { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
-        g_rbg_noring = g_rg_nomem != 0;
+        int done = 0, delay_only = rbg_delay_only();
+        if (delay_only) done = 1;                       /* (rollback = delay) no base state, no ring: the match is delay-based from the start */
+        if (g_rbg_prebased == 2 && !delay_only) {       /* (net4 live) see rbg_prebase: the live copy joined, the base finished, every page written since copied */
+            double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
+            int r1_ring_live_finish(long long frame, Ctx *c); int st = r1_live_base_state();
+            int rr = (st == 1 || st == 2 || st == 3) ? r1_ring_live_finish(i, c) : 0;
+            if (rr) { done = 1; nvn_ww_hold(0); LOG("r1: RB NET: the ready-go after the LIVE pre-base: held for %.1f ms in all (no full save)\n", now_ms() - tr); }
+            else if (g_rg_ready && !g_rg_nomem) { static int tries; if (++tries <= 20 || tries % 60 == 0) LOG("r1: RB NET: the refresh after the live base was refused (try %d): next pass\n", tries); return; }      /* (p30: falling back with the base already made corrupted the match) */
+            else if (st > 0 && !g_rg_nomem && now_ms() - tr < 300) { LOG("r1: RB NET: the live base is not ready yet: next pass\n"); return; }
+            if (!done) { r1_live_base_abort(); nvn_ww_hold(0); g_rbg_prebased = 0; LOG("r1: RB NET: the live pre-base could not be used (state %d): the base the old way\n", st); }
+        }
+        if (!done && g_rbg_prebased == 1) {             /* (net4) the held pre-base of p28 (SSBU_RB_NET_PREBASE_HELD=1): the base refreshed */
+            double tr = now_ms(); if (!g_rbg_basefix) g_rgs_next = i = 0;
+            int rr = r1_ring_refresh(i, c); nvn_ww_hold(0);
+            if (!rr) { if (!g_rg_nomem) LOG("r1: RB NET: the base refresh at the ready-go was refused: next pass\n"); return; }
+            LOG("r1: RB NET: the base refreshed at the ready-go in %.1f ms (after the pre-base: no full save here)\n", now_ms() - tr);
+            done = 1;
+        }
+        if (done) { }
+        else if (!done && g_rbg_rebase) { if (!g_rbg_basefix) g_rgs_next = i = 0; if (!r1_ring_rebase(i, c) && !g_rg_nomem) return; }
+        else if (!done) { r1_ring_capture(i, c); if (g_rbg_wdfix) g_ra_wd_pause = 1; if (!g_rg_ready && !g_rg_nomem) return; }   /* (the full save sets the pause back to 0) */
+        g_rbg_noring = g_rg_nomem != 0 || delay_only;
         rbn_set_lockstep(g_rbg_noring);
-        if (g_rbg_noring) {
+        if (delay_only) {
+            g_rbg_noring_matches++;
+            LOG("r1: RB NET: DELAY-BASED MATCH (graphics.ini rollback = delay): no snapshot ring; every frame waits for the other player's pad\n");
+            printf("[rbnet] delay-based match (rollback = delay): the game waits for the other player's input every frame, no rollback\n"); fflush(stdout);
+        } else if (g_rbg_noring) {
             g_rbg_noring_matches++;
             LOG("r1: RB NET: ROLLBACK OFF FOR THIS MATCH: not enough memory for the snapshot ring (%s); the match goes on delay-based: every frame waits for the other player's pad\n",
                 g_rg_nomem == 1 ? "the base state needs about one copy of the game's memory in free commit" : "the ring broke on the way: off for the rest of this session");
             printf("[rbnet] rollback OFF for this match (not enough memory): delay-based, the game waits for the other player's input every frame\n"); fflush(stdout);
         }
         if (g_rbg_wdfix) g_ra_wd_pause = 1;
-        g_rbg_in_match = 1;
+        g_rbg_in_match = 1; g_rbg_mr_done = 0; g_rbg_menu = 0;
+        { static int reg; if (!reg++) atexit(rbg_match_report_atexit); }      /* (net4) the window closed during a fight: the report still written */
         if (i > 0) LOG("r1: RB NET: the base state was made %lld passes after the first safe point with the fight on (fight frame %lld): it is frame %lld, as on the other game (net3)\n", i, g_rbg_ff_first, i);
         rbn_start(i);
         rbn_pass_hash(0);                               /* (hs12) the checksum of frame 1 starts here (run tw8: frame-line lines from before the base, a different number on the two games, made frame 1 of match 2 differ) */
         { char mk[24]; snprintf(mk, sizeof mk, "match%don", rbn_match_number()); input_mark(mk); }
+        input_mark("fight");                            /* (net4) the fight-frame count of SSBU_SHOT_FIGHT (nnhid.c) starts at the match start on every game */
         if (g_rbg_wdfix) g_ra_wd_base = 2;              /* from now on the hold watchdog has the long limit (H2 sets it back to this) */
         g_rbg_wd_before = g_ra_wd_fired;                /* (releases before the match, e.g. at its slow first passes, are harmless: no state in the ring yet) */
         g_rgs_next = i + 1;
         if (g_rbg_pace < 0) { const char *e = getenv("SSBU_RB_NET_PACE"); g_rbg_pace = !e || atoi(e) != 0; }
-        { const char *e = getenv("SSBU_RB_NET_LASTLITE"); g_rgs_lastlite = !e || atoi(e) != 0; }      /* default on here: proven exact (rl4L, rl4K); =0 runs the last re-run pass fully */
+        { const char *e = getenv("SSBU_RB_NET_LASTLITE"); g_rgs_lastlite = e && atoi(e) != 0; }      /* (2026-10-25 evening) default OFF: the last re-run pass runs everything. With it on, that pass skipped the lighting and effect work, and real players saw both fighters flash green / purple for a moment after a rollback (the state was exact: the picture was not). Costs ~1-2 ms per rollback. =1: the old way */
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!g_rbg_timer) g_rbg_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
         if (!g_rbg_work) { g_rbg_work = calloc(RBG_NT, sizeof *g_rbg_work); g_rbg_gap = calloc(RBG_NT, sizeof *g_rbg_gap); g_rbg_wcyc = calloc(RBG_NT, sizeof *g_rbg_wcyc); g_rbg_wk = calloc(RBG_NT, 1); }
         LOG("r1: RB NET: match start, base state = frame %lld (fight frame %lld); pacing %s; re-run skip mask %d, lite mask %d%s\n", i, g_ff, g_rbg_pace ? "60 Hz" : "off", g_rgs_skip, g_rgs_lite, g_rgs_lastlite ? " (the last re-run pass too)" : "");
         {   /* start barrier: both games begin frame 1 together (the one that finished loading first waits here, at frame 0,
              * instead of stalling seconds at frame 8 with states it might have to roll back to: rnh2 / rnh3 hung after that) */
-            double tb = now_ms(), lastx = 0;
+            double tb = now_ms(), lastx = 0, lastlog = 0; long long old0 = rbn_oldmatch_dropped();
             while (!rbn_peer_started() && now_ms() - tb < 120000) {
                 if (now_ms() - lastx >= 50) { lastx = now_ms(); rbn_hello(); }
                 rbn_drain(i);
                 rbg_wait_until(now_ms() + 1.0);
+                if (now_ms() - lastlog >= 5000) {       /* (2026-10-26 19:18 freeze: 120 s here, nothing logged) */
+                    lastlog = now_ms(); char st[300]; rbn_status(st, sizeof st); long long old = rbn_oldmatch_dropped() - old0;
+                    LOG("r1: RB NET: start barrier: still waiting for the other game after %.0f s (%s; its messages dropped as another match's: %lld%s)\n", (now_ms() - tb) / 1000.0, st, old,
+                        old > 0 ? " <- the two games disagree on the match: a restart of one of them between matches?" : "");
+                }
             }
             rbn_hello(); rbn_choose_delay();
             if (i > rbn_delay()) LOG("r1: RB NET: WARNING: the base state is frame %lld, later than the input delay (%d): the other player's first pads may differ (desync risk)\n", i, rbn_delay());
@@ -186,6 +275,9 @@ static void rbg_step_body(Ctx *c) {
             double tw = now_ms(); while (rbn_confirmed() < 1 && now_ms() - tw < 5000) { rbn_drain(i); rbg_wait_until(now_ms() + 0.5); }
         }
         g_rbg_tick0 = now_ms(); g_rbg_next = 0; g_rbg_cyc_go = rgs_cyc_now();
+        if (g_rbg_vsdefer < 0) { const char *e = getenv("SSBU_RB_NET_VSDEFER"); g_rbg_vsdefer = !(e && e[0] == '0'); }
+        g_rbg_tid = GetCurrentThreadId();
+        display_set_rb_pending(g_rbg_vsdefer ? rbg_pending : NULL);      /* (net4) */
         return;
     }
     rbn_pass_hash(i);
@@ -204,8 +296,21 @@ static void rbg_step_body(Ctx *c) {
         else if (g_rbg_recap == 3) want = 0;                                  /* (3: the last one only; a later rollback may load the state this one loaded) */
         else if (r4) want = i == g_rbg_recap_first;
         else want = i == g_rbg_recap_first;
+        if (want && !rbg_capture_needed(i)) { want = 0; g_rbg_recap_unneeded++; }      /* (net4) frame i + 1's pad is here: state i is never loaded */
         if (want) { double tc = now_ms(); if (!rbg_capture(i, c)) g_rbg_capfail++; g_rbg_t_recap += now_ms() - tc; g_rbg_n_recap++; } else g_rbg_capskip++;
         g_rgs_next = i + 1;
+        /* (net4) the other player's pads that came while this rollback runs are taken now, so the frames still to be run again
+         * get them instead of the old guesses. Before, they were taken only after the last re-run pass: each one made a second
+         * and a third rollback at the same frame (testers 2026-10-25 at 293 ms: "rollback 1, 2, 3 at frame 38", wrong guesses
+         * at 36, 37, 38: 3 + 2 + 1 frames run again instead of 3). A wrong guess at a frame not run again yet is answered by
+         * this rollback itself (dropped); one at a frame already run again stays pending. The real frame is i + left - 1, the
+         * frame the clock and the time sync must see. SSBU_RB_NET_MIDDRAIN=0: the old way (test). */
+        {   static int mid = -1; if (mid < 0) { const char *e = getenv("SSBU_RB_NET_MIDDRAIN"); mid = !(e && e[0] == '0'); }
+            if (mid && g_rgs_left > 1 && !rbn_loop()) {
+                rbn_drain(i + g_rgs_left - 1);
+                int m = rbn_take_mismatch();
+                if (m > i) g_rbg_mid_dropped++; else if (m > 0) rbn_put_mismatch(m);
+            } }
         if (--g_rgs_left > 0) { g_rbg_t_pass0 = now_ms(); return; }
         g_ra_phase = 0; g_ra_after_quiet = 1; g_rgs_left = 0;
     } else if (g_rbg_noring) {                          /* (hs13) a real pass ended, no ring: nothing to capture, nothing ran on a guess */
@@ -227,7 +332,8 @@ static void rbg_step_body(Ctx *c) {
             if (rbg_rollback(c, i, m)) return;
             r1_ring_let_go();
             if (g_rbg_keep != 1 && !rbg_capture(i, c)) g_rbg_capfail++;
-        } else if (!rbg_capture(i, c)) g_rbg_capfail++;
+        } else if (rbg_capture_needed(i)) { if (!rbg_capture(i, c)) g_rbg_capfail++; }
+        else g_rbg_cap_unneeded++;
         if (g_rbg_test_f == -2) { const char *e = getenv("SSBU_RB_NET_TEST"); g_rbg_test_f = -1; if (e && *e) { long long tf = -1; int ms = 0, k = 0; sscanf(e, "%lld,%d,%d", &tf, &ms, &k); g_rbg_test_f = tf; g_rbg_test_ms = ms; g_rbg_test_k = k; } }
         if (g_rbg_test_f > 0 && i >= g_rbg_test_f && !g_rbg_noring) {    /* (the first real pass from that frame on without a rollback of its own) */
             g_rbg_test_f = -1;                        /* test: a long stall at this safe point, then a rollback (same pads: the timeline must not change) */
@@ -268,10 +374,11 @@ static void rbg_step_body(Ctx *c) {
         if (g_rgs_next - rbn_confirmed() <= (g_rbg_noring || g_rg_short ? 0 : rbn_ahead())) break;
         if (!g_rbg_noring && g_rg_short && g_rgs_next - rbn_confirmed() <= rbn_ahead() && !stalled) g_rbg_short_waits++;
         if (rbn_peer_gone()) { if (!g_rbg_gone++) LOG("r1: RB NET: no message from the other player for 5 s at frame %lld: going on alone (guesses)\n", i); break; }
+        if (stalled && now_ms() - ts > 20000) { if (!g_rbg_gone++) LOG("r1: RB NET: no usable pad from the other player for 20 s at frame %lld (its messages still arrive: another match's, or none with pads): going on alone (guesses)\n", i); break; }      /* (2026-10-26 19:18: 100 s at frame 7, frozen) */
         if (!stalled) { stalled = 1; ts = now_ms(); g_rbg_stalls++; r1_ring_let_go(); }
-        {   /* while waiting: our newest pads again every 50 ms (a lost datagram must not leave both games waiting), a line every 2 s */
-            static double last_tx, last_log; double now = now_ms();
-            if (now - last_tx >= 50) { last_tx = now; rbn_resend(); }
+        {   /* while waiting: bounded input retries (default 50 ms), even with both games stalled; a line every 2 s */
+            static double last_log; double now = now_ms();
+            rbn_resend(now);
             if (now - ts >= 2000 && now - last_log >= 2000) { last_log = now; char st[200]; rbn_status(st, sizeof st);
                 LOG("r1: RB NET: waiting for the other player at frame %lld for %.0f ms: %s\n", i, now - ts, st); }
         }
@@ -283,9 +390,33 @@ static void rbg_step_body(Ctx *c) {
     if (g_rbg_pace) {
         double period = 1000.0 / 60.0 + rbn_pace_extra(g_rgs_next), now = now_ms();
         if (g_rbg_next <= 0 || now - g_rbg_next > 3 * period) g_rbg_next = now;      /* (far behind: no catching up in a burst) */
-        rbg_wait_until(g_rbg_next);
+        /* (net4) the wait for the tick ALSO takes the other player's pads: a wrong guess found here is rolled back now, inside
+         * time the game spent waiting anyway, instead of at the next safe point, one pass later (a rollback one frame longer,
+         * and all of it late). After the re-run passes the flow comes back here (g_rbg_next not advanced yet) and waits for
+         * the same tick. SSBU_RB_NET_WAITRB=0: the old way (test). */
+        {   static int wrb = -1; if (wrb < 0) { const char *e = getenv("SSBU_RB_NET_WAITRB"); wrb = !(e && e[0] == '0'); }
+            if (wrb && !g_rbg_noring && !rbn_loop()) {
+                int tries = 0;
+                while (now_ms() < g_rbg_next) {
+                    rbn_drain(i);
+                    int m = rbn_take_mismatch();
+                    if (m > 0 && m <= i) {
+                        /* the other threads are running here (not held as at a safe point): the load needs them at their waits.
+                         * A short try (2 ms) to hold them; busy (a job in flight, the sound thread) -> the wrong guess stays
+                         * pending for the next safe point, as before (a load with a long hold or refused is worse than that) */
+                        double keep = g_rg_park_ms; g_rg_park_ms = 2.0; int held = r1_ring_hold(); g_rg_park_ms = keep;
+                        if (held) { g_rbg_wait_rb++; if (rbg_rollback(c, i, m)) return; r1_ring_let_go(); }
+                        else { rbn_put_mismatch(m); g_rbg_wait_busy++; if (++tries >= 2) { rbg_wait_until(g_rbg_next); break; } }
+                    }
+                    double left = g_rbg_next - now_ms();
+                    if (left > 0.6) rbg_wait_until(now_ms() + 0.5); else if (left > 0) rbg_wait_until(g_rbg_next);
+                }
+            } else rbg_wait_until(g_rbg_next);
+        }
         g_rbg_next += period;
     }
+    display_wait_refresh_deferred();                   /* (net4) the refresh wait a rollback was let through (display.c) */
+    rbn_before_frame(i);                               /* opt-in: use packets received during pacing in the next pass */
     double go = now_ms();
     if (g_rbg_last_go > 0 && g_rbg_ng < RBG_NT) g_rbg_gap[g_rbg_ng++] = (float)(go - g_rbg_last_go);
     g_rbg_last_go = go; g_rbg_tick0 = go; g_rbg_tick_k = 0; g_rbg_cyc_go = rgs_cyc_now();
@@ -330,6 +461,29 @@ static void rbg_step(Ctx *c) {
 }
 /* nnhid.c (through r1_pad / r1_pad_id): the pad of port id (0 / 1) in the pass now running */
 static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
+    if (g_rbg_menu && !g_rbg_in_match && (id == 0 || id == 1)) {      /* (net4) the result screen after a room match: see rbg_fight_off */
+        /* (net4, 2026-10-25 21:00, real players: the forwarded pads went on into the room's character select, where an A press on
+         * a port ADDS a local player: "Retard1 / Adnan2 / Retard2" panels) menu mode ends 1.5 s after BOTH players' OK (A) presses
+         * were seen (the result screens are through by then), or after 60 s, or when the other player is gone */
+        double tn = now_ms(); int both = g_rbg_menu_own_a > 0 && g_rbg_menu_other_a > 0;
+        if ((both && tn - (g_rbg_menu_own_a > g_rbg_menu_other_a ? g_rbg_menu_own_a : g_rbg_menu_other_a) > 1500) || tn - g_rbg_menu_t0 > 60000 || rbn_peer_gone()) {
+            long long tx, rx; rbn_menu_counts(&tx, &rx); g_rbg_menu = 0;
+            LOG("r1: RB NET: menu mode off (%s after %.1f s; pads sent %lld, received %lld): the ports are this PC's own again\n", rbn_peer_gone() ? "the other player is gone" : both ? "both OK presses seen" : "time is up", (tn - g_rbg_menu_t0) / 1000.0, tx, rx);
+            return;
+        }
+        int local = rbn_local_player();
+        if (id == 0) {                                  /* port 1's poll carries this PC's own devices: kept, and sent to the other game */
+            RbPad p; p.buttons = *b; p.lx = (int16_t)*lx; p.ly = (int16_t)*ly; p.rx = (int16_t)*rx; p.ry = (int16_t)*ry;
+            g_rbg_menu_own = p;
+            if (g_ra_phase != 2) { static double last; double t = now_ms(); if (t - last >= 8) { last = t; rbn_menu_send(&p); } }
+        }
+        RbPad src; int have = 1;
+        if (id == local) src = g_rbg_menu_own; else have = rbn_menu_pad(&src);
+        if (!have) memset(&src, 0, sizeof src);
+        if (src.buttons & 1) { if (id == local) g_rbg_menu_own_a = tn; else g_rbg_menu_other_a = tn; }      /* (BTN_A = bit 0, nnhid.c) */
+        *b = src.buttons; *lx = src.lx; *ly = src.ly; *rx = src.rx; *ry = src.ry;
+        return;
+    }
     if (g_rbg_in_match == 2 && (id == 0 || id == 1)) {  /* (hs12) a match that was not agreed: this PC's player 1 pauses, then holds L + R + A (the game's own way out of a match), again every 4 s */
         /* (debug_mode.c makes it Final Destination with one stock) player 1 walks off the left edge for 20 s, which ends the
          * match the game's own way (results, then the stage select and the character select: run hw2 showed that pause +
@@ -366,12 +520,22 @@ static void rbg_pad(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     RbPad p = rbn_pad(id, f);
     *b = p.buttons; *lx = p.lx; *ly = p.ly; *rx = p.rx; *ry = p.ry;
 }
-static void rbg_report(void);
+static void rbg_report(void); static void rbg_match_report(void);
+static void rbg_match_report_atexit(void) { if (g_rbg_in_match == 1) rbg_match_report(); }
 /* (hs12) r1_ring.c rgs_step, every safe point while no fight is on: the end of a match (once): its report, the ring
  * emptied, the session reset for the next match (whose first safe point makes the ring's base again: r1_ring_rebase) */
 static void rbg_fight_off(void) {
     if (!g_rbg_in_match) return;
-    if (g_rbg_in_match == 1) { rbg_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }
+    display_set_rb_pending(NULL); display_wait_refresh_deferred();      /* (net4) */
+    { void r1_mem_audit(const char *when); char w[64]; snprintf(w, sizeof w, "fight over, in_match %d", g_rbg_in_match); r1_mem_audit(w); }      /* (2026-10-26 review: +5 GB per room fight) */
+    if (g_rbg_in_match == 1) { void debug_lwr_mode_back(void); debug_lwr_mode_back(); rbg_report(); rbg_match_report(); r1_ring_let_go(); if (g_rg_ready) r1_ring_release(); g_rbg_rebase = 1; }      /* (net4) a room match: its melee mode back first */
+    if (g_rbg_prebased) { nvn_ww_hold(0); if (g_rbg_prebased == 2) r1_live_base_abort(); }
+    g_rbg_prebased = 0;                                 /* (net4) the next match's pre-base is its own */
+    if (g_rbg_in_match == 1 && rbn_room_rollback() && !rbn_loop()) {      /* (net4) a room match: the result screen's pads exchanged until the next fight (at most 3 min) */
+        static int want = -1; if (want < 0) { const char *e = getenv("SSBU_RB_NET_MENU_PADS"); want = !(e && e[0] == '0'); }
+        if (want) { g_rbg_menu = 1; g_rbg_menu_t0 = now_ms(); g_rbg_menu_own_a = g_rbg_menu_other_a = 0; memset(&g_rbg_menu_own, 0, sizeof g_rbg_menu_own);
+            LOG("r1: RB NET: menu mode: the result screen's pads are exchanged with the other game (its player's OK press reaches its port here)\n"); }
+    }      /* (net4) the match report only at the fight's end (rbg_report also runs at exit and mid-match) */
     else if (g_rbg_in_match == 3) LOG("r1: RB NET: the Local Wireless room fight is over\n");
     else LOG("r1: RB NET: the match that was not agreed is over after %.1f s (player 1 walked off)\n", (now_ms() - g_rbg_quit_t0) / 1000.0);
     if (g_rg_nomem == 1) g_rg_nomem = 0;                /* (hs13) nothing was kept: the next match tries the ring again */
@@ -381,11 +545,12 @@ static void rbg_fight_off(void) {
     g_rbg_in_match = 0; g_rbg_ff_first = -1;
     g_rbg_rb = 0; memset(g_rbg_k, 0, sizeof g_rbg_k); g_rbg_rerun = g_rbg_miss = g_rbg_stalls = g_rbg_capfail = g_rbg_capskip = g_rbg_lastlocal = g_rbg_real = g_rbg_gone = 0;
     g_rbg_stall_ms = g_rbg_load_ms = g_rbg_tick0 = g_rbg_next = g_rbg_last_go = 0;
-    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
+    g_rbg_last_k = 0; g_rbg_max_k = 0; g_rbg_short_waits = 0; g_rbg_mid_dropped = 0; g_rbg_cap_unneeded = 0; g_rbg_recap_unneeded = 0; g_rbg_wait_rb = 0; g_rbg_wait_busy = 0; g_rg_short = 0; g_rg_need = -1; g_rbg_nw = g_rbg_ng = g_rbg_tick_k = 0; g_rbg_rb_unheld = 0; g_rbg_recap_first = 0;
     g_rbg_t_pre = g_rbg_t_load = g_rbg_t_rerun = g_rbg_t_recap = g_rbg_t_pass0 = 0; g_rbg_n_rerun = g_rbg_n_recap = 0;
     g_rbg_wd_before = g_ra_wd_fired;
     g_rbg_pend = 0;
     rbn_match_reset();
+    { void os_fibers_flush(void); os_fibers_flush(); }      /* (2026-10-27) the host fibers the ring kept for a load: deleted now */
 }
 static int cmp_f(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 static void rbg_dist(const char *what, const float *v, int n, const unsigned char *kk, int want) {
@@ -395,6 +560,55 @@ static void rbg_dist(const char *what, const float *v, int n, const unsigned cha
         LOG("r1: RB NET TIMING %s: %d, mean %.2f median %.2f p90 %.2f p99 %.2f max %.2f ms; over 16.67 ms: %.0f (%.2f%%)\n", what, m, s / m, w[m / 2], w[m * 9 / 10], w[m * 99 / 100], w[m - 1], over, 100.0 * over / m); }
     free(w);
 }
+/* (net4, 2026-10-25) THE MATCH REPORT: one small file per online match, build\logs\matches\match_<date>.txt (the exe runs in
+ * build\work), with the numbers that say how the match went: the link (round trip, jitter, loss, direct or relayed), the
+ * delay, the rollbacks, the frame times, desyncs. A popup names it. Players paste that file instead of the whole log. */
+void rbn_match_numbers(double *rtt_mean_ms, double *rtt_best_ms, long long *desyncs, long long *repeats, long long *rx, long long *tx);
+void rbn_link(int *jitter_ms, int *loss_pct); int net_rb_path(void); const char *net_peer_name(void); void menu_popup(const char *title, const char *text);
+static void rbg_match_report(void) {
+    if (!g_rbg_real || rbn_loop() || g_rbg_mr_done) return;
+    g_rbg_mr_done = 1;
+    double rtt_mean, rtt_best; long long desyncs, repeats, rx, tx; int jitter, loss;
+    rbn_match_numbers(&rtt_mean, &rtt_best, &desyncs, &repeats, &rx, &tx); rbn_link(&jitter, &loss);
+    float *w = malloc((size_t)(g_rbg_ng ? g_rbg_ng : 1) * sizeof *w); double p99 = 0, p90 = 0, mean = 0, over = 0;
+    if (w && g_rbg_ng) { memcpy(w, g_rbg_gap, (size_t)g_rbg_ng * sizeof *w); qsort(w, (size_t)g_rbg_ng, sizeof *w, cmp_f); for (int i = 0; i < g_rbg_ng; i++) { mean += w[i]; over += w[i] > 20.0; } mean /= g_rbg_ng; p90 = w[g_rbg_ng * 9 / 10]; p99 = w[g_rbg_ng * 99 / 100]; }
+    free(w);
+    int path = net_rb_path();
+    char when[32]; time_t t = time(NULL); struct tm tmv; localtime_s(&tmv, &t); strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tmv);
+    char fname[64]; strftime(fname, sizeof fname, "match_%Y%m%d_%H%M%S.txt", &tmv);
+    CreateDirectoryA("../logs", NULL); CreateDirectoryA("../logs/matches", NULL);
+    char path_s[128]; snprintf(path_s, sizeof path_s, "../logs/matches/%s", fname);
+    FILE *f = fopen(path_s, "w");
+    const char *verdict = desyncs ? "DESYNC: the two games disagreed; both players need the same exe and mods" :
+                          path == 2 ? "relayed through the lobby server: a direct connection would cut the ping (Relay only? firewall?)" :
+                          loss >= 5 ? "packet loss: wired connection, no downloads or streams during the match" :
+                          jitter >= 15 ? "jittery link (Wi-Fi?): a wired connection would make it steadier" :
+                          p99 > 25 ? "mostly smooth; a few late frames (rollbacks or the PC)" : "smooth";
+    if (f) {
+        fprintf(f, "OpenSmash match report  %s  (player %d of 2, other player: %s)\n\n", when, rbn_local_player() + 1, net_peer_name());
+        fprintf(f, "Link      round trip %.0f ms (best %.0f), jitter %d ms, loss %d %%, %s\n", rtt_mean, rtt_best, jitter < 0 ? 0 : jitter, loss < 0 ? 0 : loss, path == 1 ? "DIRECT between the two PCs" : path == 2 ? "RELAYED through the lobby server" : "path unknown");
+        fprintf(f, "Delay     %d frames of input delay (%.0f ms)\n", rbn_delay(), rbn_delay() * 1000.0 / 60.0);
+        {   /* (owner 2026-10-26: "responsiveness and smoothness need separate scores") responsiveness = what netplay adds to the
+             * game's own input-to-screen time (the same offline and online): the delay frames, nothing else (a rollback re-runs
+             * the past, it does not delay the present). Smoothness = how often the picture jumps or stalls. */
+            int d = rbn_delay(); double rbpm = g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0;
+            const char *resp = d <= 1 ? "like offline" : d == 2 ? "very good (one frame more than offline)" : d == 3 ? "good (two frames more than offline)" : d <= 5 ? "noticeable" : "heavy";
+            const char *smooth = rbpm < 3 && over < 60 ? "smooth" : rbpm < 15 && over < 300 ? "mostly smooth (a jump now and then)" : "stuttery";
+            fprintf(f, "Responsiveness  +%.0f ms over offline from the %d delay frames: %s. A lower rollback_delay in graphics.ini trades this for more rollbacks.\n", d * 1000.0 / 60.0, d, resp);
+            if (g_rbg_noring) fprintf(f, "Smoothness      delay-based match, no rollback (%s): %.0f late frames: %s\n", rbg_delay_only() ? "rollback = delay in graphics.ini" : "ROLLBACK OFF: not enough memory", over, over < 60 ? "smooth" : over < 300 ? "mostly smooth" : "stuttery");
+            else fprintf(f, "Smoothness      %.1f rollbacks per minute, %.0f late frames: %s\n", rbpm, over, smooth);
+        }
+        fprintf(f, "Rollbacks %lld in %lld frames (%.1f per minute), longest %d frames; waits for the other player %lld (%.0f ms in all)\n", g_rbg_rb, g_rbg_real, g_rbg_real ? g_rbg_rb * 3600.0 / g_rbg_real : 0.0, (int)g_rbg_max_k, g_rbg_stalls, g_rbg_stall_ms);
+        fprintf(f, "Frames    mean %.2f ms, p90 %.2f, p99 %.2f (16.67 = perfect); frames later than 20 ms: %.0f of %d\n", mean, p90, p99, over, g_rbg_ng);
+        fprintf(f, "Packets   sent %lld, received %lld, repeats %lld; desyncs %lld\n", tx, rx, repeats, desyncs);
+        fprintf(f, "Verdict   %s\n", verdict);
+        fprintf(f, "\n(exe build: see the first lines of the game log; one file per match in this folder; paste it to report a match)\n");
+        fclose(f);
+        LOG("r1: RB NET: match report written: %s\n", path_s);
+        char text[300]; snprintf(text, sizeof text, "Saved to build\\logs\\matches\\%s\nPing %.0f ms, jitter %d, loss %d %%, %s; delay %d frames; %lld rollbacks; %s", fname, rtt_mean, jitter < 0 ? 0 : jitter, loss < 0 ? 0 : loss, path == 1 ? "direct" : path == 2 ? "RELAYED" : "?", rbn_delay(), g_rbg_rb, verdict);
+        menu_popup("Match report", text);
+    }
+}
 static void rbg_report(void) {
     if (g_rbg <= 0 || (!g_rg_ready && !g_rbg_noring) || !g_rbg_real) return;
     if (g_rbg_noring) LOG("r1: RB NET report: this match ran WITHOUT rollback (not enough memory for the ring: %s); matches without the ring so far %lld\n", g_rg_nomem == 2 ? "broken for the session" : "base not made", g_rbg_noring_matches);
@@ -402,6 +616,7 @@ static void rbg_report(void) {
         g_rbg_real, g_rbg_rb, g_rbg_rerun, g_rbg_k[1], g_rbg_k[2], g_rbg_k[3], g_rbg_k[4], g_rbg_k[5], g_rbg_k[6], g_rbg_k[7], g_rbg_k[RG_MAXSLOT + 1] + g_rbg_k[8], g_rbg_miss);
     LOG("r1: RB NET report: stalls for the other player %lld (%.1f ms in all; %lld of them because the ring was short of memory); captures failed %lld, re-run captures not needed %lld; load mean %.3f ms; peer silent %lld\n",
         g_rbg_stalls, g_rbg_stall_ms, g_rbg_short_waits, g_rbg_capfail, g_rbg_capskip, g_rbg_rb ? g_rbg_load_ms / g_rbg_rb : 0.0, g_rbg_gone);
+    LOG("r1: RB NET report: wrong guesses answered by the rollback already running (net4: pads taken between its re-run passes) %lld; real-frame captures left out (the next pad was already here) %lld, re-run captures left out so %lld; rollbacks started inside the wait for the tick %lld (left for the safe point, threads busy: %lld); refresh waits put off for a pending rollback %lld\n", g_rbg_mid_dropped, g_rbg_cap_unneeded, g_rbg_recap_unneeded, g_rbg_wait_rb, g_rbg_wait_busy, display_vsync_deferred_count());
     LOG("r1: RB NET report: ring memory (hs14, fix %s): captures given up %lld, old states freed early %lld, captures skipped to keep the oldest needed state %lld\n",
         g_rg_poolfix ? "on" : "OFF", g_rg_short_n, g_rg_freed_slots, g_rg_skip_full);
     LOG("r1: RB NET report: task-worker watchdog releases %lld (since the process start), rollbacks with the workers not held %lld (watchdog paused at H2: %s)\n", g_ra_wd_fired, g_rbg_rb_unheld, g_rbg_wdfix ? "yes" : "NO");

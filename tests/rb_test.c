@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "rb.h"
 
 static int fails;
@@ -65,6 +66,44 @@ static void wire_tests(void) {
     RbPad p = {5, 1600, -1600, 1601, -1601};
     p = rb_pad_rest(p);
     CHECK(p.lx == 0 && p.ly == 0 && p.rx == 1601 && p.ry == -1601, "stick clamp");
+    memset(&m, 0, sizeof m); m.type = RB_MSG_PADS; m.player = 1;
+    n = rb_msg_build(buf, sizeof buf, &m);
+    CHECK(rb_msg_parse(buf, n, &r), "empty startup hello is valid");
+    m.newest = INT_MAX;
+    n = rb_msg_build(buf, sizeof buf, &m);
+    CHECK(rb_msg_parse(buf, n, &r), "empty pads at INT_MAX do not overflow the frame-range check");
+    m.newest = 1; m.count = 2;
+    n = rb_msg_build(buf, sizeof buf, &m);
+    CHECK(!rb_msg_parse(buf, n, &r), "pad range must not reach frame zero");
+}
+
+static void receive_window_tests(void) {
+    RbPad p = {0}, got;
+    int predicted;
+    rb_input_reset(2, 0, 2);
+    for (int f = 1; f <= 300; f++) { p.buttons = (uint64_t)f; rb_input_remote_put(1, f, p); }
+    p.buttons = 306; rb_input_remote_put(1, 306, p);
+    p.buttons = 50; rb_input_remote_put(1, 50, p);  /* delayed duplicate shares 306's ring slot */
+    got = rb_input_get(1, 306, &predicted);
+    CHECK(!predicted && got.buttons == 306, "stale duplicate must not overwrite unconfirmed frame 306");
+    for (int f = 301; f <= 305; f++) { p.buttons = (uint64_t)f; rb_input_remote_put(1, f, p); }
+    CHECK(rb_input_remote_latest(1) == 306, "old duplicate must not create a false hole in the receive history");
+
+    rb_input_reset(2, 0, 2);
+    for (int f = 1; f <= 20; f++) { p.buttons = (uint64_t)f; rb_input_remote_put(1, f, p); }
+    p.buttons = 22; rb_input_remote_put(1, 22, p);
+    p.buttons = 278; rb_input_remote_put(1, 278, p); /* beyond the receive window, same slot as 22 */
+    p.buttons = 21; rb_input_remote_put(1, 21, p);
+    got = rb_input_get(1, 22, &predicted);
+    CHECK(!predicted && got.buttons == 22, "out-of-window future packet must not overwrite a pending frame");
+    CHECK(rb_input_remote_latest(1) == 22, "future packet must not block consecutive acknowledgement");
+    rb_input_remote_put(1, INT_MAX, p);
+    CHECK(rb_input_remote_latest(1) == 22, "extreme future frame is ignored without arithmetic overflow");
+
+    rb_input_reset(2, 0, 2);
+    for (int f = RB_RING; f >= 1; f--) { p.buttons = (uint64_t)f; rb_input_remote_put(1, f, p); }
+    CHECK(rb_input_remote_latest(1) == RB_RING, "an entire valid receive window can arrive in reverse order");
+    for (int f = RB_RING; f >= 1; f--) { got = rb_input_get(1, f, &predicted); CHECK(!predicted && got.buttons == (uint64_t)f, "valid frame %d retained", f); }
 }
 
 static void ts_tests(void) {
@@ -98,6 +137,7 @@ static void sim_from(Side *s, int from, int to) {  /* recompute frames from..to 
 
 int main(void) {
     wire_tests();
+    receive_window_tests();
     ts_tests();
     /* a single process can hold one rb_input instance: run side 0 against a scripted remote that delivers player 1's
      * true pads late and lossy (with redundancy), then check the state equals the perfect-input state. */

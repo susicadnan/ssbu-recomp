@@ -50,7 +50,7 @@ int rb_msg_parse(const uint8_t *b, size_t len, RbMsg *m) {
         if (m->player >= RB_MAX_PLAYERS || m->count > RB_MAX_PADS_PER_MSG || len != RB_PADS_HEAD + (size_t)m->count * RB_PAD_WIRE) return 0;
         m->newest = (int32_t)get32(b + 4); m->ack = (int32_t)get32(b + 8); m->check_frame = (int32_t)get32(b + 12);
         m->check = get32(b + 16);
-        if (m->newest < 0 || m->newest - m->count + 1 < 1) return 0;   /* frames count from 1 */
+        if (m->newest < 0 || m->count > m->newest) return 0;   /* frames count from 1; count 0 also accepts newest 0 (hello) */
         for (int i = 0; i < m->count; i++) {
             const uint8_t *q = b + RB_PADS_HEAD + i * RB_PAD_WIRE;
             m->pads[i].buttons = get64(q);

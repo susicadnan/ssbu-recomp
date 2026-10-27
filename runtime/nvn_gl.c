@@ -722,13 +722,18 @@ static uint64_t *ww_slot(uint64_t page, int insert) {
         }
     }
 }
+/* (net4) rb_rollback.c: while the rollback's pre-base holds the write watch for itself (between its base before the fight and
+ * the refresh at the ready-go, which resets the watch) the texture questions get "not watched" (everything counts as
+ * written); when the hold ends everything counts as written once more (the pages the refresh reset are not missed). */
+static int g_ww_hold;
+void nvn_ww_hold(int on) { if (!on && g_ww_hold && g_ww_tab) { g_ww_floor = ++g_ww_stamp; } g_ww_hold = on; }
 /* Newest write stamp of the pages of [p, p+n), or 0 when the memory is not write-watched. Never returns less than 1 otherwise. */
 static uint64_t ww_newest(const uint8_t *p, size_t n) {
     static void *pages[16384];
     ULONG_PTR count = 16384;
     DWORD gran = 0;
     if (g_ww_off < 0) { g_ww_off = getenv("SSBU_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
-    if (g_ww_off || !n || GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
+    if (g_ww_off || g_ww_hold || !n || GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
     uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12, newest = g_ww_floor ? g_ww_floor : 1;
     if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; newest = g_ww_floor; }      /* forget: everything counts as written once */
     if (count) {

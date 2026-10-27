@@ -294,6 +294,19 @@ static int oe_observe_foreground(void) {
     return 1;
 }
 static void oe_track_focus(void);
+/* (net4, 2026-10-25) a PC window behind another one is not a console under the HOME menu. The game, told "not in focus",
+ * stops: at its second frame when the window did not get the foreground at the start (started from Play SSBU.bat's
+ * console, or a second copy of the game started next to it: 5 to 50 s of black screen until the window is clicked, for
+ * ever in the two-game tests), and in a match the moment the player clicks Discord: the other player's game then waits,
+ * rolls back for seconds or loses the room. Now a window that is visible but not in front counts as in focus; a minimised
+ * one too while online play is on (an online match never stops; offline, minimising still pauses the game as before).
+ * SSBU_FOCUS_PC=0: the console's rule (the old way). */
+int net_online(void);
+static int oe_keep_running(int minimised) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SSBU_FOCUS_PC"); on = !(e && e[0] == '0'); }
+    return on && (!minimised || net_online() > 0);
+}
 static DWORD WINAPI oe_watch(LPVOID unused) {
     const char *test = getenv("SSBU_FREEZE_TEST");
     double t_start = 0, t_len = 0;
@@ -329,6 +342,7 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
         int ours = oe_observe_foreground();
         if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); continue; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
+        if (oe_keep_running(minimised)) ours = 1;           /* (net4) */
         int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
@@ -370,6 +384,7 @@ static void oe_track_focus(void) {
      * The handling mode is what [sdk 0x32c3d0, table 0xa7ff70] sends for the oe mode: 0 = (notify 0, suspend 1), 1 = (notify 1,
      * suspend 0) NoSuspend, 2 = (notify 1, suspend 1), 3 = (notify 0, suspend 1) + SetOutOfFocusSuspendingEnabled(1) AlwaysSuspend. */
     int minimised = g_oe_window && IsIconic(g_oe_window);
+    if (oe_keep_running(minimised)) ours = 1;               /* (net4) */
     int state = ours ? 1                                                    /* InFocus */
               : g_oe_focus_mode == 3 ? 1                                    /* AlwaysSuspend: the application never learns it */
               : !minimised ? 2                                              /* obscured: NotInFocus in the other three modes */

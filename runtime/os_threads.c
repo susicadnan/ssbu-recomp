@@ -210,9 +210,10 @@ static __declspec(thread) void *t_thread_fiber;       /* host fiber of the threa
  * and the empty asm keeps the compiler from treating them as pure, so every use reads the running thread's own copy. */
 static __attribute__((noinline)) uint64_t fiber_cur(void) { __asm__ volatile("" ::: "memory"); return t_fiber; }
 static __attribute__((noinline)) void fiber_set_cur(uint64_t f) { __asm__ volatile("" ::: "memory"); t_fiber = f; }
+static void fteb_add(void); static void fteb_gone(void);      /* the fibers section below */
 static __attribute__((noinline)) void *thread_fiber(void) {
     __asm__ volatile("" ::: "memory");
-    if (!t_thread_fiber) t_thread_fiber = ConvertThreadToFiber(NULL);
+    if (!t_thread_fiber) { t_thread_fiber = ConvertThreadToFiber(NULL); fteb_add(); }
     return t_thread_fiber;
 }
 static uint8_t g_main_thread[0x400];
@@ -297,6 +298,7 @@ static DWORD WINAPI thread_main(LPVOID arg) {
     trace_printf("--- thread %llx started (entry %llx, name %s)\n", (unsigned long long)o->key, (unsigned long long)o->fn,
                  o->name ? (const char *)(uintptr_t)o->name : "?");
     call_guest(c, o->fn);
+    fteb_gone();
     pkey_run_destructors(c);                          /* pthread keys a plugin's Rust std made on this game thread */
     tls_run_destructors(c);
     trace_printf("--- thread %llx finished\n", (unsigned long long)o->key);
@@ -357,6 +359,13 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
         g_fib_cgen = gen;
     }
     for (int i = 0; i < g_fib_cn; i++) { Obj *o = g_fib_c[i]; if (o->fiber) cb(o->key, o->fctx, o->stack, o->stack_size, o->fiber); }
+}
+/* (p56 timing) a hint, read WITHOUT the hold: do the job fibers look quiet? Only the cached list is read, and only when it is
+ * current (no fiber made or gone since); a fiber's import field is read racily. 1 = quiet or unknown: go and hold. */
+int os_r1_fibers_quiet_hint(int (*busy)(uint64_t key, Ctx *c)) {
+    if (g_fib_cgen != g_fib_gen) return 2;                /* 2 = unknown (the cached list is stale) */
+    for (int i = 0; i < g_fib_cn; i++) { Obj *o = g_fib_c[i]; if (o->fiber && busy(o->key, o->fctx)) return 0; }
+    return 1;
 }
 void os_thread_report(FILE *out) {
     if (!g_oslog_n) return;
@@ -672,6 +681,66 @@ static void mw_waitany(Ctx *c) { Obj *m = obj(A0); uint64_t r; while (!(r = mw_p
 static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 
 /* ---------------------------------------------------------------- fibers */
+/* (2026-10-27, the ~5 GB per Local Wireless room fight: 4 -> 70 GB private in one evening, working set flat, the friends'
+ * games crashed at a fight's end once the commit ran out) With R1 on (every online session: rollback and run-ahead) a
+ * finalized fiber's host fiber was never deleted (g_r1_keep_fibers), and fib_init then made a new one over it. Each is
+ * 1 MB of committed stack (256 MB reserved) that is hardly touched, and the fighters' scripts make and finalize fibers all
+ * through a fight: ~0.45 MB per fight frame. Now a host fiber that its guest fiber no longer holds is RETIRED: deleted at
+ * once when no saved state can be loaded (r1 says so through g_r1_fibers_pinned), else kept until none can (a rollback
+ * match: at its end, os_fibers_flush). A load that puts a retired host fiber back into its guest fiber takes it off the
+ * list. A host fiber that a thread is running now (its TEB says so) is never deleted. */
+typedef struct { void *fiber; Ctx *fctx; } Retired;
+static Retired *g_ret; static int g_ret_n, g_ret_cap; static SRWLOCK g_ret_lock = SRWLOCK_INIT;
+static volatile LONG64 g_fib_made, g_fib_deleted;
+int (*g_r1_fibers_pinned)(void);                      /* r1_state.c: 1 while a saved state that holds host fibers may still be loaded */
+#ifdef _WIN32
+static uint8_t *volatile g_fteb[1024]; static volatile LONG g_nfteb;      /* TEBs of the threads that run fibers (NT_TIB +0x20: the fiber now) */
+static __declspec(thread) LONG t_fteb = -1;
+static void fteb_add(void) { LONG i = InterlockedIncrement(&g_nfteb) - 1; if (i < 1024) { g_fteb[i] = (uint8_t *)NtCurrentTeb(); t_fteb = i; } }
+static void fteb_gone(void) { if (t_fteb >= 0) { g_fteb[t_fteb] = NULL; t_fteb = -1; } }   /* the thread ends: its TEB goes */
+static int fiber_running(void *f) {
+    LONG n = g_nfteb < 1024 ? g_nfteb : 1024;
+    if (g_nfteb > 1024) return 1;                     /* threads not listed: nothing is deleted (kept until the end) */
+    for (LONG i = 0; i < n; i++) { uint8_t *t = g_fteb[i]; if (t && *(void *volatile *)(t + 0x20) == f) return 1; }
+    return 0;
+}
+#else
+static void fteb_add(void) {}
+static void fteb_gone(void) {}
+static int fiber_running(void *f) { (void)f; return 0; }
+#endif
+void os_fibers_flush(void) {                          /* every retired host fiber that no saved state can need and no thread runs: deleted */
+    if (g_r1_fibers_pinned && g_r1_fibers_pinned()) return;
+    AcquireSRWLockExclusive(&g_ret_lock);
+    int k = 0;
+    for (int i = 0; i < g_ret_n; i++) {
+        if (fiber_running(g_ret[i].fiber)) { g_ret[k++] = g_ret[i]; continue; }
+        DeleteFiber(g_ret[i].fiber);
+        if (g_ret[i].fctx) _aligned_free(g_ret[i].fctx);
+        g_fib_deleted++;
+    }
+    g_ret_n = k;
+    ReleaseSRWLockExclusive(&g_ret_lock);
+}
+static void fib_retire(void *fiber, Ctx *fctx) {
+    if (!fiber) return;
+    AcquireSRWLockExclusive(&g_ret_lock);
+    int dup = 0; for (int i = 0; i < g_ret_n; i++) if (g_ret[i].fiber == fiber) dup = 1;
+    if (!dup) {
+        if (g_ret_n == g_ret_cap) { int nc = g_ret_cap ? g_ret_cap * 2 : 256; Retired *nr = realloc(g_ret, (size_t)nc * sizeof *nr); if (nr) { g_ret = nr; g_ret_cap = nc; } }
+        if (g_ret_n < g_ret_cap) { g_ret[g_ret_n].fiber = fiber; g_ret[g_ret_n].fctx = fctx; g_ret_n++; }
+    }
+    ReleaseSRWLockExclusive(&g_ret_lock);
+    os_fibers_flush();
+}
+static void fib_unretire(void *fiber) {               /* (a load) the host fiber is a guest fiber's again */
+    if (!fiber) return;
+    AcquireSRWLockExclusive(&g_ret_lock);
+    for (int i = 0; i < g_ret_n; i++) if (g_ret[i].fiber == fiber) { g_ret[i] = g_ret[--g_ret_n]; break; }
+    ReleaseSRWLockExclusive(&g_ret_lock);
+}
+static void *fib_make(Obj *o);
+void os_fibers_stats(long long *made, long long *deleted, int *waiting) { *made = g_fib_made; *deleted = g_fib_deleted; *waiting = g_ret_n; }      /* r1_state.c: the memory audit */
 void (*g_r1_fiber_born)(void *fiber);                 /* r1_state.c (R3 hs13): a new host fiber's stack is left out of the guest windows' state */
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
@@ -693,7 +762,9 @@ static void CALLBACK fiber_main(void *arg) {
 static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
     Obj *o = obj(A0);
     o->fn = A1; o->arg = A2; o->stack = A3; o->stack_size = A4;
-    o->fiber = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o);
+    if (o->fiber) fib_retire(o->fiber, o->fctx);      /* initialised again without a finalize: the old host fiber is nobody's */
+    o->fctx = NULL;
+    o->fiber = fib_make(o);
     InterlockedIncrement(&g_fib_gen);
     if (g_r1_fiber_born) g_r1_fiber_born(o->fiber);
     if (g_r1_keep_fibers) { o->fctx = NULL; o->fls = NULL; o->fls_fiber = NULL; o->run_tid = 0; }      /* (R2) a new host fiber: no context, no block yet */
@@ -727,18 +798,28 @@ long long g_r1_fls_stale;                              /* (R2) notes of a block 
 void *os_r1_fiber_fls(uint64_t key) { Obj *o = obj_peek(key); if (!o) return NULL; if (o->fls && o->fls_fiber != o->fiber) { g_r1_fls_stale++; return NULL; } return o->fls; }
 void os_r1_fiber_put_fls(uint64_t key, void *fiber, void *fls) { Obj *o = obj_peek(key); if (o) { o->fls = fls; o->fls_fiber = fls ? fiber : NULL; } }      /* (R2) ring load: the note goes back with the host fiber */
 void os_r1_fiber_get(uint64_t key, uint64_t v[6]) { Obj *o = obj_peek(key); if (!o) return; v[0] = (uint64_t)(uintptr_t)o->fiber; v[1] = (uint64_t)(uintptr_t)o->fctx; v[2] = o->fn; v[3] = o->arg; v[4] = o->stack; v[5] = o->stack_size; }
-void os_r1_fiber_put(uint64_t key, const uint64_t v[6]) { Obj *o = obj_peek(key); if (!o) return; o->fiber = (void *)(uintptr_t)v[0]; o->fctx = (Ctx *)(uintptr_t)v[1]; o->fn = v[2]; o->arg = v[3]; o->stack = v[4]; o->stack_size = v[5]; InterlockedIncrement(&g_fib_gen); }
+void os_r1_fiber_put(uint64_t key, const uint64_t v[6]) { Obj *o = obj_peek(key); if (!o) return;
+    if (o->fiber != (void *)(uintptr_t)v[0]) { fib_retire(o->fiber, o->fctx); fib_unretire((void *)(uintptr_t)v[0]); }      /* the one it had now is nobody's; the saved one is its again */
+    o->fiber = (void *)(uintptr_t)v[0]; o->fctx = (Ctx *)(uintptr_t)v[1]; o->fn = v[2]; o->arg = v[3]; o->stack = v[4]; o->stack_size = v[5]; InterlockedIncrement(&g_fib_gen); }
 /* R1 restore: give a guest fiber back the host fiber it had at the save (kept alive by g_r1_keep_fibers), or a fresh one */
 void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh) {
     Obj *o = obj_peek(key); if (!o) return;
-    if (fresh) { o->fiber = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o); o->fctx = NULL; if (g_r1_fiber_born) g_r1_fiber_born(o->fiber); }
-    else { o->fiber = fiber; o->fctx = fctx; }
+    if (fiber != o->fiber || fresh) fib_retire(o->fiber, o->fctx);
+    if (fresh) { o->fiber = fib_make(o); o->fctx = NULL; if (g_r1_fiber_born) g_r1_fiber_born(o->fiber); }
+    else { fib_unretire(fiber); o->fiber = fiber; o->fctx = fctx; }
     InterlockedIncrement(&g_fib_gen);
 }
 static void fib_current(Ctx *c) { RET(fiber_cur()); }
 int g_r1_keep_fibers;                                  /* R1 (r1_state.c, SSBU_R1 only): a finalized fiber's host fiber is kept, so a
                                                         * restore that brings the guest fiber back finds it (resumed, it starts over) */
-static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber && !g_r1_keep_fibers) { DeleteFiber(o->fiber); o->fiber = NULL; InterlockedIncrement(&g_fib_gen); } }
+static void fib_finalize(Ctx *c) {                    /* the host fiber is retired: deleted now, or when no saved state can need it (see Retired) */
+    Obj *o = obj(A0);
+    if (!o->fiber) return;
+    void *f = o->fiber; Ctx *fc = o->fctx;
+    o->fiber = NULL; o->fctx = NULL; InterlockedIncrement(&g_fib_gen);
+    fib_retire(f, fc);
+}
+static void *fib_make(Obj *o) { void *f = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o); if (f) InterlockedIncrement64(&g_fib_made); return f; }
 
 /* ---------------------------------------------------------------- reader/writer locks (nn::os::ReaderWriterLockType)
  * The plugins (smashline, stage_alts) only acquire / release / finalize: their locks are statically initialised (all zero
@@ -886,6 +967,7 @@ static DWORD WINAPI pthread_main(LPVOID arg) {
     c->x[0] = o->arg;
     trace_printf("--- pthread %llx started (entry %llx)\n", (unsigned long long)o->key, (unsigned long long)o->fn);
     call_guest(c, o->fn);
+    fteb_gone();
     uint64_t ret = c->x[0];
     pkey_run_destructors(c);
     tls_run_destructors(c);

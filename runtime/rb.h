@@ -19,24 +19,26 @@ typedef struct { uint64_t buttons; int16_t lx, ly, rx, ry; } RbPad;      /* as n
 /* ---------------------------------------------------------------- input queues (rb_input.c) */
 void rb_input_reset(int nplayers, int local, int delay);   /* frames are counted from 1 */
 int rb_input_delay(void);
+void rb_input_set_delay(int delay);            /* (2026-10-27) during a delay-based match (rb_net.c) */
 RbPad rb_pad_rest(RbPad p);                        /* the stick clamp both sides apply before a pad is stored or sent */
 int rb_pad_equal(const RbPad *a, const RbPad *b);
 /* the local player's pad read at `frame`: kept for frame + delay; returns the pad that applies at `frame` (empty in the first frames) */
 RbPad rb_input_local(int frame, RbPad now);
 int rb_input_local_latest(void);                   /* newest frame with a local pad (frame + delay of the last call) */
 int rb_input_local_get(int frame, RbPad *out);     /* 1 when that frame's local pad is known (to send it again) */
-/* a pad of player `p` for `frame` from the network; a frame already known is ignored (redundant copies) */
+/* a pad of player `p` for `frame` from the network; known frames and frames beyond the next RB_RING slots are ignored */
 void rb_input_remote_put(int p, int frame, RbPad pad);
 int rb_input_remote_latest(int p);                 /* newest consecutive frame received from player p (0 = none) */
 /* the pad player p uses at `frame`: the real one, or the last real one repeated (*predicted = 1, recorded for the check) */
 RbPad rb_input_get(int p, int frame, int *predicted);
 /* the earliest frame whose prediction was wrong since the last call, or 0; the caller rolls back to it */
 int rb_input_take_mismatch(void);
+int rb_input_peek_mismatch(void);                  /* the same, left pending */
 /* the newest frame every player's real pad is known for (the "finalized" frame: no rollback can reach before it) */
 int rb_input_finalized(void);
 
 /* ---------------------------------------------------------------- wire format (rb_wire.c), little-endian */
-enum { RB_MSG_PADS = 1, RB_MSG_ACK = 2, RB_MSG_PING = 3, RB_MSG_PONG = 4 };
+enum { RB_MSG_PADS = 1, RB_MSG_ACK = 2, RB_MSG_PING = 3, RB_MSG_PONG = 4, RB_MSG_MENU = 5 };      /* MENU (net4): the other player's pad on the result screen after a room match (rb_net.c rbn_menu_send) */
 #define RB_PAD_WIRE 16
 #define RB_PADS_HEAD 20
 #define RB_MAX_PADS_PER_MSG 64

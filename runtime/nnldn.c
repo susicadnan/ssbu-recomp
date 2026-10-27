@@ -80,7 +80,7 @@ enum { DR_NONE, DR_USER, DR_SYSTEM, DR_DESTROYED_BY_USER, DR_DESTROYED_BY_SYSTEM
 #define NI_ADV 0x26c
 #define NODE(i) (NI_NODES + 0x40 * (i))
 #define SEEN_MAX 24
-#define SILENT_MS 6000
+#define SILENT_MS 15000         /* (resp1, 2026-10-26: was 6000) a player silent this long leaves the room; mobile internet (T-Mobile home) can go quiet for some seconds and come back. The lobby server waits longer (CLIENT_TIMEOUT 20 s) */
 
 typedef struct { uint8_t info[NI_SIZE]; uint32_t from; uint64_t at; } Seen;
 static struct {
@@ -101,6 +101,13 @@ static uint32_t u32at(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static void mac_of(uint8_t *mac, uint32_t ip) { mac[0] = 0x02; mac[1] = 0x53; mac[2] = (uint8_t)(ip >> 24); mac[3] = (uint8_t)(ip >> 16); mac[4] = (uint8_t)(ip >> 8); mac[5] = (uint8_t)ip; }
 static void signal_game(void) { if (L.event) os_signal_event(L.event); }
+static volatile LONG64 vs_in, vs_out;
+/* (resp1, 2026-10-26: a friend's game joined rooms, traffic flowed both ways, and 20 s later the GAME left: "ldn: state 5
+ * -> 4", nothing else) game datagrams that found no socket (port, address or connected peer not matching) or a full queue,
+ * and the last one of each, so the line at the game's own Disconnect says what it did not get */
+static volatile LONG64 vs_nosock, vs_full, vs_held_n, vs_replayed_n;      /* (held / replayed: see hold()) */
+static uint32_t vs_nosock_src, vs_full_src; static uint16_t vs_nosock_port, vs_nosock_sport, vs_full_port;
+static uint64_t vs_joined_at; static LONG64 vs_in_at_join, vs_out_at_join, vs_nosock_at_join, vs_full_at_join;
 static void set_state(int s) {            /* (lock held) */
     if (L.state != s && LOGL(1)) printf("[online] ldn: state %d -> %d\n", L.state, s);
     L.state = s;
@@ -457,7 +464,7 @@ static void join(Ctx *c, const uint8_t *session, uint64_t user, uint16_t version
         while (!L.answer && (now = ms_now()) < until) SleepConditionVariableSRW(&L.cv, &L.lock, (DWORD)(until - now), 0);
     }
     int ok = L.answer == 1;
-    if (ok) { L.host_heard = ms_now(); L.reason = DR_NONE; set_state(LS_STA_CONNECTED); }
+    if (ok) { L.host_heard = ms_now(); L.reason = DR_NONE; set_state(LS_STA_CONNECTED); vs_joined_at = L.host_heard; vs_in_at_join = vs_in; vs_out_at_join = vs_out; vs_nosock_at_join = vs_nosock; vs_full_at_join = vs_full; }
     if (LOGL(1)) printf("[online] ldn: joining %.32s's room: %s\n", (const char *)L.net + NODE(0) + 0xc, ok ? "joined" : L.answer ? "refused" : "no answer");
     L.answer = 0;
     L.join_host = 0;
@@ -473,6 +480,12 @@ static void ldn_Disconnect(Ctx *c) {
     AcquireSRWLockExclusive(&L.lock);
     if (L.state == LS_STA_CONNECTED) {
         ldn_msg(u32at(L.net + NODE(0)), M_LEAVE, L.net + NI_SESSION, 16);
+        if (LOGL(1)) {                    /* (resp1) the game itself leaves the room: what it got while it was in it */
+            char a[16], b[16]; ip_str(vs_nosock_src, a); ip_str(vs_full_src, b);
+            printf("[online] ldn: the game leaves the room after %.1f s: game datagrams in %lld, out %lld; with no socket %lld (last from %s:%u to port %u), queue full %lld (last from %s to port %u); host last heard %.1f s ago; held for a socket not open yet %lld, given to it later %lld\n",
+                   (double)(ms_now() - vs_joined_at) / 1000.0, (long long)(vs_in - vs_in_at_join), (long long)(vs_out - vs_out_at_join), (long long)(vs_nosock - vs_nosock_at_join), a, vs_nosock_sport, vs_nosock_port,
+                   (long long)(vs_full - vs_full_at_join), b, vs_full_port, (double)(ms_now() - L.host_heard) / 1000.0, (long long)vs_held_n, (long long)vs_replayed_n);
+        }
         L.reason = DR_USER;
         set_state(LS_STA);
     }
@@ -572,7 +585,40 @@ static void ldn_SetWirelessControllerRestriction(Ctx *c) { RET(0); }
 enum { E_BADF = 9, E_AGAIN = 11, E_INVAL = 22, E_MFILE = 24, E_DESTADDRREQ = 89, E_MSGSIZE = 90, E_NOPROTOOPT = 92,
        E_PROTONOSUPPORT = 93, E_OPNOTSUPP = 95, E_AFNOSUPPORT = 97, E_ADDRINUSE = 98, E_ADDRNOTAVAIL = 99,
        E_NETUNREACH = 101, E_NOTCONN = 107, E_CONNREFUSED = 111 };
-typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; uint8_t data[]; } Dgram;
+typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; double at; uint8_t data[]; } Dgram;
+/* (2026-10-27) where the game's own netcode waits: per player of the room, the gaps between its game datagrams (a gap of
+ * 50 ms and more in a fight = a late or lost datagram the game waited for), and how long datagrams sat queued before the
+ * game read them (long = this PC's game was busy). A line a minute while datagrams flow. */
+static SRWLOCK vs_lock;                    /* (defined below) */
+static double qpc_ms(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+static double vs_block_ms; static long long vs_block_n, vs_block_to;      /* (under vs_lock) */
+typedef struct { uint32_t ip; double last; long long n, g50, g100, g250; double gmax; volatile double wmax; } GapStat;      /* wmax: since nnldn_frame_take */
+static GapStat vs_gap[8]; static double vs_gap_since; static long long vs_age_n, vs_age_h[4]; static double vs_age_max;      /* (age: under vs_lock) */
+static void gap_note(uint32_t src, double t) {          /* (receive thread only) */
+    int k = -1;
+    for (int i = 0; i < 8; i++) if (vs_gap[i].ip == src) { k = i; break; }
+    if (k < 0) for (int i = 0; i < 8; i++) if (!vs_gap[i].ip) { k = i; vs_gap[i].ip = src; vs_gap[i].last = 0; break; }
+    if (k < 0) return;
+    GapStat *g = &vs_gap[k];
+    if (g->last > 0) { double d = t - g->last; if (d > g->wmax) g->wmax = d; if (d < 2000) { if (d >= 50) g->g50++; if (d >= 100) g->g100++; if (d >= 250) g->g250++; if (d > g->gmax) g->gmax = d; } }
+    g->last = t; g->n++;
+    if (!vs_gap_since) vs_gap_since = t;
+    if (t - vs_gap_since >= 60000) {
+        char line[900]; int o = snprintf(line, sizeof line, "[online] ldn: game datagrams, last %.0f s:", (t - vs_gap_since) / 1000.0);
+        for (int i = 0; i < 8; i++) if (vs_gap[i].ip && vs_gap[i].n) { char a[16]; ip_str(vs_gap[i].ip, a);
+            o += snprintf(line + o, sizeof line - (size_t)o, " from %s %lld, gaps >=50 ms %lld, >=100 %lld, >=250 %lld, longest %.0f ms;", a, vs_gap[i].n, vs_gap[i].g50, vs_gap[i].g100, vs_gap[i].g250, vs_gap[i].gmax);
+            if (o >= (int)sizeof line) break; }
+        AcquireSRWLockExclusive(&vs_lock);
+        long long an = vs_age_n, h0 = vs_age_h[0], h1 = vs_age_h[1], h2 = vs_age_h[2], h3 = vs_age_h[3]; double amax = vs_age_max;
+        double bms = vs_block_ms; long long bn = vs_block_n, bto = vs_block_to;
+        vs_age_n = 0; memset(vs_age_h, 0, sizeof vs_age_h); vs_age_max = 0; vs_block_ms = 0; vs_block_n = vs_block_to = 0;
+        ReleaseSRWLockExclusive(&vs_lock);
+        if (o < (int)sizeof line) snprintf(line + o, sizeof line - (size_t)o, " read by the game %lld: within 1 ms %lld, 1-8 ms %lld, 8-17 ms %lld, later %lld (longest %.0f ms); the game's threads blocked in poll / recv %lld times, %.0f ms in all, %lld timeouts", an, h0, h1, h2, h3, amax, bn, bms, bto);
+        if (LOGL(1)) printf("%s\n", line);
+        for (int i = 0; i < 8; i++) { uint32_t ip = vs_gap[i].ip; double last = vs_gap[i].last; memset(&vs_gap[i], 0, sizeof vs_gap[i]); if (t - last < 5000) { vs_gap[i].ip = ip; vs_gap[i].last = last; } }
+        vs_gap_since = t;
+    }
+}
 typedef struct {
     int open, type, flags, nonblock, reuse, shut_rd, shut_wr;
     uint32_t ip, peer_ip, rcvtimeo, rcvbuf, sndbuf;
@@ -585,7 +631,6 @@ static VSock vs[VS_MAX];
 static SRWLOCK vs_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE vs_cv = CONDITION_VARIABLE_INIT;
 static uint16_t vs_next_port = 49152;
-static volatile LONG64 vs_in, vs_out;
 
 static VSock *vsock(int fd) { return fd >= 0 && fd < VS_MAX && vs[fd].open ? &vs[fd] : NULL; }
 static int *errno_ptr(Ctx *c) {
@@ -638,8 +683,60 @@ static void drop_queue(VSock *s) {
     s->count = s->bytes = 0;
 }
 
+/* (net4) a game datagram from a node of the room counts as a sign of life, like its KEEP / ADVERTISE: those always go
+ * through the lobby (port 65511), so a slow or lossy relay plus a stall of a few seconds on one PC ended a room whose
+ * match was still exchanging data (testers 2026-10-25: "ldn: state 5 -> 4" mid-fight, then error 2618-0006). Never
+ * blocks the receive thread: when the lock is busy this datagram is simply not counted. */
+static void heard_from(uint32_t src) {
+    if (!TryAcquireSRWLockExclusive(&L.lock)) return;
+    uint64_t t = ms_now();
+    if (L.state == LS_STA_CONNECTED && src == u32at(L.net + NODE(0))) L.host_heard = t;
+    else if (L.state == LS_AP_CREATED) { int i = node_index(src); if (i > 0) L.heard[i] = t; }
+    ReleaseSRWLockExclusive(&L.lock);
+}
+/* (2026-10-27) a game datagram of another player for a port with no socket yet is HELD up to HOLD_MS and given to the
+ * socket bound to that port meanwhile. Joining a room, the host's first datagrams can arrive before the joiner's game has
+ * opened its socket (a LAN is ~1 ms, the internet 30-150 ms with bursts on mobile links): dropped, the joiner then waits for
+ * something that never comes again and leaves the room after 5-20 s (Retard's joins, 2026-10-25/26). SSBU_LDN_HOLD=0: off. */
+#define HOLD_MS 3000
+#define HOLD_N 64
+typedef struct { uint64_t at; uint32_t src, dst, len; uint16_t sport, dport; uint8_t *data; } Held;
+static Held vs_held[HOLD_N]; static int vs_nheld; static SRWLOCK vs_hold_lock = SRWLOCK_INIT;
+static int hold_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_LDN_HOLD"); on = !(e && e[0] == '0'); } return on; }
+static void hold(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
+    uint64_t t = ms_now();
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy) return;
+    memcpy(copy, data, len);
+    AcquireSRWLockExclusive(&vs_hold_lock);
+    int k = 0;
+    for (int i = 0; i < vs_nheld; i++) { if (t - vs_held[i].at < HOLD_MS) vs_held[k++] = vs_held[i]; else free(vs_held[i].data); }
+    vs_nheld = k;
+    if (vs_nheld == HOLD_N) { free(vs_held[0].data); memmove(vs_held, vs_held + 1, sizeof vs_held[0] * (HOLD_N - 1)); vs_nheld--; }
+    Held *h = &vs_held[vs_nheld++];
+    h->at = t; h->src = src; h->dst = dst; h->len = len; h->sport = sport; h->dport = dport; h->data = copy;
+    ReleaseSRWLockExclusive(&vs_hold_lock);
+    InterlockedIncrement64(&vs_held_n);
+}
+void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len);
+static void replay(uint16_t port) {                     /* a socket has this port now: the datagrams held for it, in order */
+    if (!port || !vs_nheld) return;
+    Held got[HOLD_N]; int n = 0, k = 0; uint64_t t = ms_now();
+    AcquireSRWLockExclusive(&vs_hold_lock);
+    for (int i = 0; i < vs_nheld; i++) {
+        if (vs_held[i].dport == port && t - vs_held[i].at < HOLD_MS) got[n++] = vs_held[i];
+        else if (t - vs_held[i].at < HOLD_MS) vs_held[k++] = vs_held[i];
+        else free(vs_held[i].data);
+    }
+    vs_nheld = k;
+    ReleaseSRWLockExclusive(&vs_hold_lock);
+    for (int i = 0; i < n; i++) { nnldn_deliver(got[i].src, got[i].sport, got[i].dst, got[i].dport, got[i].data, got[i].len); free(got[i].data); }
+    if (n) { InterlockedAdd64(&vs_replayed_n, n); if (LOGL(1)) printf("[online] ldn: %d datagram(s) held for port %u given to its new socket\n", n, port); }
+}
 void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
     if (dport == VNET_LDN_PORT) { if (sport == VNET_LDN_PORT) ldn_receive(src, data, len); return; }
+    double now = qpc_ms();
+    if (src != LOOPBACK && src != net_my_ip()) { heard_from(src); gap_note(src, now); }
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST, got = 0;
     AcquireSRWLockExclusive(&vs_lock);
     for (int i = 0; i < VS_MAX; i++) {
@@ -647,10 +744,10 @@ void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, c
         if (!s->open || s->type != 2 || s->port != dport || s->shut_rd) continue;
         if (!bcast && s->ip && s->ip != dst && s->ip != LOOPBACK) continue;
         if (s->peer_port && (s->peer_ip != src || s->peer_port != sport)) continue;
-        if (s->count >= 1024 || s->bytes + len > (1u << 20)) continue;          /* full: dropped, as a LAN would */
+        if (s->count >= 1024 || s->bytes + len > (1u << 20)) { InterlockedIncrement64(&vs_full); vs_full_src = src; vs_full_port = dport; continue; }      /* full: dropped, as a LAN would */
         Dgram *d = malloc(sizeof *d + len);
         if (!d) continue;
-        d->next = NULL; d->src = src; d->sport = sport; d->len = len;
+        d->next = NULL; d->src = src; d->sport = sport; d->len = len; d->at = now;
         memcpy(d->data, data, len);
         if (s->tail) s->tail->next = d; else s->head = d;
         s->tail = d;
@@ -661,6 +758,8 @@ void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, c
     }
     ReleaseSRWLockExclusive(&vs_lock);
     if (got) { InterlockedIncrement64(&vs_in); WakeAllConditionVariable(&vs_cv); }
+    else if (src != LOOPBACK && src != net_my_ip()) { InterlockedIncrement64(&vs_nosock); vs_nosock_src = src; vs_nosock_port = dport; vs_nosock_sport = sport;
+                                                      if (!bcast && hold_on()) hold(src, sport, dst, dport, data, len); }
     if (LOGL(3)) { char a[16], b[16]; ip_str(src, a); ip_str(dst, b); printf("[online] in %u bytes %s:%u -> %s:%u%s\n", len, a, sport, b, dport, got ? "" : " (no socket)"); }
 }
 
@@ -695,6 +794,7 @@ static void so_bind(Ctx *c) {
     if (!err && !port && !(port = free_port(s))) err = E_ADDRINUSE;
     if (!err) { s->ip = ip; s->port = port; }
     ReleaseSRWLockExclusive(&vs_lock);
+    if (!err) replay(port);
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] bind(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
     if (err) fail(c, err); else RET(0);
 }
@@ -705,8 +805,10 @@ static void so_connect(Ctx *c) {
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
     err = !s ? E_BADF : !read_sa(c->x[1], (uint32_t)c->x[2], &ip, &port) ? E_INVAL : s->type == 1 ? E_CONNREFUSED : 0;
-    if (!err) { if (!s->port) s->port = free_port(s); s->peer_ip = ip; s->peer_port = port; }
+    uint16_t newport = 0;
+    if (!err) { if (!s->port) newport = s->port = free_port(s); s->peer_ip = ip; s->peer_port = port; }
     ReleaseSRWLockExclusive(&vs_lock);
+    if (newport) replay(newport);
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] connect(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
     if (err) fail(c, err); else RET(0);
 }
@@ -724,9 +826,11 @@ static void do_send(Ctx *c, int fd, uint64_t buf, uint64_t len, uint64_t addr, u
     else if (s->peer_port) { dst = s->peer_ip; dport = s->peer_port; }
     else err = E_DESTADDRREQ;
     if (!err && len > 65507) err = E_MSGSIZE;
+    int fresh_port = !err && !s->port;
     if (!err && !s->port && !(s->port = free_port(s))) err = E_ADDRINUSE;
     if (!err) sport = s->port;
     ReleaseSRWLockExclusive(&vs_lock);
+    if (!err && fresh_port) replay(sport);
     uint32_t me = net_my_ip();
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST;
     if (!err && !bcast && dst != LOOPBACK && dst != me && ((dst & VNET_MASK) != VNET_SUBNET || !me)) err = E_NETUNREACH;
@@ -743,10 +847,33 @@ static void do_send(Ctx *c, int fd, uint64_t buf, uint64_t len, uint64_t addr, u
 static void so_send(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], 0, 0); }
 static void so_sendto(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], c->x[4], (uint32_t)c->x[5]); }
 
+/* (2026-10-27) the deadlines of poll / recv timeouts in QPC milliseconds: they were GetTickCount64 (15.6 ms steps), so a
+ * poll of 1 ms with nothing to read slept until the tick count moved: up to ~16 ms. The game's network thread then answered
+ * the other players up to a frame late. Also the time the game spent blocked in them (vs_block_*), for the minute line. */
+static uint64_t vs_now(void) { return (uint64_t)qpc_ms(); }
+static volatile double vs_fw_block;      /* blocked ms since nnldn_frame_take */
+/* (2026-10-27) display.c, at a slow fight frame in a room: how long the game's threads were blocked in poll / recv since the
+ * last call, and the player whose datagrams had the longest gap meanwhile (counting the gap still open now). Diagnostic,
+ * no lock (the receive thread writes the gaps) */
+double nnldn_frame_take(uint32_t *late_ip, double *late_gap) {
+    double b = vs_fw_block, now = qpc_ms(), best = 0; uint32_t ip = 0;
+    vs_fw_block = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!vs_gap[i].ip) continue;
+        double g = vs_gap[i].wmax, open = vs_gap[i].last > 0 ? now - vs_gap[i].last : 0;
+        if (open > g && open < 2000) g = open;
+        vs_gap[i].wmax = 0;
+        if (g > best) { best = g; ip = vs_gap[i].ip; }
+    }
+    *late_ip = ip; *late_gap = best;
+    return b;
+}
 static int wait_vs(uint64_t deadline) {   /* (vs_lock held) 0 once the deadline has passed */
     DWORD ms = INFINITE;
-    if (deadline != ~0ull) { uint64_t now = ms_now(); if (now >= deadline) return 0; ms = (DWORD)(deadline - now); }
+    if (deadline != ~0ull) { uint64_t now = vs_now(); if (now >= deadline) { vs_block_to++; return 0; } ms = (DWORD)(deadline - now); }
+    double t0 = qpc_ms();
     SleepConditionVariableSRW(&vs_cv, &vs_lock, ms, 0);
+    { double w = qpc_ms() - t0; vs_block_ms += w; vs_fw_block += w; } vs_block_n++;
     return 1;
 }
 static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint64_t addr, uint64_t alenp) {
@@ -754,7 +881,7 @@ static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint6
     if (!buf) { fail(c, E_INVAL); return; }
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    uint64_t deadline = s && s->rcvtimeo ? ms_now() + s->rcvtimeo : ~0ull;
+    uint64_t deadline = s && s->rcvtimeo ? vs_now() + s->rcvtimeo : ~0ull;
     int err = 0;
     for (;;) {
         s = vsock(fd);
@@ -769,6 +896,10 @@ static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint6
     uint32_t n = d->len < len ? d->len : (uint32_t)len, ip = d->src;
     uint16_t port = d->sport;
     memcpy(PTR(buf), d->data, n);
+    if (!(flags & 2) && d->src != LOOPBACK) {
+        double age = qpc_ms() - d->at;
+        vs_age_n++; vs_age_h[age < 1 ? 0 : age < 8 ? 1 : age < 17 ? 2 : 3]++; if (age > vs_age_max) vs_age_max = age;
+    }
     if (!(flags & 2)) {
         s->head = d->next;
         if (!s->head) s->tail = NULL;
@@ -787,7 +918,7 @@ static void so_poll(Ctx *c) {             /* (pollfd {int fd; short events, reve
     uint64_t fds = c->x[0], nfds = c->x[1];
     int timeout = (int)c->x[2];
     if (!fds && nfds) { fail(c, E_INVAL); return; }
-    uint64_t deadline = timeout < 0 ? ~0ull : ms_now() + (uint64_t)timeout;
+    uint64_t deadline = timeout < 0 ? ~0ull : vs_now() + (uint64_t)timeout;
     uint32_t ready;
     AcquireSRWLockExclusive(&vs_lock);
     for (;;) {

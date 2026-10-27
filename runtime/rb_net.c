@@ -15,6 +15,8 @@
  *   SSBU_RB_NET_LOG=<file> one line per finalized frame: "f <frame> h <checksum>" (compare two games' files)
  *   SSBU_RB_NET_AHEAD=<n>  most frames this game runs ahead of the newest remote pad (default 7 = the ring depth)
  *   SSBU_RB_NET_FIND=0     (R3 net3) no opponent search through the lobby (lobby / LAN mode without a room: the old way)
+ *   SSBU_RB_NET_PREDRAIN=0 apply inputs received during pacing before the next simulation pass: default ON (=0 off)
+ *   SSBU_RB_NET_RESEND_MS=<8..50> experimental: retry interval while stalled, milliseconds (default 50)
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <stdio.h>
@@ -39,6 +41,8 @@ int net_mode(void);
 int net_online(void);
 
 static int g_on = -1, g_loop, g_loop_lat = 4, g_local, g_delay_cfg = -1, g_ahead = 7, g_started, g_peer_started;
+static int g_predrain;
+static int g_resend_ms = 50;
 static unsigned g_bot_seed; static int g_bot;
 static FILE *g_hlog;
 static volatile LONG64 g_cur;                          /* the frame this game is on (read by the receive thread for PONGs) */
@@ -48,13 +52,37 @@ static uint64_t now_us(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); if 
 int rbn_on(void) {
     if (g_on >= 0) return g_on;
     const char *e = getenv("SSBU_RB_NET");
+    /* (net4) no variable (the game started without Play SSBU.bat's scripts/run.py, or an older run.py): rollback over the
+     * online connection when online play is on and graphics.ini does not say "rollback = off" (on by default: a room
+     * whose other player has it off is played with the game's own netcode, as before) */
+    if (!e && net_online() > 0) {
+        int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
+        int set = net_ini_value("rollback", v, sizeof v);
+        if (!set || !(!v[0] || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"))) {
+            _putenv("SSBU_RB_NET=net"); e = getenv("SSBU_RB_NET");      /* (every other reader of the variable sees it too: rbn_handshake_wanted, the menu) */
+            int delay = !set || !_stricmp(v, "delay") || !_stricmp(v, "auto");      /* (2026-10-27 01:40, the owner: "are we doing delay based networking now?" yes: the default; rollback = on gives the snapshot ring) */
+            if (delay && !getenv("SSBU_RB_NET_DELAYONLY")) _putenv("SSBU_RB_NET_DELAYONLY=1");      /* (2026-10-26, the owner: "without it feels smoother") rollback = delay: the same connection and input delay, no snapshot ring: a wrong guess is never needed (every frame waits for the other player's pad), no rollback hitches, far less memory */
+            printf("[rbnet] online input sync from graphics.ini (%s)\n", delay ? set ? "rollback = delay: delay-based, no snapshot ring" : "no rollback key: delay-based by default (rollback = on for the snapshot ring)" : "rollback = on: the snapshot ring");
+        }
+    }
     g_on = e && e[0] && e[0] != '0';
     if (!g_on) return 0;
+    { const char *v = getenv("SSBU_RB_NET_PREDRAIN"); g_predrain = !(v && v[0] == '0'); }      /* (net4: on by default after two in-game pair tests, identical; =0 off) */
+    { const char *v = getenv("SSBU_RB_NET_RESEND_MS"); char *end; long ms = v ? strtol(v, &end, 10) : 0;
+      g_resend_ms = v && end != v && !*end && ms >= 8 && ms <= 50 ? (int)ms : 50; }
     if (!_strnicmp(e, "loop", 4)) { g_loop = 1; if (e[4] == ',') g_loop_lat = atoi(e + 5); }
     g_local = 0;
     if (!g_loop && net_online() && net_mode() == 3) g_local = 1;      /* NET_MODE_JOIN */
     if ((e = getenv("SSBU_RB_NET_PLAYER"))) g_local = atoi(e) ? 1 : 0;
     if ((e = getenv("SSBU_RB_NET_DELAY"))) g_delay_cfg = atoi(e);
+    else if (net_online() > 0) {                        /* (net4) graphics.ini rollback_delay = <frames> | auto (default) */
+        int net_ini_value(const char *key, char *out, size_t n); char v[16] = "";
+        if (net_ini_value("rollback_delay", v, sizeof v) && v[0] >= '0' && v[0] <= '9') { g_delay_cfg = atoi(v); if (g_delay_cfg > 12) g_delay_cfg = 12; }
+        /* (net4, the green / purple recolor seen by real players) graphics.ini rollback_lite = <mask> (default 127: camera, UI,
+         * lighting, render layers, recorder, dynamic resolution and effect ticks skipped in the re-run passes but the last;
+         * 0 = nothing skipped, for the test whether the recolor comes from a skipped tick) */
+        if (!getenv("SSBU_RB_SIM_LITE") && net_ini_value("rollback_lite", v, sizeof v) && v[0] >= '0' && v[0] <= '9') { char w[40]; snprintf(w, sizeof w, "SSBU_RB_SIM_LITE=%d", atoi(v)); _putenv(w); printf("[rbnet] re-run lite mask %d from graphics.ini\n", atoi(v)); }
+    }
     if ((e = getenv("SSBU_RB_NET_BOT")) && *e) { g_bot = 1; g_bot_seed = (unsigned)strtoul(e, NULL, 0); }
     if ((e = getenv("SSBU_RB_NET_AHEAD")) && atoi(e) > 0) g_ahead = atoi(e);
     if ((e = getenv("SSBU_RB_NET_LOG")) && *e) g_hlog = fopen(e, "w");
@@ -133,10 +161,11 @@ static uint64_t g_hs_seed; static uint32_t g_match_id;  /* the agreed match: its
 static volatile LONG g_hs_cancelled;                    /* this match: 1 = no agreement: played locally and left at once; 2 = (pub2) set up
                                                            * inside a Local Wireless room: the game's own netcode plays it, no rollback, nothing changed */
 static int g_match_n;                                   /* (hs12) online matches of this session so far (1 = the first; rbn_start) */
+int rbn_handshake_wanted(void);
 /* (hs12) the tag byte at the end of every PADS message: the agreed match id and the match number of the session. Run tw7:
  * the other game's last pads of match 1 arrived after this game's match-1 reset and were taken at the start of match 2
  * (their acknowledgement 1081 made each game send no pads any more: both waited for ever at frame 7). */
-static uint8_t pads_tag(void) { return (uint8_t)(g_match_id ^ ((uint32_t)g_match_n * 0x3bu)); }
+static uint8_t pads_tag(void) { return rbn_handshake_wanted() && g_match_id ? (uint8_t)g_match_id : (uint8_t)(g_match_id ^ ((uint32_t)g_match_n * 0x3bu)); }      /* (2026-10-26 19:18 freeze) the session's match counter is NOT part of it with a handshake: the counters differ when one game was restarted between matches, and every message was dropped on both sides (both games waited at frame 0 for ever) */
 static long long g_hs_tx, g_hs_rx;
 #define RBH_BLK 0xa48                                   /* match block + 0 .. + 0x580 + 2 * 0x260 + 8 */
 static uint8_t g_hs_mine_blk[RBH_BLK], g_hs_peer_blk[RBH_BLK]; static int g_hs_mine_ok, g_hs_peer_got, g_hs_blk_done; static uint8_t g_hs_peer_have[RBH_BLK / 768 + 1];
@@ -150,6 +179,17 @@ static uint32_t exe_stamp(void) {
     DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
     return n && n < MAX_PATH && !stat(p, &st) ? (uint32_t)st.st_mtime : 0;
 #endif
+}
+/* the other game's exe stamp differs from ours: the log line, and (net4) once per stamp on screen: the two players run
+ * different builds of the game's program, which can desync a rollback match (testers 2026-10-25: one player updated) */
+static void stamp_note(uint32_t theirs) {
+    static uint32_t said;
+    if (theirs == exe_stamp()) return;
+    printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), theirs);
+    if (said == theirs) return;
+    said = theirs;
+    void menu_popup(const char *title, const char *text);
+    menu_popup("Online: different game versions", "The other player runs another build of ssbu_native.exe than you.\nRollback matches can go out of sync: both should use the same exe (build\\work\\ssbu_native.exe).");
 }
 int rbn_handshake_wanted(void) {
     static int w = -1;
@@ -415,7 +455,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
         if (phase == 0) { /* searching: nothing to send yet */ }
         else if (g_local == 0) {                             /* host: proposal = our choice + the joiner's */
             if (!g_hs_have_prop && g_hs_have_peer && lwr) {      /* (R3 lwr) the room's match: both games built it from the room; only the seed is new */
-                if (g_hs_peer.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_peer.exe_stamp);
+                stamp_note(g_hs_peer.exe_stamp);
                 if (g_hs_peer.m.chara[0] != mine->chara[0] || g_hs_peer.m.rule_kind != mine->rule_kind || g_hs_peer.m.stock != mine->stock) {
                     snprintf(g_hs_why, sizeof g_hs_why, "the room's match differs on the two games (player 1 %016llx here, %016llx there; rule kind %d / %d, stocks %d / %d)", (unsigned long long)mine->chara[0], (unsigned long long)g_hs_peer.m.chara[0], mine->rule_kind, g_hs_peer.m.rule_kind, mine->stock, g_hs_peer.m.stock);
                     g_hs_refused = 1; hs_refuse(g_hs_peer.nonce, g_hs_why);
@@ -425,7 +465,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
                 }
             }
             if (!g_hs_have_prop && g_hs_have_peer && !lwr) {
-                if (g_hs_peer.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_peer.exe_stamp);
+                stamp_note(g_hs_peer.exe_stamp);
                 RbhMatch m = *mine;
                 m.chara[1] = g_hs_peer.m.chara[0]; m.colour[1] = g_hs_peer.m.colour[0];
                 m.has_layout[1] = g_hs_peer.m.has_layout[0]; memcpy(m.layout[1], g_hs_peer.m.layout[0], sizeof m.layout[1]);
@@ -438,7 +478,7 @@ int rbn_handshake(const RbhMatch *mine, RbhMatch *out) {
             else if (g_hs_have_prop && now - last_tx >= 100) { last_tx = now; hs_send(&g_hs_prop, sizeof g_hs_prop); }
         } else {                                        /* joiner: our choice until the proposal comes */
             if (g_hs_have_prop) {
-                if (g_hs_prop.exe_stamp != exe_stamp()) printf("[rbnet] handshake: NOTE the other game's exe was linked at another time (stamp %08x here, %08x there): a different build may desync\n", exe_stamp(), g_hs_prop.exe_stamp);
+                stamp_note(g_hs_prop.exe_stamp);
                 *out = g_hs_prop.m; ok = 1;
             } else if (now - last_tx >= 100 && net_rb_ready()) { last_tx = now; RbhMsg c; hs_head(&c, RBH_CHOICE); c.m = *mine; hs_send(&c, sizeof c); }
         }
@@ -528,6 +568,7 @@ static void hs_block_compare(void) {                    /* main thread (rbn_drai
 static struct { uint64_t at_us; long long at_frame; int n; uint8_t b[RQ_MAX]; } *g_rq;
 static volatile LONG g_rq_head, g_rq_tail; static SRWLOCK g_rq_lock = SRWLOCK_INIT;
 static volatile LONG64 g_rx_pkts, g_rx_bad, g_rx_drop, g_tx_pkts, g_tx_fail, g_rx_last_ms, g_rx_oldmatch;
+long long rbn_oldmatch_dropped(void) { return (long long)g_rx_oldmatch; }
 static volatile LONG g_rtt_us = -1, g_rtt_min_us = -1;
 static long long g_rtt_n; static double g_rtt_sum;      /* (under g_rq_lock) */
 #define TSQ 64
@@ -541,17 +582,88 @@ static int32_t g_tsq[TSQ]; static int g_tsq_n;          /* clock-offset samples 
 static int g_lockstep, g_my_lockd, g_peerdelay = -1;
 static volatile LONG g_peer_mode = -1;                 /* the other game's mode byte of this match (-1 = none seen yet) */
 static uint8_t my_mode(void) { return (uint8_t)((g_lockstep ? 0x80 : 0) | (g_my_lockd & 0x7f)); }
+/* (net4, 2026-10-25) every PADS message is sent a second time SSBU_RB_NET_REPEAT_MS later (default 8, half a frame; 0 = off)
+ * unless a newer one went out meanwhile: one lost datagram then delays the other player's input by 8 ms instead of a whole
+ * frame (the next frame's message repeats the pads, but a frame later), which at the auto delay is the difference between
+ * no rollback and one. About 100 bytes more per frame. The repeat goes from its own thread (a high-resolution timer). */
+static SRWLOCK g_rep_lock = SRWLOCK_INIT; static uint8_t g_rep_buf[RB_PADS_HEAD + RB_MAX_PADS_PER_MSG * RB_PAD_WIRE + 2]; static int g_rep_n; static LONG64 g_rep_seq, g_rep_sent;
+static HANDLE g_rep_ev; static int g_rep_ms = -1;
+static DWORD WINAPI repeat_thread(void *u) {
+    (void)u;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+    for (;;) {
+        WaitForSingleObject(g_rep_ev, INFINITE);
+        LONG64 seq = g_rep_seq;
+        if (tm) { LARGE_INTEGER d; d.QuadPart = -(LONGLONG)g_rep_ms * 10000; SetWaitableTimer(tm, &d, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, 100); } else Sleep((DWORD)g_rep_ms);
+        uint8_t b[sizeof g_rep_buf]; int n = 0;
+        AcquireSRWLockShared(&g_rep_lock);
+        if (g_rep_seq == seq && g_rep_n > 0) { n = g_rep_n; memcpy(b, g_rep_buf, (size_t)n); }
+        ReleaseSRWLockShared(&g_rep_lock);
+        if (n && g_started && net_rb_send(b, n)) InterlockedIncrement64(&g_rep_sent);
+    }
+    return 0;
+}
 static void send_msg(const RbMsg *m) {
     uint8_t b[RB_PADS_HEAD + RB_MAX_PADS_PER_MSG * RB_PAD_WIRE + 2];
     size_t n = rb_msg_build(b, sizeof b - 2, m);
     if (!n || g_loop) return;
     if (m->type == RB_MSG_PADS) { b[n++] = pads_tag(); b[n++] = my_mode(); }      /* (hs12) the match these pads belong to: pads of another match are dropped; (hs14) this game's mode byte */
     if (net_rb_send(b, (int)n)) InterlockedIncrement64(&g_tx_pkts); else InterlockedIncrement64(&g_tx_fail);
+    if (m->type == RB_MSG_PADS && m->count > 0) {
+        if (g_rep_ms < 0) { const char *e = getenv("SSBU_RB_NET_REPEAT_MS"); g_rep_ms = e ? atoi(e) : 8; if (g_rep_ms > 0) { g_rep_ev = CreateEventA(NULL, FALSE, FALSE, NULL); HANDLE th = CreateThread(NULL, 0, repeat_thread, NULL, 0, NULL); if (th) { SetThreadPriority(th, THREAD_PRIORITY_HIGHEST); CloseHandle(th); } else g_rep_ms = 0; } }
+        if (g_rep_ms > 0) {
+            AcquireSRWLockExclusive(&g_rep_lock);
+            memcpy(g_rep_buf, b, n); g_rep_n = (int)n; g_rep_seq++;
+            ReleaseSRWLockExclusive(&g_rep_lock);
+            SetEvent(g_rep_ev);
+        }
+    }
+}
+/* (net4) the link as seen from here, for the F2 overlay: jitter = the spread of the last 5 s of round trips (p90 - best, ms),
+ * loss = pings of the last 5 s without an answer (per cent). The pings go every 100 ms from the start. */
+#define LQ_N 64
+static long g_lq_rtt[LQ_N]; static int g_lq_i, g_lq_n; static volatile LONG g_lq_ping_sent, g_lq_pong_got; static uint64_t g_lq_win_t0; static LONG g_lq_sent_prev, g_lq_got_prev;
+static volatile LONG g_lq_loss_pct;
+static int cmp_long(const void *a, const void *b) { long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
+void rbn_link(int *jitter_ms, int *loss_pct) {
+    long v[LQ_N]; int n;
+    AcquireSRWLockExclusive(&g_rq_lock); n = g_lq_n; memcpy(v, g_lq_rtt, sizeof(long) * (size_t)n); ReleaseSRWLockExclusive(&g_rq_lock);
+    if (n < 5) { *jitter_ms = -1; *loss_pct = -1; return; }
+    qsort(v, (size_t)n, sizeof v[0], cmp_long);
+    *jitter_ms = (int)((v[n * 9 / 10] - v[0]) / 1000);
+    *loss_pct = g_lq_loss_pct;
 }
 /* net_relay.c's receive thread: one rollback message from the other player */
+/* (net4, 2026-10-25, real players: after a room match played with rollback both result screens waited for the other player's
+ * OK: on each PC the other player is a local human on controller 2 for the match, and nobody presses its OK) the pads of the
+ * result screen: each game sends its own player's pad (17 bytes: type, buttons, four sticks) at every poll, and gives the
+ * last received one to the other player's port (rb_rollback.c rbg_pad, menu mode). No frame numbers: the screens are not
+ * in lockstep; a pad older than a second counts as none. */
+static RbPad g_menu_pad; static volatile LONG64 g_menu_rx_ms; static volatile LONG64 g_menu_tx, g_menu_rx;
+void rbn_menu_send(const RbPad *p) {
+    uint8_t b[17]; b[0] = RB_MSG_MENU; memcpy(b + 1, &p->buttons, 8);
+    const int16_t st[4] = {p->lx, p->ly, p->rx, p->ry};
+    for (int i = 0; i < 4; i++) { b[9 + 2 * i] = (uint8_t)st[i]; b[10 + 2 * i] = (uint8_t)((uint16_t)st[i] >> 8); }
+    if (net_rb_send(b, 17)) InterlockedIncrement64(&g_menu_tx);
+}
+int rbn_menu_pad(RbPad *out) {                          /* 1 = a pad of the last second */
+    LONG64 at = g_menu_rx_ms; if (!at || GetTickCount64() - (ULONGLONG)at > 1000) return 0;
+    AcquireSRWLockExclusive(&g_rq_lock); *out = g_menu_pad; ReleaseSRWLockExclusive(&g_rq_lock); return 1;
+}
+void rbn_menu_counts(long long *tx, long long *rx) { *tx = g_menu_tx; *rx = g_menu_rx; }
 void rbn_rx(const uint8_t *p, int n) {
     if (rbn_on() > 0 && n > 0 && hs_rx(p, n)) return;  /* the match handshake */
     if (rbn_on() <= 0 || n <= 0 || n > RQ_MAX) { InterlockedIncrement64(&g_rx_bad); return; }
+    if (p[0] == RB_MSG_MENU) {                          /* (net4) the other player's pad on the result screen: the latest kept, nothing queued */
+        if (n != 17) { InterlockedIncrement64(&g_rx_bad); return; }
+        RbPad q; memcpy(&q.buttons, p + 1, 8);
+        int16_t st[4]; for (int i = 0; i < 4; i++) st[i] = (int16_t)((uint16_t)p[9 + 2 * i] | ((uint16_t)p[10 + 2 * i] << 8));
+        q.lx = st[0]; q.ly = st[1]; q.rx = st[2]; q.ry = st[3];
+        AcquireSRWLockExclusive(&g_rq_lock); g_menu_pad = q; ReleaseSRWLockExclusive(&g_rq_lock);
+        InterlockedExchange64(&g_menu_rx_ms, (LONG64)GetTickCount64()); InterlockedIncrement64(&g_menu_rx);
+        InterlockedExchange64(&g_rx_last_ms, (LONG64)GetTickCount64());
+        return;
+    }
     if (p[0] == RB_MSG_PADS && n >= RB_PADS_HEAD + 2 && (n - RB_PADS_HEAD) % RB_PAD_WIRE == 2) {     /* (hs12) the match tag, (hs14) then the mode byte, at the end */
         if (!g_started || p[n - 2] != pads_tag()) { InterlockedIncrement64(&g_rx_oldmatch); return; }      /* (between matches: the other game sends them again) */
         InterlockedExchange(&g_peer_mode, p[n - 1]);    /* (before it is queued: rbn_drain sees it with the message that starts the match) */
@@ -568,8 +680,10 @@ void rbn_rx(const uint8_t *p, int n) {
         long rtt = (long)(now_us() - m.echo_us);
         if (rtt <= 0 || rtt >= 5000000) return;
         InterlockedExchange(&g_rtt_us, rtt); if (g_rtt_min_us < 0 || rtt < g_rtt_min_us) InterlockedExchange(&g_rtt_min_us, rtt);
+        InterlockedIncrement(&g_lq_pong_got);
         AcquireSRWLockExclusive(&g_rq_lock);
         g_rtt_sum += rtt; g_rtt_n++;
+        g_lq_rtt[g_lq_i] = rtt; g_lq_i = (g_lq_i + 1) % LQ_N; if (g_lq_n < LQ_N) g_lq_n++;      /* (net4) the last 5 s of round trips */
         if (g_started && m.frame > 0 && g_cur > 0 && g_tsq_n < TSQ) g_tsq[g_tsq_n++] = (int32_t)((g_cur - m.frame) * 16683 - rtt / 2);   /* > 0: this game runs ahead */
         ReleaseSRWLockExclusive(&g_rq_lock);
         return;
@@ -597,6 +711,14 @@ static DWORD WINAPI ping_thread(void *u) {
         if (!net_rb_ready()) continue;
         RbMsg m; memset(&m, 0, sizeof m); m.type = RB_MSG_PING; m.frame = (int32_t)g_cur; m.time_us = now_us();
         send_msg(&m);
+        InterlockedIncrement(&g_lq_ping_sent);
+        {   uint64_t t = GetTickCount64();                 /* (net4) every 5 s: the loss of the pings of that window (the answer to the last one may still be on the way: one less) */
+            if (!g_lq_win_t0) g_lq_win_t0 = t;
+            else if (t - g_lq_win_t0 >= 5000) {
+                LONG sent = g_lq_ping_sent - g_lq_sent_prev, got = g_lq_pong_got - g_lq_got_prev;
+                if (sent > 2) { LONG lost = sent - 1 - got; if (lost < 0) lost = 0; InterlockedExchange(&g_lq_loss_pct, (LONG)(100 * lost / (sent - 1))); }
+                g_lq_sent_prev = g_lq_ping_sent; g_lq_got_prev = g_lq_pong_got; g_lq_win_t0 = t;
+            } }
     }
     return 0;
 }
@@ -610,6 +732,9 @@ static long long g_f0;                                  /* the base frame (the r
 static int g_delay, g_remote = 1;
 static long long g_peer_ack, g_sent_newest;
 static long long g_stat_pred, g_stat_padget, g_stat_mis;
+static long long g_preframe_pads;
+static double g_resend_last_ms = -1;
+static long long g_stall_resends;
 static long long g_ts_n; static double g_ts_extra;     /* time sync: extra ms per frame for the next frames */
 static int g_ts_left;
 static uint64_t g_hacc = 0xcbf29ce484222325ull; static int g_hlines;
@@ -620,11 +745,32 @@ static long long g_peer_check_f; static uint32_t g_peer_check;
 /* (hs13) g_lockstep: a match without the rollback ring: every frame waits for the other pad */
 void rbn_set_lockstep(int on) { g_lockstep = on; }
 int rbn_loop(void) { return g_loop; }
+/* (2026-10-27) delay-based matches: the margin of the other player's pad at each frame's start (rbn_before_frame), and a
+ * frame more or less of delay for the next match from it (g_ld_adapt, 0..3, both games take the larger announced delay) */
+#define LD_NB 6
+static const double g_ld_edge[LD_NB - 1] = { 1.0, 4.0, 8.0, 16.7, 33.3 };     /* ms: waited / tight / ... / two frames and more */
+static long long g_ld_hist[LD_NB], g_ld_n; static long long g_ld_need = -1; static int g_ld_adapt;
+static uint64_t g_ld_arr[256];                          /* receive time (us) of the other player's pad of frame f (f & 255) */
+/* (2026-10-27) delay-based matches: the delay changes DURING the match too. Each game announces the delay it wants in its
+ * mode byte (g_my_lockd, every PADS message) and both play with the larger of the two, so both change together: a game
+ * whose frames waited for the other player's pad 6 times or more in 3 s wants one frame more (the other player's pads then
+ * leave a frame earlier); 10 s without a wait and with a frame and more to spare at 97 % of the frames: one less, never
+ * under the delay of the best round trip. SSBU_RB_NET_DYNDELAY=0: the delay of the match start for the whole match. */
+static int g_dd_on = -1, g_dd_min, g_dd_max, g_dd_frames, g_dd_waits, g_dd_calm, g_dd_roomy, g_dd_up, g_dd_down;
 static int lock_delay(void) {                           /* the delay that covers the whole one-way trip (+ 1 frame): the wait is short or none */
     if (g_loop) return g_loop_lat + 1;
     int rt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
     if (rt <= 0) return 4;
     int d = (int)ceil(rt / 2000.0 / (1000.0 / 60.0)) + 1;
+    /* (2026-10-27) the best round trip alone ignores jitter (Wi-Fi, mobile: 25-33 ms of it on 2026-10-25), and in a delay-based
+     * match every late pad is a frozen frame: also cover the last 5 s of round trips (p90 + half of p90 - min, as auto_delay)
+     * with a third of a frame of margin, whichever is larger. SSBU_RB_NET_JITTER=0: the best round trip alone. */
+    {   static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
+        long v[LQ_N]; int n;
+        AcquireSRWLockExclusive(&g_rq_lock); n = g_lq_n; memcpy(v, g_lq_rtt, sizeof(long) * (size_t)n); ReleaseSRWLockExclusive(&g_rq_lock);
+        if (jit && n >= 5) { qsort(v, (size_t)n, sizeof v[0], cmp_long); long p90 = v[n * 9 / 10], mn = v[0];
+            int dj = (int)ceil((p90 + (p90 - mn) / 2) / 2000.0 / (1000.0 / 60.0) + 0.35); if (dj > d) d = dj; } }
+    d += g_ld_adapt;
     return d < 1 ? 1 : d > 12 ? 12 : d;
 }
 static int peer_lockstep(void) { return g_peer_mode >= 0 && (g_peer_mode & 0x80) && g_peerdelay; }
@@ -638,9 +784,28 @@ static int auto_delay(void) {
     if (g_loop) return 2;
     int rtt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
     if (rtt <= 0) return 2;
+    /* (net4) jitter: the best round trip plus 1.5 x (mean - best) of the pings so far (every 100 ms from the start). A
+     * steady link changes nothing (78 ms: mean 78.9, best 78.1); a jittery one gets the frame its late packets need.
+     * Measured, two games, 78 ms + 0..10 ms jitter + 2 % loss: delay 3 -> 20-28 rollbacks, tick p99 34-44 ms; delay 4 ->
+     * 0 rollbacks, p99 21.5 ms, identical. SSBU_RB_NET_JITTER=0: the best round trip alone (the old way). */
+    /* (2026-10-25 evening, a real match: delay 6 at a 19 ms link) the all-time mean held the pings from before the direct
+     * path was up (through the lobby, 100 ms and more), so the jitter term made the delay huge. Now only the LAST 5 s of
+     * round trips count (the ring rbn_link uses): rtt = their p90 + half of (p90 - min). */
+    {   static int jit = -1; if (jit < 0) { const char *e = getenv("SSBU_RB_NET_JITTER"); jit = !(e && e[0] == '0'); }
+        long v[LQ_N]; int n;
+        AcquireSRWLockExclusive(&g_rq_lock); n = g_lq_n; memcpy(v, g_lq_rtt, sizeof(long) * (size_t)n); ReleaseSRWLockExclusive(&g_rq_lock);
+        if (jit && n >= 5) { qsort(v, (size_t)n, sizeof v[0], cmp_long); long p90 = v[n * 9 / 10], mn = v[0]; rtt = (int)(p90 + (p90 - mn) / 2); } }
     double one_way = rtt / 2000.0 / (1000.0 / 60.0);     /* frames */
-    int d = (int)(one_way - 2.0 + 0.5);                   /* up to 2 frames of lateness covered by rollback */
-    return d < 1 ? 1 : d > 4 ? 4 : d;
+    /* (net4) a rollback is never free here: a re-run frame costs 4-5 ms and a load 3-5 ms (testers 2026-10-25), and a
+     * normal frame already fills most of the 16.7 ms, so every rollback shows as a late frame. The old rule (one-way less
+     * 2 frames) made rollbacks of 2-3 frames on most changes of the other player's pad. */
+    /* (net4, overnight 2026-10-25) one-way + a third of a frame, rounded up: the other player's pad of a frame then normally comes
+     * during the pass before it, so that frame never runs on a guess, no rollback is needed, and the state before it is not
+     * captured either (rbg_capture_needed): rollback is left for the jitter. Measured, two games at 50 ms round trip: with
+     * the delay covering the trip, ticks over budget p90 31.9 -> 16.9 ms, rollbacks 22 -> 2, frames identical; at 150 ms
+     * (delay 6) 0 rollbacks in 1,485 frames. A third of a frame of margin: 2 ms: 1 frame; 20-40 ms: 2; 78 ms: 3; 100 ms: 4; 150 ms: 5; 6 at most. graphics.ini rollback_delay = <n> fixes it (lower = less delay, more rollbacks). */
+    int d = (int)ceil(one_way + 0.35);
+    return d < 1 ? 1 : d > 6 ? 6 : d;
 }
 void rbn_start(long long f0) {
     g_f0 = f0; g_started = 1; g_match_n++;
@@ -659,6 +824,16 @@ void rbn_start(long long f0) {
 }
 /* after the start barrier: the delay again from the round trip measured meanwhile (no frame has run: the queues start over;
  * pads of the other game already queued are sent again by it, from our acknowledgement on) */
+static void dd_start(void) {                            /* the match's delay is agreed: the in-match changes start from it */
+    if (g_dd_on < 0) { const char *e = getenv("SSBU_RB_NET_DYNDELAY"); g_dd_on = !(e && e[0] == '0'); }
+    g_dd_frames = g_dd_waits = g_dd_calm = g_dd_roomy = g_dd_up = g_dd_down = 0;
+    if (g_loop || g_delay_cfg >= 0 || !(g_lockstep || peer_lockstep())) { g_dd_max = 0; return; }
+    int rt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
+    g_dd_min = rt > 0 ? (int)ceil(rt / 2000.0 / (1000.0 / 60.0)) : 1; if (g_dd_min < 1) g_dd_min = 1;
+    if (g_dd_min > g_delay) g_dd_min = g_delay;
+    g_dd_max = g_delay + 3 > 8 ? 8 : g_delay + 3;
+    g_my_lockd = g_delay;                               /* (the agreed delay is the larger announced one: the same on both sides) */
+}
 void rbn_choose_delay(void) {
     int d = auto_delay(); if (d < 1) d = 1;
     if (g_lockstep && !g_peerdelay) printf("[rbnet] after the start barrier: this game has no snapshot ring (old way, SSBU_RB_NET_PEERDELAY=0): the other game keeps its own delay\n");
@@ -666,10 +841,11 @@ void rbn_choose_delay(void) {
         g_lockstep && peer_lockstep() ? "neither game has a" : g_lockstep ? "this game has no" : "the other game has no", d, g_my_lockd, g_peer_mode >= 0 ? (int)(g_peer_mode & 0x7f) : -1, my_mode(), (unsigned)(g_peer_mode & 0xff));
     else if (!g_loop) printf("[rbnet] after the start barrier: both games have the ring (mode byte here %02x, there %02x)\n", my_mode(), (unsigned)(g_peer_mode & 0xff));
     fflush(stdout);
-    if (d == g_delay) return;
+    if (d == g_delay) { dd_start(); return; }
     printf("[rbnet] after the start barrier: input delay %d -> %d frames (round trip %.1f ms, best %.1f ms)\n", g_delay, d, g_rtt_us > 0 ? g_rtt_us / 1000.0 : -1.0, g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1.0);
     fflush(stdout);
     g_delay = d; rb_input_reset(2, g_local, g_delay);
+    dd_start();
 }
 int rbn_started(void) { return g_started; }
 int rbn_delay(void) { return g_started ? g_delay : 0; }
@@ -752,10 +928,54 @@ void rbn_drain(long long cur) {
         if (!rb_msg_parse(b, (size_t)n, &m)) { g_rx_bad++; continue; }
         if (m.type != RB_MSG_PADS || !g_started || m.player != g_remote) continue;
         g_peer_started = 1;
+        int had = rb_input_remote_latest(g_remote);
         for (int k = 0; k < m.count; k++) rb_input_remote_put(g_remote, m.newest - k, m.pads[k]);
+        for (int f = had + 1; f <= rb_input_remote_latest(g_remote); f++) g_ld_arr[f & 255] = at ? at : now_us();
         if (m.ack > g_peer_ack && m.ack <= rb_input_local_latest()) g_peer_ack = m.ack;      /* (hs12: never an acknowledgement of pads not sent yet) */
         if (m.check_frame > 0) on_check(m.check_frame, m.check);
     }
+}
+/* Main thread, after pacing and before any input reads of the next real pass. Inputs can arrive while the timer waits;
+ * leaving them queued would make that pass predict inputs we already have. Drain only at the pass boundary, never
+ * between its pad reads. Mismatches in earlier passes stay pending for the normal safe-point rollback; they must not
+ * be consumed or finalized here. The loop test's artificial delivery schedule stays unchanged. */
+static int peer_lockstep(void);
+static void dd_frame(int waited, int roomy) {           /* (main thread, each real frame of a delay-based match) */
+    g_dd_frames++; g_dd_waits += waited; g_dd_roomy += roomy;
+    if (g_dd_frames % 180 == 0) {
+        if (g_dd_waits >= 6 && g_my_lockd < g_dd_max) { g_my_lockd++; g_dd_up++; g_dd_calm = 0; g_dd_roomy = 0;
+            printf("[rbnet] delay-based: %d waits for the other player's pad in 3 s: this game asks for delay %d\n", g_dd_waits, g_my_lockd); }
+        else if (g_dd_waits == 0) {
+            if ((g_dd_calm += 180) >= 600) {
+                if (g_dd_roomy >= g_dd_calm * 97 / 100 && g_my_lockd > g_dd_min) { g_my_lockd--; g_dd_down++;
+                    printf("[rbnet] delay-based: 10 s without a wait, a frame and more to spare: this game asks for delay %d\n", g_my_lockd); }
+                g_dd_calm = 0; g_dd_roomy = 0;
+            }
+        } else { g_dd_calm = 0; g_dd_roomy = 0; }
+        g_dd_waits = 0;
+    }
+}
+static void dd_follow(void) {                           /* (main thread, each real frame of a delay-based match, either game) */
+    if (g_dd_on <= 0 || g_dd_max <= 0) return;
+    /* both games: the larger of the two wanted delays (the other game's byte comes with its every message) */
+    int pd = g_peer_mode >= 0 ? (g_peer_mode & 0x7f) : 0, d = g_my_lockd > pd ? g_my_lockd : pd;
+    if (d < 1) d = 1; if (d > 12) d = 12;
+    if (d != g_delay) {
+        static int said; if (said++ < 40) printf("[rbnet] delay-based: input delay %d -> %d frames during the match (here %d, there %d)\n", g_delay, d, g_my_lockd, pd);
+        g_delay = d; rb_input_set_delay(d);
+    }
+}
+void rbn_before_frame(long long cur) {
+    if (g_started && !g_loop && g_lockstep && g_ld_need > g_delay && g_ld_need <= rb_input_remote_latest(g_remote)) {
+        double ms = ((double)now_us() - (double)g_ld_arr[g_ld_need & 255]) / 1000.0; int b = 0;
+        while (b < LD_NB - 1 && ms >= g_ld_edge[b]) b++;
+        g_ld_hist[b]++; g_ld_n++; g_ld_need = -1;
+        if (g_dd_on > 0 && g_dd_max > 0) dd_frame(b == 0, b >= 4);
+    }
+    if (!g_predrain || !g_started || g_loop) return;
+    int before = rb_input_remote_latest(g_remote);
+    rbn_drain(cur);
+    g_preframe_pads += rb_input_remote_latest(g_remote) - before;
 }
 int rbn_take_mismatch(void) { int m = rb_input_take_mismatch(); if (m) g_stat_mis++; return m; }
 void rbn_put_mismatch(int m) { rb_input_put_mismatch(m); if (m) g_stat_mis--; }      /* (R3 pub1) r1_ring_load refused: the wrong guess stays pending */
@@ -843,6 +1063,8 @@ void rbn_finalize(long long cur) {
 static double g_tsbias = -1;
 double rbn_pace_extra(long long f) {
     if (!g_started || g_loop) return 0;
+    g_ld_need = f;                                      /* (the frame rbn_before_frame measures the margin of) */
+    dd_follow();
     if (f % 30 == 0) {
         rb_ts_decide((int)f);
         double est_ms = rb_ts_offset() / 1000.0;
@@ -850,7 +1072,9 @@ double rbn_pace_extra(long long f) {
          * (SSBU_RB_NET_TSBIAS ms, default 8), so the other player's pad of its frame is there before it needs it (a stall there
          * is a hitch); the game with the ring aims at the same split from its side */
         if (g_tsbias < 0) { const char *e = getenv("SSBU_RB_NET_TSBIAS"); g_tsbias = e ? atof(e) : 8.0; }
-        if (g_peerdelay && g_lockstep) est_ms += g_tsbias; else if (peer_lockstep()) est_ms -= g_tsbias;
+        /* (2026-10-27) both games delay-based: no bias (each added it, so both read "ahead" for ever and both slowed down by
+         * ~0.13 ms a frame, a time-sync correction every 30 frames, the whole match) */
+        if (g_peerdelay && g_lockstep && !peer_lockstep()) est_ms += g_tsbias; else if (peer_lockstep() && !g_lockstep) est_ms -= g_tsbias;
         /* ahead: half of the lead given back over the next 30 frames (the other game, behind, does nothing; both halves meet) */
         if (est_ms > 2.0) { g_ts_extra = est_ms / 2.0 / 30.0; if (g_ts_extra > 4.0) g_ts_extra = 4.0; g_ts_left = 30; g_ts_n++; }
         else g_ts_left = 0;
@@ -859,7 +1083,14 @@ double rbn_pace_extra(long long f) {
     return 0;
 }
 int rbn_rtt_ms(void) { return g_rtt_us > 0 ? (int)(g_rtt_us / 1000) : -1; }
-void rbn_resend(void) { if (g_started) send_pads(); }
+/* Main-thread stall loop only. Retrying while simulation is stopped must not depend on advancing a frame. Bound the
+ * rate here, including when no packet can be sent, so short polling intervals cannot flood the peer or relay. */
+void rbn_resend(double now_ms) {
+    if (!g_started || g_loop) return;
+    if (g_resend_last_ms >= 0 && now_ms - g_resend_last_ms < g_resend_ms) return;
+    g_resend_last_ms = now_ms;
+    if (rb_input_local_latest() > 0) { send_pads(); g_stall_resends++; }
+}
 /* the match-start barrier: an empty PADS message says "in the match" (count 0, newest 0) */
 void rbn_hello(void) {
     if (!g_started || g_loop) return;
@@ -881,6 +1112,16 @@ double rbn_offset_ms(void) { return rb_ts_offset() / 1000.0; }
 void rbn_match_reset(void) {
     g_started = 0; g_peer_started = 0; g_f0 = 0; InterlockedExchange(&g_peer_mode, -1); g_peer_ack = 0; g_sent_newest = 0;
     g_stat_pred = g_stat_padget = g_stat_mis = 0; g_ts_n = 0; g_ts_extra = 0; g_ts_left = 0;
+    g_preframe_pads = 0;
+    if (g_ld_n >= 600 && g_delay_cfg < 0) {             /* (10 s and more of a delay-based match) the next match's delay */
+        double waited = (double)g_ld_hist[0] / g_ld_n, roomy = (double)(g_ld_hist[4] + g_ld_hist[5]) / g_ld_n; int was = g_ld_adapt;
+        if (waited > 0.02 && g_ld_adapt < 3) g_ld_adapt++;
+        else if (waited < 0.002 && roomy > 0.97 && g_ld_adapt > 0) g_ld_adapt--;
+        if (g_ld_adapt != was) printf("[rbnet] delay-based: %.1f %% of frames waited for the other player's pad, %.1f %% had a frame or more to spare: %s a frame of delay next match (+%d)\n",
+                                      100 * waited, 100 * roomy, g_ld_adapt > was ? "one more" : "one less", g_ld_adapt);
+    }
+    memset(g_ld_hist, 0, sizeof g_ld_hist); g_ld_n = 0; g_ld_need = -1;
+    g_resend_last_ms = -1; g_stall_resends = 0;
     g_hacc = 0xcbf29ce484222325ull; g_hlines = 0; g_lacc_n = 0;
     memset(g_hash, 0, sizeof g_hash); memset(g_hframe, 0, sizeof g_hframe); g_hfinal_upto = 0;
     g_desync = 0; g_check_ok = 0; g_desync_first = -1; g_peer_check_f = 0; g_peer_check = 0;
@@ -895,6 +1136,11 @@ void rbn_match_reset(void) {
     fflush(stdout);
 }
 int rbn_match_number(void) { return g_match_n; }
+/* (net4) the match report (rb_rollback.c rbg_match_report): the numbers of this file */
+void rbn_match_numbers(double *rtt_mean_ms, double *rtt_best_ms, long long *desyncs, long long *repeats, long long *rx, long long *tx) {
+    AcquireSRWLockExclusive(&g_rq_lock); *rtt_mean_ms = g_rtt_n ? g_rtt_sum / g_rtt_n / 1000.0 : -1; ReleaseSRWLockExclusive(&g_rq_lock);
+    *rtt_best_ms = g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1; *desyncs = g_desync; *repeats = g_rep_sent; *rx = g_rx_pkts; *tx = g_tx_pkts;
+}
 void rbn_report(FILE *o, long long frames) {
     if (g_on <= 0) return;
     if (g_hlog) fflush(g_hlog);
@@ -903,6 +1149,11 @@ void rbn_report(FILE *o, long long frames) {
     fprintf(o, "[rbnet] report: pads given %lld, predicted %lld (%.1f%%), mispredictions %lld; finalized frames %lld; checksums compared %lld, DESYNCS %lld (first %lld)\n",
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
+    fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
+    if (g_ld_n) fprintf(o, "[rbnet] report: delay-based, the other player's pad at each frame's start: waited for %.1f %%, under 4 ms to spare %.1f %%, 4-8 ms %.1f %%, 8-16.7 ms %.1f %%, a frame %.1f %%, two frames and more %.1f %% (%lld frames; delay +%d from earlier matches; during this one %d up, %d down, %d at the end)\n",
+                        100.0 * g_ld_hist[0] / g_ld_n, 100.0 * g_ld_hist[1] / g_ld_n, 100.0 * g_ld_hist[2] / g_ld_n, 100.0 * g_ld_hist[3] / g_ld_n, 100.0 * g_ld_hist[4] / g_ld_n, 100.0 * g_ld_hist[5] / g_ld_n, g_ld_n, g_ld_adapt, g_dd_up, g_dd_down, g_delay);
+    fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
+    { int j, l; rbn_link(&j, &l); fprintf(o, "[rbnet] report: pads repeated %d ms after the first send: %lld; link seen here: jitter %d ms, loss %d %%\n", g_rep_ms, (long long)g_rep_sent, j, l); }
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",
             (long long)g_tx_pkts, (long long)g_tx_fail, (long long)g_rx_pkts, (long long)g_rx_bad, (long long)g_rx_drop, rb_input_remote_latest(g_remote), rb_input_local_latest());
     fflush(o);

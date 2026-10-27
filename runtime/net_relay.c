@@ -49,7 +49,7 @@
  *   SSBU_ONLINE_CODE                 online_code                      lobby code: only players with the same code meet
  *   SSBU_ONLINE_DIRECT=0             online_direct = off              no direct paths: everything through the lobby
  *   SSBU_ONLINE_PORT=<n>             local UDP port (default: any)
- *   SSBU_ONLINE_LOG=0..3             log level (default 1)
+ *   SSBU_ONLINE_LOG=0..3             online_log = 0..3               log level (default 1; 2 = every room message)
  *   SSBU_ONLINE_BUILD                build id override (players of different builds never meet) */
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -61,6 +61,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include "net_relay.h"
 #include "net_stats.h"
 #include "gfx_options.h"
@@ -75,6 +78,7 @@ enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_LEAVE, T_LIST,
        T_PEERS, T_PUNCH, T_DIRECT, T_BCAST };
 enum { T_ROOMS = 17, T_ROOM_INFO, T_ROOMS_END };      /* O1 room browser */
 enum { T_MATCH = 20, T_MATCH_STATE };                 /* O2 matchmaking */
+enum { T_RB_DIRECT = 22 };                            /* (net4) a rollback message straight to the other player (see net_rb_send) */
 #define PROTO 1
 #define NAME_LEN 32
 #define BUILD_LEN 40
@@ -84,7 +88,7 @@ enum { T_MATCH = 20, T_MATCH_STATE };                 /* O2 matchmaking */
 #define LOBBY_TIMEOUT_MS 10000
 #define GONE_AFTER_MS 5000
 #define PUNCH_FOR_MS 5000          /* hellos every 200 ms this long; no answer -> relayed (hello every 5 s in case it opens) */
-#define FRESH_MS 1200              /* a direct path is used while its last answer is younger than this */
+#define FRESH_MS 4000              /* a direct path is used while its last ANSWER to our hello is younger than this (net4: was 1200; the other player's own packets do not count, see heard_direct) */
 #define NET_BUILD_DEFAULT "ssbu-recomp-ldn1"
 #define NET_PUBLIC_LOBBY "opensmash-lobby.duckdns.org:39500"     /* the project's public lobby (menu.cpp ONLINE_DEFAULT_LOBBY): the default without online_mode / online_server */
 
@@ -105,9 +109,10 @@ static uint64_t rnd64(void) {
 }
 
 /* ---------------------------------------------------------------- configuration */
-static int g_cfg = -1, g_log = 1, g_direct = 1;
+#define DUP_MS 4
+static int g_cfg = -1, g_log = 1, g_direct = 1, g_dup;      /* g_dup (resp1): online_redundant = on: each game datagram on a direct path is sent twice */
 extern int g_game_build;             /* hostrt.c: 0 = 13.0.4, 1 = 13.0.5 (hostrt.h GAME_13_0_*), -1 before main.elf is read */
-static char g_server[256], g_name[NAME_LEN + 1], g_code[NAME_LEN + 1] = "public", g_build[BUILD_LEN + 1] = NET_BUILD_DEFAULT;
+static char g_server[256], g_name[NAME_LEN + 1], g_code[NAME_LEN + 1] = "ado-netplay"      /* (net4) this build's own lobby code: only players with this exe meet (online_code overrides) */, g_build[BUILD_LEN + 1] = NET_BUILD_DEFAULT;
 static uint16_t g_local_port;
 
 static int ini_value(const char *key, char *out, size_t n) {     /* "key = value" in graphics.ini (read only) */
@@ -134,6 +139,7 @@ static int ini_value(const char *key, char *out, size_t n) {     /* "key = value
     fclose(f);
     return found;
 }
+int net_ini_value(const char *key, char *out, size_t n) { return ini_value(key, out, n); }     /* (net4) rb_net.c rbn_on */
 static int is_off(const char *v) { return !*v || !strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") || !_stricmp(v, "false"); }
 
 /* ---------------------------------------------------------------- O1: the mod set this game loads
@@ -276,6 +282,18 @@ static int g_mode, g_auto, g_upnp = 1, g_list_other = 1;     /* g_list_other: on
 static uint16_t g_host_port;                    /* HOST mode: the in-game lobby's UDP port (default 39500) */
 static char g_join[64], g_peer[256], g_stun[128] = "stun.l.google.com:19302";
 
+/* (resp1) the low 24 bits of this exe's link stamp (rb_net.c exe_stamp: the PE header; POSIX: the file's modification time) */
+static uint32_t exe_stamp24(void) {
+#ifdef _WIN32
+    const uint8_t *m = (const uint8_t *)GetModuleHandleA(NULL); if (!m) return 0;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(m + ((const IMAGE_DOS_HEADER *)m)->e_lfanew);
+    return nt->FileHeader.TimeDateStamp & 0xffffffu;
+#else
+    char p[MAX_PATH]; struct stat st;
+    DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
+    return n && n < MAX_PATH && !stat(p, &st) ? (uint32_t)st.st_mtime & 0xffffffu : 0;
+#endif
+}
 static void configure(void) {
     if (g_cfg >= 0) return;
     char v[256] = "", mode[64] = "";
@@ -325,12 +343,26 @@ static void configure(void) {
     else if (ini_value("online_code", v, sizeof v) && *v) snprintf(g_code, sizeof g_code, "%s", v);
     if ((e = getenv("SSBU_ONLINE_DIRECT"))) g_direct = !is_off(e);
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
+    /* (resp1, 2026-10-26) the game's own online netcode (3-player rooms, and 1v1 without rollback) waits for a lost datagram;
+     * on a lossy link (mobile internet) a second copy of each one hides most single losses, at twice the (small) traffic.
+     * (2026-10-27) ON by default: the copy goes DUP_MS later (a burst loss on Wi-Fi / mobile takes both copies sent together),
+     * and the receiving game drops it when the first one came (dup_seen), so the game never sees a duplicate.
+     * online_redundant = off: one copy. */
+    g_dup = 1;
+    if ((e = getenv("SSBU_ONLINE_REDUNDANT"))) g_dup = !is_off(e);
+    else if (ini_value("online_redundant", v, sizeof v)) g_dup = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
     if ((e = getenv("SSBU_ONLINE_LOG"))) g_log = atoi(e);
+    else if (ini_value("online_log", v, sizeof v) && v[0] >= '0' && v[0] <= '3') g_log = atoi(v);      /* (net4) graphics.ini online_log = 0..3 (2: every room message) */
     mods_scan();                       /* O1: the mods this game loads (their names and hashes go to the lobby) */
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
     else {
         size_t l = strlen(g_build);
+        /* (resp1, 2026-10-26: a friend's join of a room was accepted and then left by his game 20 s later, every time; the
+         * label was the same, the exes maybe not) this exe's link stamp is part of the label: rooms of another exe are listed
+         * with the reason and cannot be joined. 6 hex digits keep a label with mods within BUILD_LEN. */
+        { uint32_t st = exe_stamp24(); if (st) snprintf(g_build + l, sizeof g_build - l, ".%06x", (unsigned)st); }
+        l = strlen(g_build);
         if (g_game_build >= 0)         /* players of 13.0.4 and 13.0.5 never share a room: the lobby and the LAN lobby part rooms by build */
             snprintf(g_build + l, sizeof g_build - l, "-%s", g_game_build == 1 ? "13.0.5" : "13.0.4");
         l = strlen(g_build);
@@ -342,6 +374,7 @@ static void configure(void) {
     static const char *mode_names[] = {"lobby", "lan (no server)", "host (no server)", "join (no server)"};
     printf("[online] on: mode %s%s, lobby %s, code %s, name %s, direct paths %s, build %s\n", mode_names[g_mode], g_auto ? " (auto)" : "",
            g_mode == NET_MODE_LOBBY ? g_server : g_mode == NET_MODE_JOIN ? g_join : "inside this game", g_code, g_name, g_direct ? "allowed" : "off", g_build);
+    if (g_dup) printf("[online] online_redundant = on: game datagrams on a direct path are sent twice, the copy %d ms later (duplicates dropped on arrival)\n", DUP_MS);
     printf("[online] mods: %s; rooms of other builds %s\n", g_mods_text, g_list_other ? "shown in the game's list (joining them is refused, with the reason)" : "only in F1 > Online");
     fflush(stdout);
 }
@@ -369,6 +402,17 @@ static uint16_t g_lan_port;
 static int g_loopback;
 static char g_reject[80];
 static volatile LONG64 g_out_relay, g_out_direct, g_in_relay, g_in_direct;
+static volatile LONG64 g_rb_out_relay, g_rb_out_direct, g_rb_in_relay, g_rb_in_direct;     /* (net4) rollback messages by path */
+/* (2026-10-27) game datagram sizes: one over ~1200 bytes is split into IP fragments on the way, and mobile carriers
+ * (T-Mobile's carrier NAT / 464XLAT) often drop fragments: such a player gets the small datagrams and never the big ones */
+#define BIG_DGRAM 1200
+static volatile LONG64 g_big_out, g_big_in; static volatile LONG g_max_out, g_max_in;
+static int g_bcast_skip = -1; static volatile LONG64 g_bcast_saved;
+int nnldn_players(void);
+static void note_size(volatile LONG64 *big, volatile LONG *mx, int n) {
+    if (n > BIG_DGRAM) InterlockedIncrement64(big);
+    for (LONG m = *mx; n > m; m = *mx) if (InterlockedCompareExchange(mx, n, m) == m) break;
+}
 
 enum { PS_PUNCHING, PS_DIRECT, PS_RELAYED };
 typedef struct {
@@ -378,7 +422,7 @@ typedef struct {
 typedef struct {
     uint32_t ip;
     char name[NAME_LEN + 1];
-    uint64_t secret, since, last_ack, next_hello, acks_window;
+    uint64_t secret, since, last_ack, last_heard, next_hello, acks_window;
     int state, via, ncand, acks, rtt;
     Cand cand[2];                                     /* through its router (as the lobby sees it), then on its own LAN */
 } Peer;
@@ -439,6 +483,59 @@ static void sim_init(void) {                           /* (net_start, before the
         printf("[online] TEST: link simulation on: +%.1f ms per datagram sent (+0..%.1f jitter), %.1f %% lost\n", g_sim_ms, g_sim_jit, g_sim_loss); fflush(stdout);
     }
 }
+static void tx(const void *p, int n, const struct sockaddr_in *to);
+/* (2026-10-27) online_redundant: the second copy of a direct game datagram, DUP_MS later, from its own thread */
+typedef struct DupPkt { struct DupPkt *next; double due; int n; struct sockaddr_in to; uint8_t b[]; } DupPkt;
+static DupPkt *g_dup_head, *g_dup_tail; static SRWLOCK g_dup_lock = SRWLOCK_INIT; static CONDITION_VARIABLE g_dup_cv = CONDITION_VARIABLE_INIT;
+static int g_dup_thread; static volatile LONG64 g_dup_sent, g_dup_dropped_rx;
+static double dup_now(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+static DWORD WINAPI dup_thread(LPVOID u) {
+    (void)u;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+    for (;;) {
+        AcquireSRWLockExclusive(&g_dup_lock);
+        while (!g_dup_head) SleepConditionVariableSRW(&g_dup_cv, &g_dup_lock, INFINITE, 0);
+        DupPkt *q = g_dup_head; double now = dup_now();
+        if (now >= q->due) { g_dup_head = q->next; if (!g_dup_head) g_dup_tail = NULL; }
+        ReleaseSRWLockExclusive(&g_dup_lock);
+        if (now < q->due) {
+            double left = q->due - now;
+            if (tm) { LARGE_INTEGER d; d.QuadPart = -(LONGLONG)(left * 10000.0); SetWaitableTimer(tm, &d, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, 50); }
+            else Sleep(1);
+            continue;
+        }
+        tx(q->b, q->n, &q->to); InterlockedIncrement64(&g_dup_sent);
+        free(q);
+    }
+    return 0;
+}
+static void dup_later(const void *p, int n, const struct sockaddr_in *to) {
+    if (!g_dup_thread) {
+        AcquireSRWLockExclusive(&g_dup_lock);
+        if (!g_dup_thread) { HANDLE th = CreateThread(NULL, 0, dup_thread, NULL, 0, NULL); g_dup_thread = th ? 1 : -1; if (th) CloseHandle(th); }
+        ReleaseSRWLockExclusive(&g_dup_lock);
+    }
+    if (g_dup_thread < 0) { tx(p, n, to); return; }
+    DupPkt *q = malloc(sizeof *q + (size_t)n);
+    if (!q) return;
+    q->next = NULL; q->n = n; q->to = *to; q->due = dup_now() + DUP_MS; memcpy(q->b, p, (size_t)n);
+    AcquireSRWLockExclusive(&g_dup_lock);
+    if (g_dup_tail) g_dup_tail->next = q; else g_dup_head = q;
+    g_dup_tail = q;
+    ReleaseSRWLockExclusive(&g_dup_lock);
+    WakeConditionVariable(&g_dup_cv);
+}
+/* (receive thread only) a direct game datagram identical to one from the same address in the last DUP_SEEN_MS: the copy */
+#define DUP_SEEN_MS 30.0      /* (a match clears the entry: the next identical datagram of the game, a frame later, is not taken for a copy) */
+static int dup_seen(const struct sockaddr_in *from, const uint8_t *p, int n) {
+    static struct { uint64_t h; double at; } seen[128]; static int next;
+    uint64_t h = fnv64(fnv64(0xcbf29ce484222325ull, &from->sin_addr, 4), &from->sin_port, 2); h = fnv64(h, p, (size_t)n);
+    double t = dup_now();
+    for (int i = 0; i < 128; i++) if (seen[i].h == h && t - seen[i].at < DUP_SEEN_MS) { seen[i].at = 0; InterlockedIncrement64(&g_dup_dropped_rx); return 1; }
+    seen[next].h = h; seen[next].at = t; next = (next + 1) & 127;
+    return 0;
+}
 static void tx(const void *p, int n, const struct sockaddr_in *to) {
     if (g_sim <= 0) { tx_now(p, n, to); return; }
     g_sim_rng ^= g_sim_rng << 13; g_sim_rng ^= g_sim_rng >> 17; g_sim_rng ^= g_sim_rng << 5;
@@ -474,7 +571,18 @@ static const char *ip_text(uint32_t ip, char *b);
 static volatile uint32_t g_rb_match_peer;              /* (R3 net3) the opponent of the last rollback-match search (lobby 1.4), 0 = none */
 static volatile LONG64 g_rb_rx_other;                  /* (R3 net3) rollback messages from another player than that opponent: dropped */
 static volatile LONG g_rb_nodst; static volatile uint32_t g_rb_dst_said;
+static volatile uint32_t g_rb_direct_from;            /* (net4) the player whose rollback messages came straight from it (T_RB_DIRECT) */
 int net_rb_no_destination(void) { return g_rb_nodst; }
+/* (net4) the match report: how the rollback messages went (1 direct, 2 through the lobby, 0 none), and the other player's name */
+int net_rb_path(void) { return g_rb_out_direct > g_rb_out_relay ? 1 : g_rb_out_relay ? 2 : 0; }
+const char *net_peer_name(void) {
+    static char n[NAME_LEN + 1];
+    uint32_t other = nnldn_other_ip(); n[0] = 0;
+    AcquireSRWLockShared(&g_peers_lock);
+    for (int i = 0; i < g_npeers; i++) if (!other || g_peers[i].ip == other) { snprintf(n, sizeof n, "%s", g_peers[i].name); break; }
+    ReleaseSRWLockShared(&g_peers_lock);
+    return n[0] ? n : "?";
+}
 int net_rb_send(const void *p, int n) {
     if (!net_rb_ready() || n <= 0 || n > 1400) return 0;
     uint32_t dst = nnldn_other_ip(), room = dst;
@@ -483,9 +591,35 @@ int net_rb_send(const void *p, int n) {
     if (!dst && g_mode == NET_MODE_LOBBY && !_stricmp(g_code, "public")) { InterlockedIncrement(&g_rb_nodst); return 0; }
     if (dst && dst != g_rb_dst_said) { char a[16]; g_rb_dst_said = dst; printf("[rbnet] rollback messages go to %s (%s)\n", ip_text(dst, a), room ? "the other player of this Local Wireless room" : dst == g_rb_match_peer ? "the opponent the lobby found" : "the game that wrote to this one"); fflush(stdout); }
     uint8_t b[1500];
+    /* (net4) straight to the other player while a direct path to it is fresh (its address and pair secret from the lobby's
+     * PEERS, the path the game's own datagrams take): the input messages no longer go through the lobby server and back,
+     * a whole extra round trip on every pad. Otherwise (no path, or it went quiet) the lobby relays them as before.
+     *   'S' 'U' 1 22 | pair secret u64 | source u32 | message */
+    if (dst && g_direct) {
+        struct sockaddr_in at; uint64_t secret = 0, t = ms_now();
+        AcquireSRWLockShared(&g_peers_lock);
+        for (int i = 0; i < g_npeers && !secret; i++)
+            if (g_peers[i].ip == dst && fresh(&g_peers[i], t)) { at = g_peers[i].cand[g_peers[i].via].at; secret = g_peers[i].secret; }
+        ReleaseSRWLockShared(&g_peers_lock);
+        static volatile LONG route = -1;                /* the path last written in the log: 1 direct, 0 the lobby */
+        if (InterlockedExchange(&route, secret ? 1 : 0) != (secret ? 1 : 0)) {
+            printf("[rbnet] rollback messages %s\n", secret ? "go straight to the other player (direct path)" : "go through the lobby (no direct path to the other player now)");
+            fflush(stdout);
+        }
+        if (secret) {
+            hdr(b, T_RB_DIRECT); s64(b + 4, secret); s32(b + 12, g_ip);
+            memcpy(b + 16, p, (size_t)n);
+            tx(b, 16 + n, &at);
+            InterlockedIncrement64(&g_rb_out_direct);
+            if (g_rb_direct_from == dst) return 1;
+            /* the other game has not sent us one of these yet: it may be an older version that drops type 22, so the lobby
+             * gets a copy too until it has (a pad message arriving twice changes nothing) */
+        }
+    }
     hdr(b, T_RB); s64(b + 4, g_cookie); s32(b + 12, dst);
     memcpy(b + 16, p, (size_t)n);
     tx(b, 16 + n, &g_lobby);
+    InterlockedIncrement64(&g_rb_out_relay);
     return 1;
 }
 
@@ -559,7 +693,7 @@ static void read_peers(const uint8_t *p, int n) {               /* PEERS body */
 
 static void peers_tick(uint64_t t) {
     static uint64_t last_report;
-    char lines[2 * MAX_PEERS][160];
+    char lines[2 * MAX_PEERS][400];
     int nl = 0;
     AcquireSRWLockExclusive(&g_peers_lock);
     for (int i = 0; i < g_npeers; i++) {
@@ -577,11 +711,13 @@ static void peers_tick(uint64_t t) {
             else for (int c = 0; c < q->ncand; c++) hello(q, c, t);
         }
     }
-    if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct)) {
+    if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct || g_rb_out_relay || g_rb_out_direct)) {
         last_report = t;
-        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; %d peer(s)%s",
-                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_in_relay, (long long)g_in_direct, g_npeers,
-                 g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "");
+        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct (broadcasts not copied to the lobby %lld, second copies %lld), in %lld copies dropped, %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s; datagrams over %d bytes out %lld (largest %ld), in %lld (largest %ld)",
+                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_bcast_saved, (long long)g_dup_sent, (long long)g_dup_dropped_rx, (long long)g_in_relay, (long long)g_in_direct,
+                 (long long)g_rb_out_relay, (long long)g_rb_out_direct, (long long)g_rb_in_relay, (long long)g_rb_in_direct, g_npeers,
+                 g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "",
+                 BIG_DGRAM, (long long)g_big_out, (long)g_max_out, (long long)g_big_in, (long)g_max_in);
     }
     ReleaseSRWLockExclusive(&g_peers_lock);
     for (int i = 0; i < nl; i++) say("%s", lines[i]);
@@ -597,24 +733,50 @@ static Peer *peer_at(uint64_t secret, const struct sockaddr_in *from, int *cand)
     return NULL;
 }
 
+/* (net4, peers lock held exclusive) a game datagram or rollback message of q arrived on its direct path: the path is alive.
+ * Only the answers to hellos kept it fresh before, so three hellos lost in a row (Wi-Fi) sent every datagram through the
+ * lobby for a while although the path carried the game's traffic all along: a burst of lag in the middle of a fight. */
+/* (net4, 2026-10-25 late: a player on a phone hotspot could not join the room: his packets reached this PC on the direct
+ * path, this PC's did not reach him, and because his data refreshed last_ack the path counted as fresh for ever, so the
+ * game's room data went out on it and was lost) a packet of his only notes that he is heard; a direct path stays fresh
+ * only by his ANSWERS to this PC's hellos (every 400 ms), which prove this PC's packets reach him too. */
+static void heard_direct(Peer *q, int c, uint64_t t) { if (q->state == PS_DIRECT && c == q->via) q->last_heard = t; }
+
 static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from) {
     uint64_t t = ms_now();
     int c = 0;
     if (n < 12) return;
     uint64_t secret = g64(p + 4);
     if (p[3] == T_DIRECT && n >= 12 + 12) {
+        if (dup_seen(from, p, n)) return;
         const uint8_t *b = p + 12;
         uint32_t src = g32(b), dst = g32(b + 4);
         uint16_t sport = g16(b + 8), dport = g16(b + 10);
         int ok;
-        AcquireSRWLockShared(&g_peers_lock);
+        AcquireSRWLockExclusive(&g_peers_lock);
         Peer *q = peer_at(secret, from, &c);
         ok = q && q->ip == src && (dst == g_ip || dst == VNET_BROADCAST || dst == 0xFFFFFFFFu) && sport != VNET_LDN_PORT && dport != VNET_LDN_PORT;
-        ReleaseSRWLockShared(&g_peers_lock);
+        if (ok) heard_direct(q, c, t);
+        ReleaseSRWLockExclusive(&g_peers_lock);
         if (ok && nnldn_has_node(src)) {
             InterlockedIncrement64(&g_in_direct);
             nnldn_deliver(src, sport, dst, dport, b + 12, (uint32_t)(n - 24));
         }
+        return;
+    }
+    if (p[3] == T_RB_DIRECT && n > 16) {              /* (net4) a rollback message of the other player, straight from it */
+        uint32_t src = g32(p + 12), mp = g_rb_match_peer;
+        AcquireSRWLockExclusive(&g_peers_lock);
+        Peer *q = peer_at(secret, from, &c);
+        int ok = q && q->ip == src;
+        if (ok) heard_direct(q, c, t);
+        ReleaseSRWLockExclusive(&g_peers_lock);
+        if (!ok || !src || src == g_ip) return;
+        {   uint32_t want = nnldn_other_ip() ? nnldn_other_ip() : mp;      /* (2026-10-26 evening) the room's other player, else the matched opponent; another game's messages are not ours */
+            if (want && src != want) { InterlockedIncrement64(&g_rb_rx_other); return; } }
+        g_rb_peer = src; g_rb_direct_from = src;
+        InterlockedIncrement64(&g_rb_in_direct);
+        rbn_rx(p + 16, n - 16);
         return;
     }
     if (p[3] != T_PUNCH || n < 29) return;
@@ -660,6 +822,8 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
     uint8_t *body = buf + HEAD_ROOM, *h;
     s32(body, src); s32(body + 4, dst); s16(body + 8, sport); s16(body + 10, dport);
     memcpy(body + 12, data, len);
+    note_size(&g_big_out, &g_max_out, (int)len + 12 + 12 + 28);
+    if (g_bcast_skip < 0) { const char *e = getenv("SSBU_ONLINE_BCAST_LOBBY"); g_bcast_skip = !(e && e[0] == '1'); }      /* (as on the wire: our 12 + 12 bytes, IP + UDP 28) */
     int n = 12 + (int)len, bcast = dst == VNET_BROADCAST || dst == 0xFFFFFFFFu, nd = 0;
     struct { struct sockaddr_in at; uint64_t secret; uint32_t ip; } direct[MAX_PEERS];
     if (sport != VNET_LDN_PORT && dport != VNET_LDN_PORT) {
@@ -677,9 +841,18 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
         hdr(h, T_DIRECT);
         s64(h + 4, direct[i].secret);
         tx(h, n + 12, &direct[i].at);
+        if (g_dup) dup_later(h, n + 12, &direct[i].at);
         InterlockedIncrement64(&g_out_direct);
     }
-    if (!nd || bcast) {                         /* a broadcast also reaches the room's players not reached directly: the lobby sends it on */
+    int all_direct = 0;
+    if (bcast && nd && g_bcast_skip) {          /* (2026-10-27) every other player of the room reached directly: no copy through the lobby
+                                                 * (~35 datagrams a second per player in a fight went there for nobody). SSBU_ONLINE_BCAST_LOBBY=1: always */
+        int players = nnldn_players(), room = 0;
+        for (int i = 0; i < nd; i++) room += nnldn_has_node(direct[i].ip) != 0;
+        all_direct = players >= 2 && room >= players - 1;
+        if (all_direct) InterlockedIncrement64(&g_bcast_saved);
+    }
+    if (!nd || (bcast && !all_direct)) {        /* a broadcast also reaches the room's players not reached directly: the lobby sends it on */
         if (nd) {
             h = body - (5 + 4 * nd);
             hdr(h, T_BCAST);
@@ -720,6 +893,8 @@ static uint64_t g_rooms_sent, g_rooms_at;
 static struct { uint32_t ip; char build[BUILD_LEN + 1]; } g_other[24];   /* the last game list's rooms of other builds */
 static int g_nother;
 
+/* "ssbu-recomp-ldn1.6adfa7-13.0.5" -> length of "ssbu-recomp-ldn1" (the label's name without this exe's stamp) */
+static int build_name_len(const char *b) { const char *dot = strchr(b, '.'), *dash = strchr(b + (strlen(b) > 12 ? 12 : 0), '-'); return (int)(dot && (!dash || dot < dash) ? dot - b : dash ? dash - b : (ptrdiff_t)strlen(b)); }
 static const char *build_version(const char *b, char *out, size_t n) {   /* "ssbu-recomp-ldn1-13.0.5+m..." -> "13.0.5" */
     const char *plus = strchr(b, '+'), *end = plus ? plus : b + strlen(b), *dash = end;
     while (dash > b && dash[-1] != '-') dash--;
@@ -757,6 +932,8 @@ static int room_why(const char *b, int known, const ModEntry *m, int nm, char *o
         build_version(b, theirs, sizeof theirs); build_version(g_build, mine, sizeof mine);
         if (theirs[0] && mine[0] && strcmp(theirs, mine) && !strncmp(b, g_build, (size_t)(build_base_len(b) - (int)strlen(theirs))))
             snprintf(out, n, "Different version: this room is %s, you have %s", theirs, mine);
+        else if (theirs[0] && !strcmp(theirs, mine) && build_name_len(b) == build_name_len(g_build) && !strncmp(b, g_build, (size_t)build_name_len(b)))
+            snprintf(out, n, "Different exe: this room's game runs another ssbu_native.exe than yours (both players need the same one: copy the host's build\\work\\ssbu_native.exe)");
         else snprintf(out, n, "Different game build: this room is %.*s, you have %.*s", build_base_len(b), b, build_base_len(g_build), g_build);
         return 1;
     }
@@ -1374,9 +1551,43 @@ static void send_join(void) {
     tx(p, BASE + 2 + g_mods_wire_len, &g_lobby);
 }
 
+/* (net4, client thread, about once a second) a Local Wireless room with another player whose datagrams still go through the
+ * lobby SERVER 10 s after it joined: said once per room, on screen and in the log, with who should change what. The relay adds
+ * the way to the server and back to every datagram (testers 2026-10-25: 293 ms round trip relayed, 78 ms direct, the same two
+ * players). HOST / JOIN / LAN modes are left out: their lobby is one of the players' games, so relayed is about as fast. */
+static void room_path_check(uint64_t t) {
+    static uint64_t since; static int said;
+    int n = nnldn_players();
+    if (n < 2 || g_mode != NET_MODE_LOBBY) { since = 0; said = 0; return; }
+    if (!since) since = t;
+    if (said || t - since < 10000) return;
+    uint32_t other = nnldn_other_ip();
+    int listed = 0, direct = 0;
+    char name[NAME_LEN + 1] = "the other player";
+    AcquireSRWLockShared(&g_peers_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (other && g_peers[i].ip != other) continue;
+        listed = 1; direct |= fresh(&g_peers[i], t);
+        if (other) snprintf(name, sizeof name, "%s", g_peers[i].name);
+    }
+    ReleaseSRWLockShared(&g_peers_lock);
+    said = 1;
+    if (direct) return;
+    char text[400];
+    if (!g_direct) snprintf(text, sizeof text, "You have \"Relay only\" on (F1 > Experimental): everything goes through the lobby server, which adds lag.\nUntick it and restart the game for a direct connection.");
+    else if (!listed) snprintf(text, sizeof text, "%s has \"Relay only\" on: everything goes through the lobby server, which adds lag.\nAsk them to untick it in F1 > Experimental and restart.", other ? name : "Another player of this room");
+    else snprintf(text, sizeof text, "No direct connection to %s could be made (a router or firewall): the lobby server relays the game, which adds lag.\nAllowing the game through the Windows firewall on both PCs usually fixes it.", name);
+    say("room: %s", text);
+    menu_popup("Online: slow connection", text);
+}
+
 static DWORD WINAPI client_thread(LPVOID unused) {
     (void)unused;
     static uint8_t buf[65536];
+    /* (net4) this thread hands every datagram received to the game (nnldn_deliver) and answers the rollback pings. It sleeps
+     * in recvfrom nearly all the time, but when a packet comes it must run at once: at NORMAL priority it waited behind the
+     * game's own threads (ABOVE_NORMAL / HIGHEST, os_threads.c host_priority) on a busy PC, so packets reached the game late. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     while (!setup()) {
         if (g_mode == NET_MODE_LOBBY && g_auto && ms_now() - g_unjoined_since > GONE_AFTER_MS) { lobby_fallback_to_lan(); break; }
         Sleep(3000);
@@ -1417,12 +1628,14 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             else say("lost the lobby %s: joining again", g_server);
         }
         if (g_joined && t - last_tick >= 50) { peers_tick(t); last_tick = t; }
+        { static uint64_t last_path; if (g_joined && t - last_path >= 1000) { last_path = t; room_path_check(t); } }     /* (net4) */
         if (g_joined && t - (uint64_t)g_rooms_wanted < 5000 && t - g_rooms_sent >= 2000) rooms_ask(t);     /* O1: while someone looks */
         if (g_joined) mm_tick(t);                                                                         /* O2 */
         struct sockaddr_in from;
         int flen = sizeof from;
         int n = recvfrom(g_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n < 4 || buf[0] != 'S' || buf[1] != 'U' || buf[2] != PROTO) continue;
+        if (buf[3] == T_DIRECT || buf[3] == T_DATA || buf[3] == T_BCAST) note_size(&g_big_in, &g_max_in, n + 28);
         if (!same_at(&from, &g_lobby)) { if (g_joined && g_direct) from_player(buf, n, &from); continue; }
         switch (buf[3]) {
         case T_DATA:
@@ -1482,9 +1695,9 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             if (g_joined && g_direct) read_peers(buf + 4, n - 4);
             break;
         case T_RB:                                       /* R3: a rollback message of the other player */
-            if (n > 8 && g_joined) { uint32_t src = g32(buf + 4), mp = g_rb_match_peer;
-                if (mp && src != mp && !nnldn_other_ip()) { InterlockedIncrement64(&g_rb_rx_other); break; }     /* (R3 net3) not our opponent */
-                if (src && src != g_ip) { g_rb_peer = src; rbn_rx(buf + 8, n - 8); } }
+            if (n > 8 && g_joined) { uint32_t src = g32(buf + 4), mp = g_rb_match_peer, want = nnldn_other_ip() ? nnldn_other_ip() : mp;
+                if (want && src != want) { InterlockedIncrement64(&g_rb_rx_other); break; }     /* (R3 net3, 2026-10-26) not our opponent: the room's other player, else the matched one */
+                if (src && src != g_ip) { g_rb_peer = src; InterlockedIncrement64(&g_rb_in_relay); rbn_rx(buf + 8, n - 8); } }
             break;
         }
     }
@@ -1542,20 +1755,28 @@ void net_start(void) {
  *   delay, rollback_*  0: the game's own Local Wireless netcode is delay based and is not ours to measure (rollback, N1). */
 void net_stats_get(NetStats *o) {
     memset(o, 0, sizeof *o);
-    o->ping_ms = -1;
+    o->ping_ms = -1; o->jitter_ms = -1; o->loss_pct = -1;
     if (g_cfg <= 0) { o->state = NET_OFFLINE; return; }
     if (!g_joined) { o->state = net_lobby_gone() || g_reject[0] ? NET_DISCONNECTED : NET_CONNECTING; return; }
     o->state = NET_CONNECTED;
     {   /* R3: an online rollback match (rb_net.c / rb_rollback.c) fills delay and rollback; its own round trip */
-        int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk);
-        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); return; }
+        int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk); void rbn_link(int *jitter_ms, int *loss_pct);
+        if (rbn_started()) {
+            rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); rbn_link(&o->jitter_ms, &o->loss_pct);
+            static LONG64 seen_d, seen_r; static int last_path;          /* (net4) the path of the messages sent since the last call */
+            LONG64 d = g_rb_out_direct, r = g_rb_out_relay;
+            if (d != seen_d) last_path = NET_PATH_DIRECT; else if (r != seen_r) last_path = NET_PATH_RELAYED;
+            seen_d = d; seen_r = r; o->path = last_path;
+            return;
+        }
     }
     int in_room = nnldn_players();
     o->players = in_room ? in_room : 1;
     o->ping_ms = (int)g_ping;
     if (in_room > 1 && TryAcquireSRWLockShared(&g_peers_lock)) {
         uint64_t t = ms_now();
-        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; break; }
+        o->path = NET_PATH_RELAYED;
+        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; o->path = NET_PATH_DIRECT; break; }
         ReleaseSRWLockShared(&g_peers_lock);
     }
 }

@@ -17,7 +17,8 @@
 extern "C" {
 #endif
 enum { NET_OFFLINE = 0, NET_CONNECTING = 1, NET_CONNECTED = 2, NET_DISCONNECTED = 3 };
-typedef struct { int state; int players; int ping_ms; int delay; int rollback_last, rollback_max; } NetStats;
+enum { NET_PATH_UNKNOWN = 0, NET_PATH_DIRECT = 1, NET_PATH_RELAYED = 2 };     /* (net4) how the other player's datagrams travel */
+typedef struct { int state; int players; int ping_ms; int delay; int rollback_last, rollback_max; int path; int jitter_ms, loss_pct; } NetStats;      /* (net4) jitter / loss: -1 = not known */
 void net_stats_get(NetStats *out);          /* fills every field; the default: state NET_OFFLINE, ping -1, the rest 0 */
 
 /* O1 (plan\phases\O1_room_browser.md): the room browser of the settings menu (F1 > Online rooms), net_relay.c.
