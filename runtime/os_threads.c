@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <malloc.h>
+#include <limits.h>
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -685,14 +686,18 @@ static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
  * games crashed at a fight's end once the commit ran out) With R1 on (every online session: rollback and run-ahead) a
  * finalized fiber's host fiber was never deleted (g_r1_keep_fibers), and fib_init then made a new one over it. Each is
  * 1 MB of committed stack (256 MB reserved) that is hardly touched, and the fighters' scripts make and finalize fibers all
- * through a fight: ~0.45 MB per fight frame. Now a host fiber that its guest fiber no longer holds is RETIRED: deleted at
- * once when no saved state can be loaded (r1 says so through g_r1_fibers_pinned), else kept until none can (a rollback
- * match: at its end, os_fibers_flush). A load that puts a retired host fiber back into its guest fiber takes it off the
- * list. A host fiber that a thread is running now (its TEB says so) is never deleted. */
-typedef struct { void *fiber; Ctx *fctx; } Retired;
+ * through a fight: ~0.45 MB per fight frame. Now a host fiber that its guest fiber no longer holds is RETIRED, stamped with
+ * the capture generation (os_fibers_captured: every save of the fibers counts one), and deleted once every saved state
+ * that can still be loaded was captured after it retired (r1 says from which generation on: g_r1_fibers_keep_from; no
+ * ring: at once; a rollback match: as its oldest slot rotates out; the rest at its end, os_fibers_flush). A load that
+ * puts a retired host fiber back into its guest fiber takes it off the list. A host fiber that a thread is running now (its TEB says so) is never deleted. */
+typedef struct { void *fiber; Ctx *fctx; long long gen; } Retired;
 static Retired *g_ret; static int g_ret_n, g_ret_cap; static SRWLOCK g_ret_lock = SRWLOCK_INIT;
 static volatile LONG64 g_fib_made, g_fib_deleted;
-int (*g_r1_fibers_pinned)(void);                      /* r1_state.c: 1 while a saved state that holds host fibers may still be loaded */
+long long (*g_r1_fibers_keep_from)(void);             /* r1_state.c: the oldest capture generation that may still be loaded (LLONG_MAX: none, 0: keep all) */
+static volatile LONG64 g_fib_capgen;                  /* captures of the fibers so far */
+long long os_fibers_captured(void) { return InterlockedIncrement64(&g_fib_capgen); }      /* r1_state.c fibers_save */
+long long os_fibers_capgen(void) { return g_fib_capgen; }                               /* r1_ring.c: a slot's stamp */
 #ifdef _WIN32
 static uint8_t *volatile g_fteb[1024]; static volatile LONG g_nfteb;      /* TEBs of the threads that run fibers (NT_TIB +0x20: the fiber now) */
 static __declspec(thread) LONG t_fteb = -1;
@@ -710,11 +715,12 @@ static void fteb_gone(void) {}
 static int fiber_running(void *f) { (void)f; return 0; }
 #endif
 void os_fibers_flush(void) {                          /* every retired host fiber that no saved state can need and no thread runs: deleted */
-    if (g_r1_fibers_pinned && g_r1_fibers_pinned()) return;
+    long long from = g_r1_fibers_keep_from ? g_r1_fibers_keep_from() : LLONG_MAX;
+    if (from <= 0) return;
     AcquireSRWLockExclusive(&g_ret_lock);
     int k = 0;
     for (int i = 0; i < g_ret_n; i++) {
-        if (fiber_running(g_ret[i].fiber)) { g_ret[k++] = g_ret[i]; continue; }
+        if (g_ret[i].gen >= from || fiber_running(g_ret[i].fiber)) { g_ret[k++] = g_ret[i]; continue; }      /* a slot captured before it retired may load it */
         DeleteFiber(g_ret[i].fiber);
         if (g_ret[i].fctx) _aligned_free(g_ret[i].fctx);
         g_fib_deleted++;
@@ -725,10 +731,11 @@ void os_fibers_flush(void) {                          /* every retired host fibe
 static void fib_retire(void *fiber, Ctx *fctx) {
     if (!fiber) return;
     AcquireSRWLockExclusive(&g_ret_lock);
-    int dup = 0; for (int i = 0; i < g_ret_n; i++) if (g_ret[i].fiber == fiber) dup = 1;
+    long long gen = g_fib_capgen;                     /* captures up to this one may hold it */
+    int dup = 0; for (int i = 0; i < g_ret_n; i++) if (g_ret[i].fiber == fiber) { dup = 1; if (gen > g_ret[i].gen) g_ret[i].gen = gen; }
     if (!dup) {
         if (g_ret_n == g_ret_cap) { int nc = g_ret_cap ? g_ret_cap * 2 : 256; Retired *nr = realloc(g_ret, (size_t)nc * sizeof *nr); if (nr) { g_ret = nr; g_ret_cap = nc; } }
-        if (g_ret_n < g_ret_cap) { g_ret[g_ret_n].fiber = fiber; g_ret[g_ret_n].fctx = fctx; g_ret_n++; }
+        if (g_ret_n < g_ret_cap) { g_ret[g_ret_n].fiber = fiber; g_ret[g_ret_n].fctx = fctx; g_ret[g_ret_n].gen = gen; g_ret_n++; }
     }
     ReleaseSRWLockExclusive(&g_ret_lock);
     os_fibers_flush();
