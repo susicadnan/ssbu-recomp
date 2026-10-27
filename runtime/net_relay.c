@@ -109,7 +109,7 @@ static uint64_t rnd64(void) {
 }
 
 /* ---------------------------------------------------------------- configuration */
-static int g_cfg = -1, g_log = 1, g_direct = 1;
+static int g_cfg = -1, g_log = 1, g_direct = 1, g_dup;      /* g_dup (resp1): online_redundant = on: each game datagram on a direct path is sent twice */
 extern int g_game_build;             /* hostrt.c: 0 = 13.0.4, 1 = 13.0.5 (hostrt.h GAME_13_0_*), -1 before main.elf is read */
 static char g_server[256], g_name[NAME_LEN + 1], g_code[NAME_LEN + 1] = "ado-netplay"      /* (net4) this build's own lobby code: only players with this exe meet (online_code overrides) */, g_build[BUILD_LEN + 1] = NET_BUILD_DEFAULT;
 static uint16_t g_local_port;
@@ -342,6 +342,11 @@ static void configure(void) {
     else if (ini_value("online_code", v, sizeof v) && *v) snprintf(g_code, sizeof g_code, "%s", v);
     if ((e = getenv("SSBU_ONLINE_DIRECT"))) g_direct = !is_off(e);
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
+    /* (resp1, 2026-10-26) the game's own online netcode (3-player rooms, and 1v1 without rollback) waits for a lost datagram;
+     * on a lossy link (mobile internet) a second copy of each one hides most single losses, at twice the (small) traffic.
+     * Off by default until tested in real matches: the game's netcode is expected to drop the copy as a duplicate. */
+    if ((e = getenv("SSBU_ONLINE_REDUNDANT"))) g_dup = !is_off(e);
+    else if (ini_value("online_redundant", v, sizeof v)) g_dup = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
     if ((e = getenv("SSBU_ONLINE_LOG"))) g_log = atoi(e);
     else if (ini_value("online_log", v, sizeof v) && v[0] >= '0' && v[0] <= '3') g_log = atoi(v);      /* (net4) graphics.ini online_log = 0..3 (2: every room message) */
@@ -365,6 +370,7 @@ static void configure(void) {
     static const char *mode_names[] = {"lobby", "lan (no server)", "host (no server)", "join (no server)"};
     printf("[online] on: mode %s%s, lobby %s, code %s, name %s, direct paths %s, build %s\n", mode_names[g_mode], g_auto ? " (auto)" : "",
            g_mode == NET_MODE_LOBBY ? g_server : g_mode == NET_MODE_JOIN ? g_join : "inside this game", g_code, g_name, g_direct ? "allowed" : "off", g_build);
+    if (g_dup) printf("[online] online_redundant = on: game datagrams on a direct path are sent twice\n");
     printf("[online] mods: %s; rooms of other builds %s\n", g_mods_text, g_list_other ? "shown in the game's list (joining them is refused, with the reason)" : "only in F1 > Online");
     fflush(stdout);
 }
@@ -764,6 +770,7 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
         hdr(h, T_DIRECT);
         s64(h + 4, direct[i].secret);
         tx(h, n + 12, &direct[i].at);
+        if (g_dup) tx(h, n + 12, &direct[i].at);
         InterlockedIncrement64(&g_out_direct);
     }
     if (!nd || bcast) {                         /* a broadcast also reaches the room's players not reached directly: the lobby sends it on */
