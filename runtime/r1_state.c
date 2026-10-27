@@ -1493,6 +1493,9 @@ void r1_mem_audit(const char *when) {
     MEMORYSTATUSEX ms; ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
     LOG("r1: MEMORY AUDIT (%s): private %.0f MB, working set %.0f MB, committed in this process %.0f MB (private %.0f MB) over %d regions; free commit on the PC %.0f MB\n",
         when, pm.PrivateUsage / 1048576.0, pm.WorkingSetSize / 1048576.0, tot_commit / 1048576.0, tot_priv / 1048576.0, regions, ms.ullAvailPageFile / 1048576.0);
+    {   void os_fibers_stats(long long *made, long long *deleted, int *waiting); long long fm = 0, fd = 0; int fw = 0; os_fibers_stats(&fm, &fd, &fw);
+        int f256 = 0; for (int i = 0; i < n; i++) if (recs[i].reserve == (256ull << 20) && recs[i].commit <= (2ull << 20)) f256++;
+        LOG("r1:   host fibers: %lld made, %lld deleted, %d retired and kept for a possible load; %d allocations look like a fiber stack (256 MB reserved, <= 2 MB committed)\n", fm, fd, fw, f256); }
     for (int i = 0; i < n && i < 12; i++)
         LOG("r1:   %p: %.0f MB committed of %.0f MB reserved, protection %lx %s\n", (void *)recs[i].base, recs[i].commit / 1048576.0, recs[i].reserve / 1048576.0, (unsigned long)recs[i].prot, ma_label(recs[i].base));
 }
@@ -2398,6 +2401,12 @@ void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) {
     if (g_phase == 1 && g_npad < 8192) { PadRec r = {*b, *lx, *ly, *rx, *ry}; g_pad[g_npad++] = r; }
     else if (g_phase == 2 && g_ipad < g_npad) { PadRec r = g_pad[g_ipad++]; *b = r.b; *lx = r.lx; *ly = r.ly; *rx = r.rx; *ry = r.ry; }
 }
+/* (2026-10-27) os_threads.c: a retired host fiber (its guest fiber finalized or given another one) is deleted only while
+ * no saved state that may hold it can be loaded: a ring with captures (or threads kept for a load), the live pre-base,
+ * run-ahead between its save and restore, the SSBU_R1 test's save. Room fights without the ring: deleted at once. */
+static int r1_fibers_pinned(void) {
+    return g_rg_count > 0 || g_rg_kept || (g_rbg_in_match == 1 && g_rg_ready && !g_rbg_noring) || g_live_state == 1 || g_live_state == 2 || g_ra_phase == 1 || g_phase == 1 || g_phase == 2;
+}
 void r1_init(void) {
     if (!r1_on()) return;
     if (getenv("SSBU_R1_PARK_MS")) g_park_ms = atoi(getenv("SSBU_R1_PARK_MS"));
@@ -2407,7 +2416,7 @@ void r1_init(void) {
     g_mark = getenv("SSBU_R1_MARK") != NULL;
     g_prot = getenv("SSBU_R1_MARK_PROT") != NULL; if (g_prot) AddVectoredExceptionHandler(1, prot_veh); g_mcheck = getenv("SSBU_R1_MARK_CHECK") != NULL; if (g_mark && !mark_bind()) g_mark = 0;
     g_fast = getenv("SSBU_R1_FAST") != NULL; g_fcheck = getenv("SSBU_R1_FAST_CHECK") != NULL; if (getenv("SSBU_R1_LEARN")) g_learn = atoi(getenv("SSBU_R1_LEARN"));
-    g_r1_keep_fibers = 1; g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
+    g_r1_keep_fibers = 1; { extern int (*g_r1_fibers_pinned)(void); g_r1_fibers_pinned = r1_fibers_pinned; } g_wait_idle = getenv("SSBU_R1_WAIT_IDLE") != NULL; g_busy_log = g_wait_idle ? 3 : 0;
     ls_init();                                          /* R4: the presentation pool of the learned-set save */
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);

@@ -550,6 +550,7 @@ static void rbg_fight_off(void) {
     g_rbg_wd_before = g_ra_wd_fired;
     g_rbg_pend = 0;
     rbn_match_reset();
+    { void os_fibers_flush(void); os_fibers_flush(); }      /* (2026-10-27) the host fibers the ring kept for a load: deleted now */
 }
 static int cmp_f(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 static void rbg_dist(const char *what, const float *v, int n, const unsigned char *kk, int want) {
