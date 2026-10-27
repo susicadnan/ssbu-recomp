@@ -1389,6 +1389,11 @@ static void draw_stats(void) {
     ImGui::Begin("##stats", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                  ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("%.0f fps  %.2f ms", avg > 0 ? 1000.0f / avg : 0.0f, avg);
+    {   /* (2026-10-27, the owner: "an ID that verifies that we are all on the same build in the F2 menu") this exe's build id,
+         * with its link stamp (net_relay.c): players compare the 6 hex digits; a room of another exe cannot be joined anyway */
+        const char *b = net_build_id(); const char *dot = strchr(b, '.'); const char *dash = dot ? strchr(dot, '-') : NULL;
+        if (dot && dash && dash - dot - 1 == 6) ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1), "build %.6s  (%s)", dot + 1, dash + 1);
+        else ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1), "build %s", b); }
     static const char *const st[] = {"Offline", "Connecting...", "Online - connected", "Disconnected"};
     ImVec4 col = ns.state == NET_CONNECTED ? ImVec4(0.45f, 0.9f, 0.45f, 1) : ns.state == NET_CONNECTING ? ImVec4(1, 0.8f, 0.2f, 1) : ns.state == NET_DISCONNECTED ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.7f, 0.7f, 0.7f, 1);
     if (ns.state == NET_CONNECTED) ImGui::TextColored(col, "%s (%d players)", st[2], ns.players);
