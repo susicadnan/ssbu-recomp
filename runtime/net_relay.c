@@ -61,6 +61,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include "net_relay.h"
 #include "net_stats.h"
 #include "gfx_options.h"
@@ -278,6 +281,18 @@ static int g_mode, g_auto, g_upnp = 1, g_list_other = 1;     /* g_list_other: on
 static uint16_t g_host_port;                    /* HOST mode: the in-game lobby's UDP port (default 39500) */
 static char g_join[64], g_peer[256], g_stun[128] = "stun.l.google.com:19302";
 
+/* (resp1) the low 24 bits of this exe's link stamp (rb_net.c exe_stamp: the PE header; POSIX: the file's modification time) */
+static uint32_t exe_stamp24(void) {
+#ifdef _WIN32
+    const uint8_t *m = (const uint8_t *)GetModuleHandleA(NULL); if (!m) return 0;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(m + ((const IMAGE_DOS_HEADER *)m)->e_lfanew);
+    return nt->FileHeader.TimeDateStamp & 0xffffffu;
+#else
+    char p[MAX_PATH]; struct stat st;
+    DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
+    return n && n < MAX_PATH && !stat(p, &st) ? (uint32_t)st.st_mtime & 0xffffffu : 0;
+#endif
+}
 static void configure(void) {
     if (g_cfg >= 0) return;
     char v[256] = "", mode[64] = "";
@@ -334,6 +349,11 @@ static void configure(void) {
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
     else {
         size_t l = strlen(g_build);
+        /* (resp1, 2026-10-26: a friend's join of a room was accepted and then left by his game 20 s later, every time; the
+         * label was the same, the exes maybe not) this exe's link stamp is part of the label: rooms of another exe are listed
+         * with the reason and cannot be joined. 6 hex digits keep a label with mods within BUILD_LEN. */
+        { uint32_t st = exe_stamp24(); if (st) snprintf(g_build + l, sizeof g_build - l, ".%06x", (unsigned)st); }
+        l = strlen(g_build);
         if (g_game_build >= 0)         /* players of 13.0.4 and 13.0.5 never share a room: the lobby and the LAN lobby part rooms by build */
             snprintf(g_build + l, sizeof g_build - l, "-%s", g_game_build == 1 ? "13.0.5" : "13.0.4");
         l = strlen(g_build);
@@ -787,6 +807,8 @@ static uint64_t g_rooms_sent, g_rooms_at;
 static struct { uint32_t ip; char build[BUILD_LEN + 1]; } g_other[24];   /* the last game list's rooms of other builds */
 static int g_nother;
 
+/* "ssbu-recomp-ldn1.6adfa7-13.0.5" -> length of "ssbu-recomp-ldn1" (the label's name without this exe's stamp) */
+static int build_name_len(const char *b) { const char *dot = strchr(b, '.'), *dash = strchr(b + (strlen(b) > 12 ? 12 : 0), '-'); return (int)(dot && (!dash || dot < dash) ? dot - b : dash ? dash - b : (ptrdiff_t)strlen(b)); }
 static const char *build_version(const char *b, char *out, size_t n) {   /* "ssbu-recomp-ldn1-13.0.5+m..." -> "13.0.5" */
     const char *plus = strchr(b, '+'), *end = plus ? plus : b + strlen(b), *dash = end;
     while (dash > b && dash[-1] != '-') dash--;
@@ -824,6 +846,8 @@ static int room_why(const char *b, int known, const ModEntry *m, int nm, char *o
         build_version(b, theirs, sizeof theirs); build_version(g_build, mine, sizeof mine);
         if (theirs[0] && mine[0] && strcmp(theirs, mine) && !strncmp(b, g_build, (size_t)(build_base_len(b) - (int)strlen(theirs))))
             snprintf(out, n, "Different version: this room is %s, you have %s", theirs, mine);
+        else if (theirs[0] && !strcmp(theirs, mine) && build_name_len(b) == build_name_len(g_build) && !strncmp(b, g_build, (size_t)build_name_len(b)))
+            snprintf(out, n, "Different exe: this room's game runs another ssbu_native.exe than yours (both players need the same one: copy the host's build\\work\\ssbu_native.exe)");
         else snprintf(out, n, "Different game build: this room is %.*s, you have %.*s", build_base_len(b), b, build_base_len(g_build), g_build);
         return 1;
     }
