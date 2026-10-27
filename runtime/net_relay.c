@@ -109,6 +109,7 @@ static uint64_t rnd64(void) {
 }
 
 /* ---------------------------------------------------------------- configuration */
+#define DUP_MS 4
 static int g_cfg = -1, g_log = 1, g_direct = 1, g_dup;      /* g_dup (resp1): online_redundant = on: each game datagram on a direct path is sent twice */
 extern int g_game_build;             /* hostrt.c: 0 = 13.0.4, 1 = 13.0.5 (hostrt.h GAME_13_0_*), -1 before main.elf is read */
 static char g_server[256], g_name[NAME_LEN + 1], g_code[NAME_LEN + 1] = "ado-netplay"      /* (net4) this build's own lobby code: only players with this exe meet (online_code overrides) */, g_build[BUILD_LEN + 1] = NET_BUILD_DEFAULT;
@@ -344,7 +345,10 @@ static void configure(void) {
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
     /* (resp1, 2026-10-26) the game's own online netcode (3-player rooms, and 1v1 without rollback) waits for a lost datagram;
      * on a lossy link (mobile internet) a second copy of each one hides most single losses, at twice the (small) traffic.
-     * Off by default until tested in real matches: the game's netcode is expected to drop the copy as a duplicate. */
+     * (2026-10-27) ON by default: the copy goes DUP_MS later (a burst loss on Wi-Fi / mobile takes both copies sent together),
+     * and the receiving game drops it when the first one came (dup_seen), so the game never sees a duplicate.
+     * online_redundant = off: one copy. */
+    g_dup = 1;
     if ((e = getenv("SSBU_ONLINE_REDUNDANT"))) g_dup = !is_off(e);
     else if (ini_value("online_redundant", v, sizeof v)) g_dup = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
@@ -370,7 +374,7 @@ static void configure(void) {
     static const char *mode_names[] = {"lobby", "lan (no server)", "host (no server)", "join (no server)"};
     printf("[online] on: mode %s%s, lobby %s, code %s, name %s, direct paths %s, build %s\n", mode_names[g_mode], g_auto ? " (auto)" : "",
            g_mode == NET_MODE_LOBBY ? g_server : g_mode == NET_MODE_JOIN ? g_join : "inside this game", g_code, g_name, g_direct ? "allowed" : "off", g_build);
-    if (g_dup) printf("[online] online_redundant = on: game datagrams on a direct path are sent twice\n");
+    if (g_dup) printf("[online] online_redundant = on: game datagrams on a direct path are sent twice, the copy %d ms later (duplicates dropped on arrival)\n", DUP_MS);
     printf("[online] mods: %s; rooms of other builds %s\n", g_mods_text, g_list_other ? "shown in the game's list (joining them is refused, with the reason)" : "only in F1 > Online");
     fflush(stdout);
 }
@@ -403,6 +407,8 @@ static volatile LONG64 g_rb_out_relay, g_rb_out_direct, g_rb_in_relay, g_rb_in_d
  * (T-Mobile's carrier NAT / 464XLAT) often drop fragments: such a player gets the small datagrams and never the big ones */
 #define BIG_DGRAM 1200
 static volatile LONG64 g_big_out, g_big_in; static volatile LONG g_max_out, g_max_in;
+static int g_bcast_skip = -1; static volatile LONG64 g_bcast_saved;
+int nnldn_players(void);
 static void note_size(volatile LONG64 *big, volatile LONG *mx, int n) {
     if (n > BIG_DGRAM) InterlockedIncrement64(big);
     for (LONG m = *mx; n > m; m = *mx) if (InterlockedCompareExchange(mx, n, m) == m) break;
@@ -476,6 +482,59 @@ static void sim_init(void) {                           /* (net_start, before the
         HANDLE th = CreateThread(NULL, 0, sim_thread, NULL, 0, NULL); if (th) CloseHandle(th); else g_sim = 0;
         printf("[online] TEST: link simulation on: +%.1f ms per datagram sent (+0..%.1f jitter), %.1f %% lost\n", g_sim_ms, g_sim_jit, g_sim_loss); fflush(stdout);
     }
+}
+static void tx(const void *p, int n, const struct sockaddr_in *to);
+/* (2026-10-27) online_redundant: the second copy of a direct game datagram, DUP_MS later, from its own thread */
+typedef struct DupPkt { struct DupPkt *next; double due; int n; struct sockaddr_in to; uint8_t b[]; } DupPkt;
+static DupPkt *g_dup_head, *g_dup_tail; static SRWLOCK g_dup_lock = SRWLOCK_INIT; static CONDITION_VARIABLE g_dup_cv = CONDITION_VARIABLE_INIT;
+static int g_dup_thread; static volatile LONG64 g_dup_sent, g_dup_dropped_rx;
+static double dup_now(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+static DWORD WINAPI dup_thread(LPVOID u) {
+    (void)u;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+    for (;;) {
+        AcquireSRWLockExclusive(&g_dup_lock);
+        while (!g_dup_head) SleepConditionVariableSRW(&g_dup_cv, &g_dup_lock, INFINITE, 0);
+        DupPkt *q = g_dup_head; double now = dup_now();
+        if (now >= q->due) { g_dup_head = q->next; if (!g_dup_head) g_dup_tail = NULL; }
+        ReleaseSRWLockExclusive(&g_dup_lock);
+        if (now < q->due) {
+            double left = q->due - now;
+            if (tm) { LARGE_INTEGER d; d.QuadPart = -(LONGLONG)(left * 10000.0); SetWaitableTimer(tm, &d, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, 50); }
+            else Sleep(1);
+            continue;
+        }
+        tx(q->b, q->n, &q->to); InterlockedIncrement64(&g_dup_sent);
+        free(q);
+    }
+    return 0;
+}
+static void dup_later(const void *p, int n, const struct sockaddr_in *to) {
+    if (!g_dup_thread) {
+        AcquireSRWLockExclusive(&g_dup_lock);
+        if (!g_dup_thread) { HANDLE th = CreateThread(NULL, 0, dup_thread, NULL, 0, NULL); g_dup_thread = th ? 1 : -1; if (th) CloseHandle(th); }
+        ReleaseSRWLockExclusive(&g_dup_lock);
+    }
+    if (g_dup_thread < 0) { tx(p, n, to); return; }
+    DupPkt *q = malloc(sizeof *q + (size_t)n);
+    if (!q) return;
+    q->next = NULL; q->n = n; q->to = *to; q->due = dup_now() + DUP_MS; memcpy(q->b, p, (size_t)n);
+    AcquireSRWLockExclusive(&g_dup_lock);
+    if (g_dup_tail) g_dup_tail->next = q; else g_dup_head = q;
+    g_dup_tail = q;
+    ReleaseSRWLockExclusive(&g_dup_lock);
+    WakeConditionVariable(&g_dup_cv);
+}
+/* (receive thread only) a direct game datagram identical to one from the same address in the last DUP_SEEN_MS: the copy */
+#define DUP_SEEN_MS 30.0      /* (a match clears the entry: the next identical datagram of the game, a frame later, is not taken for a copy) */
+static int dup_seen(const struct sockaddr_in *from, const uint8_t *p, int n) {
+    static struct { uint64_t h; double at; } seen[128]; static int next;
+    uint64_t h = fnv64(fnv64(0xcbf29ce484222325ull, &from->sin_addr, 4), &from->sin_port, 2); h = fnv64(h, p, (size_t)n);
+    double t = dup_now();
+    for (int i = 0; i < 128; i++) if (seen[i].h == h && t - seen[i].at < DUP_SEEN_MS) { seen[i].at = 0; InterlockedIncrement64(&g_dup_dropped_rx); return 1; }
+    seen[next].h = h; seen[next].at = t; next = (next + 1) & 127;
+    return 0;
 }
 static void tx(const void *p, int n, const struct sockaddr_in *to) {
     if (g_sim <= 0) { tx_now(p, n, to); return; }
@@ -634,7 +693,7 @@ static void read_peers(const uint8_t *p, int n) {               /* PEERS body */
 
 static void peers_tick(uint64_t t) {
     static uint64_t last_report;
-    char lines[2 * MAX_PEERS][160];
+    char lines[2 * MAX_PEERS][400];
     int nl = 0;
     AcquireSRWLockExclusive(&g_peers_lock);
     for (int i = 0; i < g_npeers; i++) {
@@ -654,8 +713,8 @@ static void peers_tick(uint64_t t) {
     }
     if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct || g_rb_out_relay || g_rb_out_direct)) {
         last_report = t;
-        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s; datagrams over %d bytes out %lld (largest %ld), in %lld (largest %ld)",
-                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_in_relay, (long long)g_in_direct,
+        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct (broadcasts not copied to the lobby %lld, second copies %lld), in %lld copies dropped, %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s; datagrams over %d bytes out %lld (largest %ld), in %lld (largest %ld)",
+                 (long long)g_out_relay, (long long)g_out_direct, (long long)g_bcast_saved, (long long)g_dup_sent, (long long)g_dup_dropped_rx, (long long)g_in_relay, (long long)g_in_direct,
                  (long long)g_rb_out_relay, (long long)g_rb_out_direct, (long long)g_rb_in_relay, (long long)g_rb_in_direct, g_npeers,
                  g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "",
                  BIG_DGRAM, (long long)g_big_out, (long)g_max_out, (long long)g_big_in, (long)g_max_in);
@@ -689,6 +748,7 @@ static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from)
     if (n < 12) return;
     uint64_t secret = g64(p + 4);
     if (p[3] == T_DIRECT && n >= 12 + 12) {
+        if (dup_seen(from, p, n)) return;
         const uint8_t *b = p + 12;
         uint32_t src = g32(b), dst = g32(b + 4);
         uint16_t sport = g16(b + 8), dport = g16(b + 10);
@@ -762,7 +822,8 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
     uint8_t *body = buf + HEAD_ROOM, *h;
     s32(body, src); s32(body + 4, dst); s16(body + 8, sport); s16(body + 10, dport);
     memcpy(body + 12, data, len);
-    note_size(&g_big_out, &g_max_out, (int)len + 12 + 12 + 28);      /* (as on the wire: our 12 + 12 bytes, IP + UDP 28) */
+    note_size(&g_big_out, &g_max_out, (int)len + 12 + 12 + 28);
+    if (g_bcast_skip < 0) { const char *e = getenv("SSBU_ONLINE_BCAST_LOBBY"); g_bcast_skip = !(e && e[0] == '1'); }      /* (as on the wire: our 12 + 12 bytes, IP + UDP 28) */
     int n = 12 + (int)len, bcast = dst == VNET_BROADCAST || dst == 0xFFFFFFFFu, nd = 0;
     struct { struct sockaddr_in at; uint64_t secret; uint32_t ip; } direct[MAX_PEERS];
     if (sport != VNET_LDN_PORT && dport != VNET_LDN_PORT) {
@@ -780,10 +841,18 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
         hdr(h, T_DIRECT);
         s64(h + 4, direct[i].secret);
         tx(h, n + 12, &direct[i].at);
-        if (g_dup) tx(h, n + 12, &direct[i].at);
+        if (g_dup) dup_later(h, n + 12, &direct[i].at);
         InterlockedIncrement64(&g_out_direct);
     }
-    if (!nd || bcast) {                         /* a broadcast also reaches the room's players not reached directly: the lobby sends it on */
+    int all_direct = 0;
+    if (bcast && nd && g_bcast_skip) {          /* (2026-10-27) every other player of the room reached directly: no copy through the lobby
+                                                 * (~35 datagrams a second per player in a fight went there for nobody). SSBU_ONLINE_BCAST_LOBBY=1: always */
+        int players = nnldn_players(), room = 0;
+        for (int i = 0; i < nd; i++) room += nnldn_has_node(direct[i].ip) != 0;
+        all_direct = players >= 2 && room >= players - 1;
+        if (all_direct) InterlockedIncrement64(&g_bcast_saved);
+    }
+    if (!nd || (bcast && !all_direct)) {        /* a broadcast also reaches the room's players not reached directly: the lobby sends it on */
         if (nd) {
             h = body - (5 + 4 * nd);
             hdr(h, T_BCAST);

@@ -585,7 +585,38 @@ static void ldn_SetWirelessControllerRestriction(Ctx *c) { RET(0); }
 enum { E_BADF = 9, E_AGAIN = 11, E_INVAL = 22, E_MFILE = 24, E_DESTADDRREQ = 89, E_MSGSIZE = 90, E_NOPROTOOPT = 92,
        E_PROTONOSUPPORT = 93, E_OPNOTSUPP = 95, E_AFNOSUPPORT = 97, E_ADDRINUSE = 98, E_ADDRNOTAVAIL = 99,
        E_NETUNREACH = 101, E_NOTCONN = 107, E_CONNREFUSED = 111 };
-typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; uint8_t data[]; } Dgram;
+typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; double at; uint8_t data[]; } Dgram;
+/* (2026-10-27) where the game's own netcode waits: per player of the room, the gaps between its game datagrams (a gap of
+ * 50 ms and more in a fight = a late or lost datagram the game waited for), and how long datagrams sat queued before the
+ * game read them (long = this PC's game was busy). A line a minute while datagrams flow. */
+static SRWLOCK vs_lock;                    /* (defined below) */
+static double qpc_ms(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+typedef struct { uint32_t ip; double last; long long n, g50, g100, g250; double gmax; } GapStat;
+static GapStat vs_gap[8]; static double vs_gap_since; static long long vs_age_n, vs_age_h[4]; static double vs_age_max;      /* (age: under vs_lock) */
+static void gap_note(uint32_t src, double t) {          /* (receive thread only) */
+    int k = -1;
+    for (int i = 0; i < 8; i++) if (vs_gap[i].ip == src) { k = i; break; }
+    if (k < 0) for (int i = 0; i < 8; i++) if (!vs_gap[i].ip) { k = i; vs_gap[i].ip = src; vs_gap[i].last = 0; break; }
+    if (k < 0) return;
+    GapStat *g = &vs_gap[k];
+    if (g->last > 0) { double d = t - g->last; if (d < 2000) { if (d >= 50) g->g50++; if (d >= 100) g->g100++; if (d >= 250) g->g250++; if (d > g->gmax) g->gmax = d; } }
+    g->last = t; g->n++;
+    if (!vs_gap_since) vs_gap_since = t;
+    if (t - vs_gap_since >= 60000) {
+        char line[900]; int o = snprintf(line, sizeof line, "[online] ldn: game datagrams, last %.0f s:", (t - vs_gap_since) / 1000.0);
+        for (int i = 0; i < 8; i++) if (vs_gap[i].ip && vs_gap[i].n) { char a[16]; ip_str(vs_gap[i].ip, a);
+            o += snprintf(line + o, sizeof line - (size_t)o, " from %s %lld, gaps >=50 ms %lld, >=100 %lld, >=250 %lld, longest %.0f ms;", a, vs_gap[i].n, vs_gap[i].g50, vs_gap[i].g100, vs_gap[i].g250, vs_gap[i].gmax);
+            if (o >= (int)sizeof line) break; }
+        AcquireSRWLockExclusive(&vs_lock);
+        long long an = vs_age_n, h0 = vs_age_h[0], h1 = vs_age_h[1], h2 = vs_age_h[2], h3 = vs_age_h[3]; double amax = vs_age_max;
+        vs_age_n = 0; memset(vs_age_h, 0, sizeof vs_age_h); vs_age_max = 0;
+        ReleaseSRWLockExclusive(&vs_lock);
+        if (o < (int)sizeof line) snprintf(line + o, sizeof line - (size_t)o, " read by the game %lld: within 1 ms %lld, 1-8 ms %lld, 8-17 ms %lld, later %lld (longest %.0f ms)", an, h0, h1, h2, h3, amax);
+        if (LOGL(1)) printf("%s\n", line);
+        for (int i = 0; i < 8; i++) { uint32_t ip = vs_gap[i].ip; double last = vs_gap[i].last; memset(&vs_gap[i], 0, sizeof vs_gap[i]); if (t - last < 5000) { vs_gap[i].ip = ip; vs_gap[i].last = last; } }
+        vs_gap_since = t;
+    }
+}
 typedef struct {
     int open, type, flags, nonblock, reuse, shut_rd, shut_wr;
     uint32_t ip, peer_ip, rcvtimeo, rcvbuf, sndbuf;
@@ -702,7 +733,8 @@ static void replay(uint16_t port) {                     /* a socket has this por
 }
 void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
     if (dport == VNET_LDN_PORT) { if (sport == VNET_LDN_PORT) ldn_receive(src, data, len); return; }
-    if (src != LOOPBACK && src != net_my_ip()) heard_from(src);
+    double now = qpc_ms();
+    if (src != LOOPBACK && src != net_my_ip()) { heard_from(src); gap_note(src, now); }
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST, got = 0;
     AcquireSRWLockExclusive(&vs_lock);
     for (int i = 0; i < VS_MAX; i++) {
@@ -713,7 +745,7 @@ void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, c
         if (s->count >= 1024 || s->bytes + len > (1u << 20)) { InterlockedIncrement64(&vs_full); vs_full_src = src; vs_full_port = dport; continue; }      /* full: dropped, as a LAN would */
         Dgram *d = malloc(sizeof *d + len);
         if (!d) continue;
-        d->next = NULL; d->src = src; d->sport = sport; d->len = len;
+        d->next = NULL; d->src = src; d->sport = sport; d->len = len; d->at = now;
         memcpy(d->data, data, len);
         if (s->tail) s->tail->next = d; else s->head = d;
         s->tail = d;
@@ -839,6 +871,10 @@ static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint6
     uint32_t n = d->len < len ? d->len : (uint32_t)len, ip = d->src;
     uint16_t port = d->sport;
     memcpy(PTR(buf), d->data, n);
+    if (!(flags & 2) && d->src != LOOPBACK) {
+        double age = qpc_ms() - d->at;
+        vs_age_n++; vs_age_h[age < 1 ? 0 : age < 8 ? 1 : age < 17 ? 2 : 3]++; if (age > vs_age_max) vs_age_max = age;
+    }
     if (!(flags & 2)) {
         s->head = d->next;
         if (!s->head) s->tail = NULL;
