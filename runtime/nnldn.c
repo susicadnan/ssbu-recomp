@@ -105,7 +105,7 @@ static volatile LONG64 vs_in, vs_out;
 /* (resp1, 2026-10-26: a friend's game joined rooms, traffic flowed both ways, and 20 s later the GAME left: "ldn: state 5
  * -> 4", nothing else) game datagrams that found no socket (port, address or connected peer not matching) or a full queue,
  * and the last one of each, so the line at the game's own Disconnect says what it did not get */
-static volatile LONG64 vs_nosock, vs_full;
+static volatile LONG64 vs_nosock, vs_full, vs_held_n, vs_replayed_n;      /* (held / replayed: see hold()) */
 static uint32_t vs_nosock_src, vs_full_src; static uint16_t vs_nosock_port, vs_nosock_sport, vs_full_port;
 static uint64_t vs_joined_at; static LONG64 vs_in_at_join, vs_out_at_join, vs_nosock_at_join, vs_full_at_join;
 static void set_state(int s) {            /* (lock held) */
@@ -482,9 +482,9 @@ static void ldn_Disconnect(Ctx *c) {
         ldn_msg(u32at(L.net + NODE(0)), M_LEAVE, L.net + NI_SESSION, 16);
         if (LOGL(1)) {                    /* (resp1) the game itself leaves the room: what it got while it was in it */
             char a[16], b[16]; ip_str(vs_nosock_src, a); ip_str(vs_full_src, b);
-            printf("[online] ldn: the game leaves the room after %.1f s: game datagrams in %lld, out %lld; with no socket %lld (last from %s:%u to port %u), queue full %lld (last from %s to port %u); host last heard %.1f s ago\n",
+            printf("[online] ldn: the game leaves the room after %.1f s: game datagrams in %lld, out %lld; with no socket %lld (last from %s:%u to port %u), queue full %lld (last from %s to port %u); host last heard %.1f s ago; held for a socket not open yet %lld, given to it later %lld\n",
                    (double)(ms_now() - vs_joined_at) / 1000.0, (long long)(vs_in - vs_in_at_join), (long long)(vs_out - vs_out_at_join), (long long)(vs_nosock - vs_nosock_at_join), a, vs_nosock_sport, vs_nosock_port,
-                   (long long)(vs_full - vs_full_at_join), b, vs_full_port, (double)(ms_now() - L.host_heard) / 1000.0);
+                   (long long)(vs_full - vs_full_at_join), b, vs_full_port, (double)(ms_now() - L.host_heard) / 1000.0, (long long)vs_held_n, (long long)vs_replayed_n);
         }
         L.reason = DR_USER;
         set_state(LS_STA);
@@ -661,6 +661,45 @@ static void heard_from(uint32_t src) {
     else if (L.state == LS_AP_CREATED) { int i = node_index(src); if (i > 0) L.heard[i] = t; }
     ReleaseSRWLockExclusive(&L.lock);
 }
+/* (2026-10-27) a game datagram of another player for a port with no socket yet is HELD up to HOLD_MS and given to the
+ * socket bound to that port meanwhile. Joining a room, the host's first datagrams can arrive before the joiner's game has
+ * opened its socket (a LAN is ~1 ms, the internet 30-150 ms with bursts on mobile links): dropped, the joiner then waits for
+ * something that never comes again and leaves the room after 5-20 s (Retard's joins, 2026-10-25/26). SSBU_LDN_HOLD=0: off. */
+#define HOLD_MS 3000
+#define HOLD_N 64
+typedef struct { uint64_t at; uint32_t src, dst, len; uint16_t sport, dport; uint8_t *data; } Held;
+static Held vs_held[HOLD_N]; static int vs_nheld; static SRWLOCK vs_hold_lock = SRWLOCK_INIT;
+static int hold_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_LDN_HOLD"); on = !(e && e[0] == '0'); } return on; }
+static void hold(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
+    uint64_t t = ms_now();
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy) return;
+    memcpy(copy, data, len);
+    AcquireSRWLockExclusive(&vs_hold_lock);
+    int k = 0;
+    for (int i = 0; i < vs_nheld; i++) { if (t - vs_held[i].at < HOLD_MS) vs_held[k++] = vs_held[i]; else free(vs_held[i].data); }
+    vs_nheld = k;
+    if (vs_nheld == HOLD_N) { free(vs_held[0].data); memmove(vs_held, vs_held + 1, sizeof vs_held[0] * (HOLD_N - 1)); vs_nheld--; }
+    Held *h = &vs_held[vs_nheld++];
+    h->at = t; h->src = src; h->dst = dst; h->len = len; h->sport = sport; h->dport = dport; h->data = copy;
+    ReleaseSRWLockExclusive(&vs_hold_lock);
+    InterlockedIncrement64(&vs_held_n);
+}
+void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len);
+static void replay(uint16_t port) {                     /* a socket has this port now: the datagrams held for it, in order */
+    if (!port || !vs_nheld) return;
+    Held got[HOLD_N]; int n = 0, k = 0; uint64_t t = ms_now();
+    AcquireSRWLockExclusive(&vs_hold_lock);
+    for (int i = 0; i < vs_nheld; i++) {
+        if (vs_held[i].dport == port && t - vs_held[i].at < HOLD_MS) got[n++] = vs_held[i];
+        else if (t - vs_held[i].at < HOLD_MS) vs_held[k++] = vs_held[i];
+        else free(vs_held[i].data);
+    }
+    vs_nheld = k;
+    ReleaseSRWLockExclusive(&vs_hold_lock);
+    for (int i = 0; i < n; i++) { nnldn_deliver(got[i].src, got[i].sport, got[i].dst, got[i].dport, got[i].data, got[i].len); free(got[i].data); }
+    if (n) { InterlockedAdd64(&vs_replayed_n, n); if (LOGL(1)) printf("[online] ldn: %d datagram(s) held for port %u given to its new socket\n", n, port); }
+}
 void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const void *data, uint32_t len) {
     if (dport == VNET_LDN_PORT) { if (sport == VNET_LDN_PORT) ldn_receive(src, data, len); return; }
     if (src != LOOPBACK && src != net_my_ip()) heard_from(src);
@@ -685,7 +724,8 @@ void nnldn_deliver(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, c
     }
     ReleaseSRWLockExclusive(&vs_lock);
     if (got) { InterlockedIncrement64(&vs_in); WakeAllConditionVariable(&vs_cv); }
-    else if (src != LOOPBACK && src != net_my_ip()) { InterlockedIncrement64(&vs_nosock); vs_nosock_src = src; vs_nosock_port = dport; vs_nosock_sport = sport; }
+    else if (src != LOOPBACK && src != net_my_ip()) { InterlockedIncrement64(&vs_nosock); vs_nosock_src = src; vs_nosock_port = dport; vs_nosock_sport = sport;
+                                                      if (!bcast && hold_on()) hold(src, sport, dst, dport, data, len); }
     if (LOGL(3)) { char a[16], b[16]; ip_str(src, a); ip_str(dst, b); printf("[online] in %u bytes %s:%u -> %s:%u%s\n", len, a, sport, b, dport, got ? "" : " (no socket)"); }
 }
 
@@ -720,6 +760,7 @@ static void so_bind(Ctx *c) {
     if (!err && !port && !(port = free_port(s))) err = E_ADDRINUSE;
     if (!err) { s->ip = ip; s->port = port; }
     ReleaseSRWLockExclusive(&vs_lock);
+    if (!err) replay(port);
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] bind(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
     if (err) fail(c, err); else RET(0);
 }
@@ -730,8 +771,10 @@ static void so_connect(Ctx *c) {
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
     err = !s ? E_BADF : !read_sa(c->x[1], (uint32_t)c->x[2], &ip, &port) ? E_INVAL : s->type == 1 ? E_CONNREFUSED : 0;
-    if (!err) { if (!s->port) s->port = free_port(s); s->peer_ip = ip; s->peer_port = port; }
+    uint16_t newport = 0;
+    if (!err) { if (!s->port) newport = s->port = free_port(s); s->peer_ip = ip; s->peer_port = port; }
     ReleaseSRWLockExclusive(&vs_lock);
+    if (newport) replay(newport);
     if (LOGL(1)) { char a[16]; ip_str(ip, a); printf("[online] connect(%d, %s:%u) = %d\n", fd, a, port, err ? -err : 0); }
     if (err) fail(c, err); else RET(0);
 }
@@ -749,9 +792,11 @@ static void do_send(Ctx *c, int fd, uint64_t buf, uint64_t len, uint64_t addr, u
     else if (s->peer_port) { dst = s->peer_ip; dport = s->peer_port; }
     else err = E_DESTADDRREQ;
     if (!err && len > 65507) err = E_MSGSIZE;
+    int fresh_port = !err && !s->port;
     if (!err && !s->port && !(s->port = free_port(s))) err = E_ADDRINUSE;
     if (!err) sport = s->port;
     ReleaseSRWLockExclusive(&vs_lock);
+    if (!err && fresh_port) replay(sport);
     uint32_t me = net_my_ip();
     int bcast = dst == ALL_ONES || dst == VNET_BROADCAST;
     if (!err && !bcast && dst != LOOPBACK && dst != me && ((dst & VNET_MASK) != VNET_SUBNET || !me)) err = E_NETUNREACH;

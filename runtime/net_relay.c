@@ -399,6 +399,14 @@ static int g_loopback;
 static char g_reject[80];
 static volatile LONG64 g_out_relay, g_out_direct, g_in_relay, g_in_direct;
 static volatile LONG64 g_rb_out_relay, g_rb_out_direct, g_rb_in_relay, g_rb_in_direct;     /* (net4) rollback messages by path */
+/* (2026-10-27) game datagram sizes: one over ~1200 bytes is split into IP fragments on the way, and mobile carriers
+ * (T-Mobile's carrier NAT / 464XLAT) often drop fragments: such a player gets the small datagrams and never the big ones */
+#define BIG_DGRAM 1200
+static volatile LONG64 g_big_out, g_big_in; static volatile LONG g_max_out, g_max_in;
+static void note_size(volatile LONG64 *big, volatile LONG *mx, int n) {
+    if (n > BIG_DGRAM) InterlockedIncrement64(big);
+    for (LONG m = *mx; n > m; m = *mx) if (InterlockedCompareExchange(mx, n, m) == m) break;
+}
 
 enum { PS_PUNCHING, PS_DIRECT, PS_RELAYED };
 typedef struct {
@@ -646,10 +654,11 @@ static void peers_tick(uint64_t t) {
     }
     if (g_log >= 1 && t - last_report >= 10000 && (g_out_relay || g_out_direct || g_in_relay || g_in_direct || g_rb_out_relay || g_rb_out_direct)) {
         last_report = t;
-        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s",
+        snprintf(lines[nl++], sizeof lines[0], "traffic: out %lld relayed + %lld direct, in %lld relayed + %lld direct; rollback out %lld + %lld, in %lld + %lld; %d peer(s)%s; datagrams over %d bytes out %lld (largest %ld), in %lld (largest %ld)",
                  (long long)g_out_relay, (long long)g_out_direct, (long long)g_in_relay, (long long)g_in_direct,
                  (long long)g_rb_out_relay, (long long)g_rb_out_direct, (long long)g_rb_in_relay, (long long)g_rb_in_direct, g_npeers,
-                 g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "");
+                 g_npeers ? (fresh(&g_peers[0], t) ? ", first direct" : ", first relayed") : "",
+                 BIG_DGRAM, (long long)g_big_out, (long)g_max_out, (long long)g_big_in, (long)g_max_in);
     }
     ReleaseSRWLockExclusive(&g_peers_lock);
     for (int i = 0; i < nl; i++) say("%s", lines[i]);
@@ -753,6 +762,7 @@ void net_send(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, const 
     uint8_t *body = buf + HEAD_ROOM, *h;
     s32(body, src); s32(body + 4, dst); s16(body + 8, sport); s16(body + 10, dport);
     memcpy(body + 12, data, len);
+    note_size(&g_big_out, &g_max_out, (int)len + 12 + 12 + 28);      /* (as on the wire: our 12 + 12 bytes, IP + UDP 28) */
     int n = 12 + (int)len, bcast = dst == VNET_BROADCAST || dst == 0xFFFFFFFFu, nd = 0;
     struct { struct sockaddr_in at; uint64_t secret; uint32_t ip; } direct[MAX_PEERS];
     if (sport != VNET_LDN_PORT && dport != VNET_LDN_PORT) {
@@ -1556,6 +1566,7 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         int flen = sizeof from;
         int n = recvfrom(g_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n < 4 || buf[0] != 'S' || buf[1] != 'U' || buf[2] != PROTO) continue;
+        if (buf[3] == T_DIRECT || buf[3] == T_DATA || buf[3] == T_BCAST) note_size(&g_big_in, &g_max_in, n + 28);
         if (!same_at(&from, &g_lobby)) { if (g_joined && g_direct) from_player(buf, n, &from); continue; }
         switch (buf[3]) {
         case T_DATA:
