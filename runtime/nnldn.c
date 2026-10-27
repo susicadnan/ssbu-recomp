@@ -591,6 +591,7 @@ typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; do
  * game read them (long = this PC's game was busy). A line a minute while datagrams flow. */
 static SRWLOCK vs_lock;                    /* (defined below) */
 static double qpc_ms(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
+static double vs_block_ms; static long long vs_block_n, vs_block_to;      /* (under vs_lock) */
 typedef struct { uint32_t ip; double last; long long n, g50, g100, g250; double gmax; } GapStat;
 static GapStat vs_gap[8]; static double vs_gap_since; static long long vs_age_n, vs_age_h[4]; static double vs_age_max;      /* (age: under vs_lock) */
 static void gap_note(uint32_t src, double t) {          /* (receive thread only) */
@@ -609,9 +610,10 @@ static void gap_note(uint32_t src, double t) {          /* (receive thread only)
             if (o >= (int)sizeof line) break; }
         AcquireSRWLockExclusive(&vs_lock);
         long long an = vs_age_n, h0 = vs_age_h[0], h1 = vs_age_h[1], h2 = vs_age_h[2], h3 = vs_age_h[3]; double amax = vs_age_max;
-        vs_age_n = 0; memset(vs_age_h, 0, sizeof vs_age_h); vs_age_max = 0;
+        double bms = vs_block_ms; long long bn = vs_block_n, bto = vs_block_to;
+        vs_age_n = 0; memset(vs_age_h, 0, sizeof vs_age_h); vs_age_max = 0; vs_block_ms = 0; vs_block_n = vs_block_to = 0;
         ReleaseSRWLockExclusive(&vs_lock);
-        if (o < (int)sizeof line) snprintf(line + o, sizeof line - (size_t)o, " read by the game %lld: within 1 ms %lld, 1-8 ms %lld, 8-17 ms %lld, later %lld (longest %.0f ms)", an, h0, h1, h2, h3, amax);
+        if (o < (int)sizeof line) snprintf(line + o, sizeof line - (size_t)o, " read by the game %lld: within 1 ms %lld, 1-8 ms %lld, 8-17 ms %lld, later %lld (longest %.0f ms); the game's threads blocked in poll / recv %lld times, %.0f ms in all, %lld timeouts", an, h0, h1, h2, h3, amax, bn, bms, bto);
         if (LOGL(1)) printf("%s\n", line);
         for (int i = 0; i < 8; i++) { uint32_t ip = vs_gap[i].ip; double last = vs_gap[i].last; memset(&vs_gap[i], 0, sizeof vs_gap[i]); if (t - last < 5000) { vs_gap[i].ip = ip; vs_gap[i].last = last; } }
         vs_gap_since = t;
@@ -845,10 +847,16 @@ static void do_send(Ctx *c, int fd, uint64_t buf, uint64_t len, uint64_t addr, u
 static void so_send(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], 0, 0); }
 static void so_sendto(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], c->x[4], (uint32_t)c->x[5]); }
 
+/* (2026-10-27) the deadlines of poll / recv timeouts in QPC milliseconds: they were GetTickCount64 (15.6 ms steps), so a
+ * poll of 1 ms with nothing to read slept until the tick count moved: up to ~16 ms. The game's network thread then answered
+ * the other players up to a frame late. Also the time the game spent blocked in them (vs_block_*), for the minute line. */
+static uint64_t vs_now(void) { return (uint64_t)qpc_ms(); }
 static int wait_vs(uint64_t deadline) {   /* (vs_lock held) 0 once the deadline has passed */
     DWORD ms = INFINITE;
-    if (deadline != ~0ull) { uint64_t now = ms_now(); if (now >= deadline) return 0; ms = (DWORD)(deadline - now); }
+    if (deadline != ~0ull) { uint64_t now = vs_now(); if (now >= deadline) { vs_block_to++; return 0; } ms = (DWORD)(deadline - now); }
+    double t0 = qpc_ms();
     SleepConditionVariableSRW(&vs_cv, &vs_lock, ms, 0);
+    vs_block_ms += qpc_ms() - t0; vs_block_n++;
     return 1;
 }
 static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint64_t addr, uint64_t alenp) {
@@ -856,7 +864,7 @@ static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint6
     if (!buf) { fail(c, E_INVAL); return; }
     AcquireSRWLockExclusive(&vs_lock);
     VSock *s = vsock(fd);
-    uint64_t deadline = s && s->rcvtimeo ? ms_now() + s->rcvtimeo : ~0ull;
+    uint64_t deadline = s && s->rcvtimeo ? vs_now() + s->rcvtimeo : ~0ull;
     int err = 0;
     for (;;) {
         s = vsock(fd);
@@ -893,7 +901,7 @@ static void so_poll(Ctx *c) {             /* (pollfd {int fd; short events, reve
     uint64_t fds = c->x[0], nfds = c->x[1];
     int timeout = (int)c->x[2];
     if (!fds && nfds) { fail(c, E_INVAL); return; }
-    uint64_t deadline = timeout < 0 ? ~0ull : ms_now() + (uint64_t)timeout;
+    uint64_t deadline = timeout < 0 ? ~0ull : vs_now() + (uint64_t)timeout;
     uint32_t ready;
     AcquireSRWLockExclusive(&vs_lock);
     for (;;) {
