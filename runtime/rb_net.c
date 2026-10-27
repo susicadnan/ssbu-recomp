@@ -751,6 +751,12 @@ int rbn_loop(void) { return g_loop; }
 static const double g_ld_edge[LD_NB - 1] = { 1.0, 4.0, 8.0, 16.7, 33.3 };     /* ms: waited / tight / ... / two frames and more */
 static long long g_ld_hist[LD_NB], g_ld_n; static long long g_ld_need = -1; static int g_ld_adapt;
 static uint64_t g_ld_arr[256];                          /* receive time (us) of the other player's pad of frame f (f & 255) */
+/* (2026-10-27) delay-based matches: the delay changes DURING the match too. Each game announces the delay it wants in its
+ * mode byte (g_my_lockd, every PADS message) and both play with the larger of the two, so both change together: a game
+ * whose frames waited for the other player's pad 6 times or more in 3 s wants one frame more (the other player's pads then
+ * leave a frame earlier); 10 s without a wait and with a frame and more to spare at 97 % of the frames: one less, never
+ * under the delay of the best round trip. SSBU_RB_NET_DYNDELAY=0: the delay of the match start for the whole match. */
+static int g_dd_on = -1, g_dd_min, g_dd_max, g_dd_frames, g_dd_waits, g_dd_calm, g_dd_roomy, g_dd_up, g_dd_down;
 static int lock_delay(void) {                           /* the delay that covers the whole one-way trip (+ 1 frame): the wait is short or none */
     if (g_loop) return g_loop_lat + 1;
     int rt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
@@ -818,6 +824,16 @@ void rbn_start(long long f0) {
 }
 /* after the start barrier: the delay again from the round trip measured meanwhile (no frame has run: the queues start over;
  * pads of the other game already queued are sent again by it, from our acknowledgement on) */
+static void dd_start(void) {                            /* the match's delay is agreed: the in-match changes start from it */
+    if (g_dd_on < 0) { const char *e = getenv("SSBU_RB_NET_DYNDELAY"); g_dd_on = !(e && e[0] == '0'); }
+    g_dd_frames = g_dd_waits = g_dd_calm = g_dd_roomy = g_dd_up = g_dd_down = 0;
+    if (g_loop || g_delay_cfg >= 0 || !(g_lockstep || peer_lockstep())) { g_dd_max = 0; return; }
+    int rt = g_rtt_min_us > 0 ? g_rtt_min_us : g_rtt_us;
+    g_dd_min = rt > 0 ? (int)ceil(rt / 2000.0 / (1000.0 / 60.0)) : 1; if (g_dd_min < 1) g_dd_min = 1;
+    if (g_dd_min > g_delay) g_dd_min = g_delay;
+    g_dd_max = g_delay + 3 > 8 ? 8 : g_delay + 3;
+    g_my_lockd = g_delay;                               /* (the agreed delay is the larger announced one: the same on both sides) */
+}
 void rbn_choose_delay(void) {
     int d = auto_delay(); if (d < 1) d = 1;
     if (g_lockstep && !g_peerdelay) printf("[rbnet] after the start barrier: this game has no snapshot ring (old way, SSBU_RB_NET_PEERDELAY=0): the other game keeps its own delay\n");
@@ -825,10 +841,11 @@ void rbn_choose_delay(void) {
         g_lockstep && peer_lockstep() ? "neither game has a" : g_lockstep ? "this game has no" : "the other game has no", d, g_my_lockd, g_peer_mode >= 0 ? (int)(g_peer_mode & 0x7f) : -1, my_mode(), (unsigned)(g_peer_mode & 0xff));
     else if (!g_loop) printf("[rbnet] after the start barrier: both games have the ring (mode byte here %02x, there %02x)\n", my_mode(), (unsigned)(g_peer_mode & 0xff));
     fflush(stdout);
-    if (d == g_delay) return;
+    if (d == g_delay) { dd_start(); return; }
     printf("[rbnet] after the start barrier: input delay %d -> %d frames (round trip %.1f ms, best %.1f ms)\n", g_delay, d, g_rtt_us > 0 ? g_rtt_us / 1000.0 : -1.0, g_rtt_min_us > 0 ? g_rtt_min_us / 1000.0 : -1.0);
     fflush(stdout);
     g_delay = d; rb_input_reset(2, g_local, g_delay);
+    dd_start();
 }
 int rbn_started(void) { return g_started; }
 int rbn_delay(void) { return g_started ? g_delay : 0; }
@@ -922,11 +939,38 @@ void rbn_drain(long long cur) {
  * leaving them queued would make that pass predict inputs we already have. Drain only at the pass boundary, never
  * between its pad reads. Mismatches in earlier passes stay pending for the normal safe-point rollback; they must not
  * be consumed or finalized here. The loop test's artificial delivery schedule stays unchanged. */
+static int peer_lockstep(void);
+static void dd_frame(int waited, int roomy) {           /* (main thread, each real frame of a delay-based match) */
+    g_dd_frames++; g_dd_waits += waited; g_dd_roomy += roomy;
+    if (g_dd_frames % 180 == 0) {
+        if (g_dd_waits >= 6 && g_my_lockd < g_dd_max) { g_my_lockd++; g_dd_up++; g_dd_calm = 0; g_dd_roomy = 0;
+            printf("[rbnet] delay-based: %d waits for the other player's pad in 3 s: this game asks for delay %d\n", g_dd_waits, g_my_lockd); }
+        else if (g_dd_waits == 0) {
+            if ((g_dd_calm += 180) >= 600) {
+                if (g_dd_roomy >= g_dd_calm * 97 / 100 && g_my_lockd > g_dd_min) { g_my_lockd--; g_dd_down++;
+                    printf("[rbnet] delay-based: 10 s without a wait, a frame and more to spare: this game asks for delay %d\n", g_my_lockd); }
+                g_dd_calm = 0; g_dd_roomy = 0;
+            }
+        } else { g_dd_calm = 0; g_dd_roomy = 0; }
+        g_dd_waits = 0;
+    }
+}
+static void dd_follow(void) {                           /* (main thread, each real frame of a delay-based match, either game) */
+    if (g_dd_on <= 0 || g_dd_max <= 0) return;
+    /* both games: the larger of the two wanted delays (the other game's byte comes with its every message) */
+    int pd = g_peer_mode >= 0 ? (g_peer_mode & 0x7f) : 0, d = g_my_lockd > pd ? g_my_lockd : pd;
+    if (d < 1) d = 1; if (d > 12) d = 12;
+    if (d != g_delay) {
+        static int said; if (said++ < 40) printf("[rbnet] delay-based: input delay %d -> %d frames during the match (here %d, there %d)\n", g_delay, d, g_my_lockd, pd);
+        g_delay = d; rb_input_set_delay(d);
+    }
+}
 void rbn_before_frame(long long cur) {
     if (g_started && !g_loop && g_lockstep && g_ld_need > g_delay && g_ld_need <= rb_input_remote_latest(g_remote)) {
         double ms = ((double)now_us() - (double)g_ld_arr[g_ld_need & 255]) / 1000.0; int b = 0;
         while (b < LD_NB - 1 && ms >= g_ld_edge[b]) b++;
         g_ld_hist[b]++; g_ld_n++; g_ld_need = -1;
+        if (g_dd_on > 0 && g_dd_max > 0) dd_frame(b == 0, b >= 4);
     }
     if (!g_predrain || !g_started || g_loop) return;
     int before = rb_input_remote_latest(g_remote);
@@ -1020,6 +1064,7 @@ static double g_tsbias = -1;
 double rbn_pace_extra(long long f) {
     if (!g_started || g_loop) return 0;
     g_ld_need = f;                                      /* (the frame rbn_before_frame measures the margin of) */
+    dd_follow();
     if (f % 30 == 0) {
         rb_ts_decide((int)f);
         double est_ms = rb_ts_offset() / 1000.0;
@@ -1105,8 +1150,8 @@ void rbn_report(FILE *o, long long frames) {
             g_stat_padget, g_stat_pred, g_stat_padget ? 100.0 * g_stat_pred / g_stat_padget : 0.0, g_stat_mis, g_hfinal_upto, g_check_ok + g_desync, g_desync, g_desync_first);
     fprintf(o, "[rbnet] report: pad check of the final simulations: %lld pad values differ from the final ones (first frame %lld)\n", g_padcheck_bad, g_padcheck_first);
     fprintf(o, "[rbnet] report: pre-frame receive %s; %lld additional remote frames confirmed after pacing\n", g_predrain ? "on" : "off", g_preframe_pads);
-    if (g_ld_n) fprintf(o, "[rbnet] report: delay-based, the other player's pad at each frame's start: waited for %.1f %%, under 4 ms to spare %.1f %%, 4-8 ms %.1f %%, 8-16.7 ms %.1f %%, a frame %.1f %%, two frames and more %.1f %% (%lld frames; delay +%d from earlier matches)\n",
-                        100.0 * g_ld_hist[0] / g_ld_n, 100.0 * g_ld_hist[1] / g_ld_n, 100.0 * g_ld_hist[2] / g_ld_n, 100.0 * g_ld_hist[3] / g_ld_n, 100.0 * g_ld_hist[4] / g_ld_n, 100.0 * g_ld_hist[5] / g_ld_n, g_ld_n, g_ld_adapt);
+    if (g_ld_n) fprintf(o, "[rbnet] report: delay-based, the other player's pad at each frame's start: waited for %.1f %%, under 4 ms to spare %.1f %%, 4-8 ms %.1f %%, 8-16.7 ms %.1f %%, a frame %.1f %%, two frames and more %.1f %% (%lld frames; delay +%d from earlier matches; during this one %d up, %d down, %d at the end)\n",
+                        100.0 * g_ld_hist[0] / g_ld_n, 100.0 * g_ld_hist[1] / g_ld_n, 100.0 * g_ld_hist[2] / g_ld_n, 100.0 * g_ld_hist[3] / g_ld_n, 100.0 * g_ld_hist[4] / g_ld_n, 100.0 * g_ld_hist[5] / g_ld_n, g_ld_n, g_ld_adapt, g_dd_up, g_dd_down, g_delay);
     fprintf(o, "[rbnet] report: stall retry interval %d ms; %lld input retransmissions while stalled\n", g_resend_ms, g_stall_resends);
     { int j, l; rbn_link(&j, &l); fprintf(o, "[rbnet] report: pads repeated %d ms after the first send: %lld; link seen here: jitter %d ms, loss %d %%\n", g_rep_ms, (long long)g_rep_sent, j, l); }
     fprintf(o, "[rbnet] report: packets sent %lld (failed %lld), received %lld (bad %lld, queue full %lld); remote pads up to %d, local up to %d\n",

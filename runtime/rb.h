@@ -19,6 +19,7 @@ typedef struct { uint64_t buttons; int16_t lx, ly, rx, ry; } RbPad;      /* as n
 /* ---------------------------------------------------------------- input queues (rb_input.c) */
 void rb_input_reset(int nplayers, int local, int delay);   /* frames are counted from 1 */
 int rb_input_delay(void);
+void rb_input_set_delay(int delay);            /* (2026-10-27) during a delay-based match (rb_net.c) */
 RbPad rb_pad_rest(RbPad p);                        /* the stick clamp both sides apply before a pad is stored or sent */
 int rb_pad_equal(const RbPad *a, const RbPad *b);
 /* the local player's pad read at `frame`: kept for frame + delay; returns the pad that applies at `frame` (empty in the first frames) */
