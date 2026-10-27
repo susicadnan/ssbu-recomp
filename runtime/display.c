@@ -1025,6 +1025,20 @@ void display_present_done(int fight) {
             if (ms > g_ps[i].mx) g_ps[i].mx = ms;
         }
     }
+    {   /* (2026-10-27) online rooms (the game's own netcode waits for every player each frame): a line for each fight frame
+         * 25 ms or more after the one before, with the time the game's threads sat in poll / recv meanwhile and the player
+         * whose datagrams had the longest gap: network wait or this PC (first 400 per run; SSBU_HITCHNET=0: none) */
+        int nnldn_players(void); double nnldn_frame_take(uint32_t *late_ip, double *late_gap);
+        static int on = -1; static long hn;
+        if (on < 0) { const char *e = getenv("SSBU_HITCHNET"); on = !(e && e[0] == '0'); }
+        if (on && nnldn_players() >= 2) {
+            uint32_t ip; double gap, blocked = nnldn_frame_take(&ip, &gap);
+            double ms = g_ps_prev_qpc ? (double)(now.QuadPart - g_ps_prev_qpc) * 1000.0 / (double)g_freq.QuadPart : 0;
+            if (fight && ms >= 25.0 && ms < 2000.0 && hn++ < 400)
+                printf("hitch-net: frame %lld came %.1f ms after the one before; the game's threads waited in poll / recv %.1f ms; longest gap between datagrams %.1f ms, from 10.13.%u.%u%s\n",
+                       (long long)g_prof15_frame, ms, blocked, gap, ip >> 8 & 255, ip & 255, gap >= ms - 17.0 && gap >= 33.0 ? " (likely waited for that player)" : gap < 25.0 ? " (no player late: this PC)" : "");
+        }
+    }
     g_ps_prev_vb = shown; g_ps_prev_qpc = now.QuadPart;
     l1_done(fight, vq + (LONG64)((double)(whole + 1) * period));      /* L1: the vblank after this present */
     if (stat && g_ps[0].n && g_ps[0].n % 600 == 0 && g_ps[0].n != g_ps_last[0].n) {

@@ -592,7 +592,7 @@ typedef struct Dgram { struct Dgram *next; uint32_t src, len; uint16_t sport; do
 static SRWLOCK vs_lock;                    /* (defined below) */
 static double qpc_ms(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return t.QuadPart * 1000.0 / f.QuadPart; }
 static double vs_block_ms; static long long vs_block_n, vs_block_to;      /* (under vs_lock) */
-typedef struct { uint32_t ip; double last; long long n, g50, g100, g250; double gmax; } GapStat;
+typedef struct { uint32_t ip; double last; long long n, g50, g100, g250; double gmax; volatile double wmax; } GapStat;      /* wmax: since nnldn_frame_take */
 static GapStat vs_gap[8]; static double vs_gap_since; static long long vs_age_n, vs_age_h[4]; static double vs_age_max;      /* (age: under vs_lock) */
 static void gap_note(uint32_t src, double t) {          /* (receive thread only) */
     int k = -1;
@@ -600,7 +600,7 @@ static void gap_note(uint32_t src, double t) {          /* (receive thread only)
     if (k < 0) for (int i = 0; i < 8; i++) if (!vs_gap[i].ip) { k = i; vs_gap[i].ip = src; vs_gap[i].last = 0; break; }
     if (k < 0) return;
     GapStat *g = &vs_gap[k];
-    if (g->last > 0) { double d = t - g->last; if (d < 2000) { if (d >= 50) g->g50++; if (d >= 100) g->g100++; if (d >= 250) g->g250++; if (d > g->gmax) g->gmax = d; } }
+    if (g->last > 0) { double d = t - g->last; if (d > g->wmax) g->wmax = d; if (d < 2000) { if (d >= 50) g->g50++; if (d >= 100) g->g100++; if (d >= 250) g->g250++; if (d > g->gmax) g->gmax = d; } }
     g->last = t; g->n++;
     if (!vs_gap_since) vs_gap_since = t;
     if (t - vs_gap_since >= 60000) {
@@ -851,12 +851,29 @@ static void so_sendto(Ctx *c) { do_send(c, (int)c->x[0], c->x[1], c->x[2], c->x[
  * poll of 1 ms with nothing to read slept until the tick count moved: up to ~16 ms. The game's network thread then answered
  * the other players up to a frame late. Also the time the game spent blocked in them (vs_block_*), for the minute line. */
 static uint64_t vs_now(void) { return (uint64_t)qpc_ms(); }
+static volatile double vs_fw_block;      /* blocked ms since nnldn_frame_take */
+/* (2026-10-27) display.c, at a slow fight frame in a room: how long the game's threads were blocked in poll / recv since the
+ * last call, and the player whose datagrams had the longest gap meanwhile (counting the gap still open now). Diagnostic,
+ * no lock (the receive thread writes the gaps) */
+double nnldn_frame_take(uint32_t *late_ip, double *late_gap) {
+    double b = vs_fw_block, now = qpc_ms(), best = 0; uint32_t ip = 0;
+    vs_fw_block = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!vs_gap[i].ip) continue;
+        double g = vs_gap[i].wmax, open = vs_gap[i].last > 0 ? now - vs_gap[i].last : 0;
+        if (open > g && open < 2000) g = open;
+        vs_gap[i].wmax = 0;
+        if (g > best) { best = g; ip = vs_gap[i].ip; }
+    }
+    *late_ip = ip; *late_gap = best;
+    return b;
+}
 static int wait_vs(uint64_t deadline) {   /* (vs_lock held) 0 once the deadline has passed */
     DWORD ms = INFINITE;
     if (deadline != ~0ull) { uint64_t now = vs_now(); if (now >= deadline) { vs_block_to++; return 0; } ms = (DWORD)(deadline - now); }
     double t0 = qpc_ms();
     SleepConditionVariableSRW(&vs_cv, &vs_lock, ms, 0);
-    vs_block_ms += qpc_ms() - t0; vs_block_n++;
+    { double w = qpc_ms() - t0; vs_block_ms += w; vs_fw_block += w; } vs_block_n++;
     return 1;
 }
 static void do_recv(Ctx *c, int fd, uint64_t buf, uint64_t len, int flags, uint64_t addr, uint64_t alenp) {
